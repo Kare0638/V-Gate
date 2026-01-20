@@ -212,3 +212,13 @@ weights/
 .ipynb_checkpoints/
 *.pt
 *.safetensors
+
+# Ignore IDE configuration
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+
+# Ignore Virtual Environment
+.venv/
+venv/
