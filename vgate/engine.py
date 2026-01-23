@@ -14,7 +14,7 @@ class VGateEngine:
             trust_remote_code=True
         )
 
-    def generate(self, prompt, max_tokens=256):
+    def chat_completions(self, prompt, max_tokens=256):
         # 构造采样参数
         sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=max_tokens)
         
@@ -52,4 +52,25 @@ class VGateEngine:
             "ttft": ttft,
             "tpot": tpot,
             "total_tokens": num_tokens
+        }
+
+    def embeddings(self, input_text: str):
+        """
+        Placeholder for embeddings generation.
+        In a real scenario, a dedicated embedding model would be loaded and used here.
+        Returns a mock embedding for MVP.
+        """
+        print(f"VGateEngine: Generating mock embeddings for input: '{input_text}'")
+        # Return a fixed mock embedding for now
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "object": "embedding",
+                    "embedding": [i * 0.01 for i in range(1536)], # A longer mock embedding
+                    "index": 0,
+                }
+            ],
+            "model": "mock-embedding-model",
+            "usage": {"prompt_tokens": len(input_text), "total_tokens": len(input_text)},
         }
