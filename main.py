@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 import os
 import sys
 import time
@@ -7,18 +8,43 @@ import time
 # Add the vgate directory to the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'vgate')))
 
-# Import the actual VGateEngine
+# Import the actual VGateEngine and Batcher
 from engine import VGateEngine
+from batcher import RequestBatcher
+
+# Configuration
+BATCH_CONFIG = {
+    "max_batch_size": 8,       # Max requests per batch
+    "max_wait_time_ms": 50.0,  # Max wait time before processing
+}
+
+# Initialize the VGateEngine
+engine = VGateEngine(model_name="Qwen/Qwen2.5-1.5B-Instruct-AWQ")
+
+# Initialize the RequestBatcher
+batcher = RequestBatcher(
+    engine=engine,
+    max_batch_size=BATCH_CONFIG["max_batch_size"],
+    max_wait_time_ms=BATCH_CONFIG["max_wait_time_ms"],
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifecycle manager for startup/shutdown."""
+    # Startup: start the batcher
+    await batcher.start()
+    yield
+    # Shutdown: stop the batcher
+    await batcher.stop()
+
 
 app = FastAPI(
     title="V-Gate AI Model Serving Gateway",
     description="A high-performance AI model serving gateway for various models.",
-    version="0.1.0",
+    version="0.2.0",
+    lifespan=lifespan,
 )
-
-# Initialize the VGateEngine
-# Model name should ideally come from configuration in a later stage
-engine = VGateEngine(model_name="Qwen/Qwen2.5-1.5B-Instruct-AWQ")
 
 # Request models for OpenAI-like API
 class ChatCompletionRequest(BaseModel):
@@ -52,15 +78,18 @@ async def health_check():
 async def create_chat_completion(request: ChatCompletionRequest):
     """
     Generates a chat completion response from the specified model.
+    Requests are automatically batched for improved throughput.
     """
     try:
         # Convert messages to a single prompt string for the engine
         prompt = messages_to_prompt(request.messages)
-        response = engine.chat_completions(prompt)
-        
+
+        # Submit to batcher for batched processing
+        response = await batcher.submit(prompt, max_tokens=256)
+
         # Adapt engine's response to OpenAI-like format
         return {
-            "id": "chatcmpl-" + str(hash(prompt)), # Simple unique ID for mock
+            "id": "chatcmpl-" + str(hash(prompt)),
             "object": "chat.completion",
             "created": int(time.time()),
             "model": request.model,
@@ -75,7 +104,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 }
             ],
             "usage": {
-                "prompt_tokens": response.get("prompt_tokens", 0), # Assuming engine can return this
+                "prompt_tokens": response.get("prompt_tokens", 0),
                 "completion_tokens": response.get("total_tokens", 0),
                 "total_tokens": response.get("total_tokens", 0) + response.get("prompt_tokens", 0),
             },
@@ -90,7 +119,7 @@ async def create_embeddings(request: EmbeddingRequest):
     """
     try:
         response = engine.embeddings(request.input)
-        
+
         # Adapt engine's response to OpenAI-like format
         return {
             "object": "list",
@@ -100,6 +129,19 @@ async def create_embeddings(request: EmbeddingRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/metrics", summary="Get Batching Metrics")
+async def get_metrics():
+    """
+    Returns metrics about the request batching system.
+    Useful for monitoring and debugging.
+    """
+    return {
+        "batcher": batcher.get_metrics(),
+        "config": BATCH_CONFIG,
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
