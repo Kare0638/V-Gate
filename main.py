@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'vgat
 # Import the actual VGateEngine and Batcher
 from engine import VGateEngine
 from batcher import RequestBatcher
+from cache import CacheConfig
 
 # Configuration
 BATCH_CONFIG = {
@@ -18,14 +19,19 @@ BATCH_CONFIG = {
     "max_wait_time_ms": 50.0,  # Max wait time before processing
 }
 
+CACHE_CONFIG = {
+    "maxsize": int(os.getenv("VGATE_CACHE_MAXSIZE", "1000")),
+}
+
 # Initialize the VGateEngine
 engine = VGateEngine(model_name="Qwen/Qwen2.5-1.5B-Instruct-AWQ")
 
-# Initialize the RequestBatcher
+# Initialize the RequestBatcher with cache config
 batcher = RequestBatcher(
     engine=engine,
     max_batch_size=BATCH_CONFIG["max_batch_size"],
     max_wait_time_ms=BATCH_CONFIG["max_wait_time_ms"],
+    cache_config=CacheConfig(maxsize=CACHE_CONFIG["maxsize"]),
 )
 
 
@@ -134,12 +140,22 @@ async def create_embeddings(request: EmbeddingRequest):
 @app.get("/metrics", summary="Get Batching Metrics")
 async def get_metrics():
     """
-    Returns metrics about the request batching system.
+    Returns metrics about the request batching system and cache.
     Useful for monitoring and debugging.
     """
+    metrics = batcher.get_metrics()
     return {
-        "batcher": batcher.get_metrics(),
-        "config": BATCH_CONFIG,
+        "batcher": {
+            "total_requests": metrics["total_requests"],
+            "total_batches": metrics["total_batches"],
+            "average_batch_size": metrics["average_batch_size"],
+            "pending_requests": metrics["pending_requests"],
+        },
+        "cache": metrics["cache"],
+        "config": {
+            "batch": BATCH_CONFIG,
+            "cache": CACHE_CONFIG,
+        },
     }
 
 
