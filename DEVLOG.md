@@ -94,6 +94,85 @@ BATCH_CONFIG = {
 
 ---
 
+## 2025-01-27 - Phase 2.2 Result Caching / 第二阶段 2.2 结果缓存
+
+### Summary / 概述
+
+Implemented LRU result caching to avoid redundant computations, with batch-level deduplication for identical prompts within the same batch.
+
+实现了 LRU 结果缓存以避免重复计算，并支持批次内相同 prompt 的去重优化。
+
+### What Was Done / 完成内容
+
+| Feature | Description |
+|---------|-------------|
+| **ResultCache** | LRU cache with configurable size (default 1000 entries) / 可配置大小的 LRU 缓存（默认 1000 条） |
+| **Cache Key** | SHA256 hash of `prompt + temperature + top_p + max_tokens` / 基于参数组合的 SHA256 哈希键 |
+| **Batch Deduplication** | Identical prompts in same batch share single inference / 同批次相同 prompt 共享单次推理 |
+| **Cache Metrics** | Hit rate, size, and usage stats in `/metrics` endpoint / `/metrics` 端点中的缓存命中率和使用统计 |
+| **Environment Config** | `VGATE_CACHE_MAXSIZE` env var for cache size / 环境变量配置缓存大小 |
+
+### Architecture / 架构
+
+```
+Request 1 (prompt A) ─┐
+Request 2 (prompt A) ─┼─→ [Cache Check] ─→ Hit? ─→ Return cached
+Request 3 (prompt B) ─┘        │
+                               ↓ Miss
+                    [Batch Dedup] ─→ {A: [req1,req2], B: [req3]}
+                               ↓
+                    [vLLM.generate([A, B])] ← Only 2 unique prompts
+                               ↓
+                    [Cache Store] + [Result Dispatch]
+```
+
+### Key Files / 关键文件
+
+| File | Purpose |
+|------|---------|
+| `vgate/cache.py` | `ResultCache` class with LRU eviction and stats |
+| `vgate/batcher.py` | Cache integration and batch deduplication logic |
+| `main.py` | Cache configuration and updated `/metrics` endpoint |
+| `tests/test_cache.py` | Unit tests for cache and deduplication |
+
+### Configuration / 配置
+
+```python
+CACHE_CONFIG = {
+    "maxsize": int(os.getenv("VGATE_CACHE_MAXSIZE", "1000")),
+}
+```
+
+### Metrics Available / 可用指标
+
+```json
+{
+  "batcher": {
+    "total_requests": 100,
+    "total_batches": 25,
+    "average_batch_size": 4.0,
+    "pending_requests": 0
+  },
+  "cache": {
+    "size": 50,
+    "maxsize": 1000,
+    "hits": 30,
+    "misses": 70,
+    "hit_rate": 0.3
+  }
+}
+```
+
+### Performance Impact / 性能影响
+
+| Scenario | Latency | GPU Load |
+|----------|---------|----------|
+| Cache Hit | < 1ms | None |
+| Batch Dedup | Normal | Reduced (fewer unique prompts) |
+| Cache Miss | Normal | Normal |
+
+---
+
 ## Next Steps / 下一步计划
 
 ### Phase 2: Performance & Efficiency Optimization / 第二阶段：性能与效率优化
@@ -101,7 +180,7 @@ BATCH_CONFIG = {
 | Priority | Feature | Status | Description |
 |----------|---------|--------|-------------|
 | 1 | **Dynamic Request Batching** | ✅ Done | Aggregate concurrent requests into batches for GPU efficiency |
-| 2 | **Result Caching** | 🔲 Todo | LRU cache to avoid redundant computations |
+| 2 | **Result Caching** | ✅ Done | LRU cache to avoid redundant computations |
 | 3 | **Multi-Worker Load Balancing** | 🔲 Todo | Horizontal scaling with multiple engine instances |
 
 ### Key Objectives / 核心目标
@@ -117,7 +196,7 @@ BATCH_CONFIG = {
 - [x] Phase 1: Core MVP - Unified API Gateway / 核心 MVP - 统一 API 网关
 - [ ] Phase 2: Performance & Efficiency Optimization / 性能与效率优化
   - [x] 2.1 Dynamic Request Batching / 动态请求批处理
-  - [ ] 2.2 Result Caching / 结果缓存
+  - [x] 2.2 Result Caching / 结果缓存
   - [ ] 2.3 Multi-Worker Load Balancing / 多 Worker 负载均衡
 - [ ] Phase 3: Production-Grade Features / 生产级特性
 - [ ] Phase 4: Ecosystem & Deployment / 生态与部署

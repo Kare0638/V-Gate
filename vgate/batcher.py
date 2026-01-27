@@ -1,7 +1,9 @@
 import asyncio
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
+
+from vgate.cache import ResultCache, CacheConfig
 
 
 @dataclass
@@ -9,6 +11,9 @@ class BatchRequest:
     """A single request waiting to be batched."""
     prompt: str
     max_tokens: int
+    temperature: float = 0.7
+    top_p: float = 0.9
+    cache_key: str = ""
     future: asyncio.Future = field(default_factory=lambda: asyncio.get_event_loop().create_future())
     created_at: float = field(default_factory=time.time)
 
@@ -28,10 +33,12 @@ class RequestBatcher:
         engine,
         max_batch_size: int = 8,
         max_wait_time_ms: float = 50.0,
+        cache_config: CacheConfig = None,
     ):
         self.engine = engine
         self.max_batch_size = max_batch_size
         self.max_wait_time_ms = max_wait_time_ms
+        self.cache = ResultCache(cache_config)
 
         self._queue: List[BatchRequest] = []
         self._lock = asyncio.Lock()
@@ -63,14 +70,31 @@ class RequestBatcher:
         # Process any remaining requests
         await self._process_batch()
 
-    async def submit(self, prompt: str, max_tokens: int = 256) -> Dict[str, Any]:
+    async def submit(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+    ) -> Dict[str, Any]:
         """
         Submit a request for batched processing.
         Returns the result when the batch is processed.
+        Checks cache first and returns cached result if available.
         """
+        cache_key = ResultCache.make_key(prompt, temperature, top_p, max_tokens)
+
+        # Check cache first
+        cached = await self.cache.get(cache_key)
+        if cached:
+            return cached
+
         request = BatchRequest(
             prompt=prompt,
             max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            cache_key=cache_key,
             future=asyncio.get_event_loop().create_future(),
             created_at=time.time(),
         )
@@ -97,7 +121,7 @@ class RequestBatcher:
                 await self._process_batch()
 
     async def _process_batch(self):
-        """Process all pending requests as a batch."""
+        """Process all pending requests as a batch with deduplication."""
         async with self._lock:
             if not self._queue:
                 return
@@ -116,17 +140,36 @@ class RequestBatcher:
         print(f"[Batcher] Processing batch #{self.total_batches} with {batch_size} requests")
 
         try:
-            # Collect all prompts
-            prompts = [req.prompt for req in batch]
+            # Group requests by cache_key for deduplication
+            unique_prompts: Dict[str, List[BatchRequest]] = {}
+            for req in batch:
+                if req.cache_key not in unique_prompts:
+                    unique_prompts[req.cache_key] = []
+                unique_prompts[req.cache_key].append(req)
+
+            # Only infer unique prompts
+            prompts_to_infer = [reqs[0].prompt for reqs in unique_prompts.values()]
+            temps_to_infer = [reqs[0].temperature for reqs in unique_prompts.values()]
+            top_ps_to_infer = [reqs[0].top_p for reqs in unique_prompts.values()]
             max_tokens = max(req.max_tokens for req in batch)
 
-            # Process batch through engine
-            results = await self._run_batch_inference(prompts, max_tokens)
+            dedup_count = batch_size - len(prompts_to_infer)
+            if dedup_count > 0:
+                print(f"[Batcher] Deduplicated {dedup_count} requests, inferring {len(prompts_to_infer)} unique prompts")
 
-            # Distribute results to waiting requests
-            for i, req in enumerate(batch):
-                if not req.future.done():
-                    req.future.set_result(results[i])
+            # Process batch through engine
+            results = await self._run_batch_inference(
+                prompts_to_infer, max_tokens, temps_to_infer[0], top_ps_to_infer[0]
+            )
+
+            # Distribute results to waiting requests and cache them
+            for (cache_key, reqs), result in zip(unique_prompts.items(), results):
+                # Store in cache
+                await self.cache.put(cache_key, result)
+                # Distribute to all requests with this cache_key
+                for req in reqs:
+                    if not req.future.done():
+                        req.future.set_result(result)
 
         except Exception as e:
             # On error, fail all requests in batch
@@ -135,7 +178,13 @@ class RequestBatcher:
                 if not req.future.done():
                     req.future.set_exception(e)
 
-    async def _run_batch_inference(self, prompts: List[str], max_tokens: int) -> List[Dict[str, Any]]:
+    async def _run_batch_inference(
+        self,
+        prompts: List[str],
+        max_tokens: int,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+    ) -> List[Dict[str, Any]]:
         """
         Run batched inference through the engine.
         This runs in a thread pool to avoid blocking the event loop.
@@ -147,17 +196,25 @@ class RequestBatcher:
             None,
             self._sync_batch_inference,
             prompts,
-            max_tokens
+            max_tokens,
+            temperature,
+            top_p,
         )
         return results
 
-    def _sync_batch_inference(self, prompts: List[str], max_tokens: int) -> List[Dict[str, Any]]:
+    def _sync_batch_inference(
+        self,
+        prompts: List[str],
+        max_tokens: int,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+    ) -> List[Dict[str, Any]]:
         """Synchronous batch inference - runs in thread pool."""
         from vllm import SamplingParams
 
         sampling_params = SamplingParams(
-            temperature=0.7,
-            top_p=0.9,
+            temperature=temperature,
+            top_p=top_p,
             max_tokens=max_tokens
         )
 
@@ -194,11 +251,12 @@ class RequestBatcher:
         return results
 
     def get_metrics(self) -> Dict[str, Any]:
-        """Return batching metrics."""
+        """Return batching metrics including cache stats."""
         avg_batch_size = (self.total_batch_size / self.total_batches) if self.total_batches > 0 else 0
         return {
             "total_requests": self.total_requests,
             "total_batches": self.total_batches,
             "average_batch_size": round(avg_batch_size, 2),
             "pending_requests": len(self._queue),
+            "cache": self.cache.get_stats(),
         }
