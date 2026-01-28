@@ -173,6 +173,68 @@ CACHE_CONFIG = {
 
 ---
 
+## 2025-01-28 - Phase 2 Bug Fix & Testing / 第二阶段 Bug 修复与测试
+
+### Summary / 概述
+
+Fixed a race condition in concurrent vLLM calls and added a comprehensive testing script for Phase 2 features.
+
+修复了并发 vLLM 调用的竞态条件，并添加了 Phase 2 功能的综合测试脚本。
+
+### What Was Done / 完成内容
+
+| Feature | Description |
+|---------|-------------|
+| **Inference Lock** | Added `_inference_lock` to prevent concurrent vLLM calls / 添加推理锁防止并发 vLLM 调用 |
+| **Concurrent Test Script** | `scripts/test_concurrent.py` for testing batching, caching, and deduplication / 并发测试脚本 |
+
+### Bug Fixed / 修复的问题
+
+**Issue**: When multiple batches were triggered simultaneously (from timeout and queue full), concurrent `vLLM.generate()` calls caused `ValueError: b'\x00\x00' is not a valid EngineCoreRequestType`.
+
+**问题**: 当多个批次同时触发（超时和队列满）时，并发的 `vLLM.generate()` 调用导致引擎核心请求类型错误。
+
+**Solution**: Added `_inference_lock` to ensure only one batch inference runs at a time.
+
+**解决方案**: 添加 `_inference_lock` 确保同一时间只有一个批次在推理。
+
+```python
+self._inference_lock = asyncio.Lock()
+
+async def _process_batch(self):
+    async with self._inference_lock:  # Prevent concurrent vLLM calls
+        # ... batch processing logic ...
+```
+
+### Test Script / 测试脚本
+
+```bash
+python scripts/test_concurrent.py
+```
+
+| Test | Description |
+|------|-------------|
+| **Test 1: Batching** | 10 concurrent requests → 1 batch |
+| **Test 2: Caching** | Duplicate requests hit cache (< 1ms) |
+| **Test 3: Deduplication** | 5 identical prompts → 1 inference |
+
+### Test Results / 测试结果
+
+```
+TEST 1: Dynamic Request Batching    - PASS (10 requests → 1 batch)
+TEST 2: Result Caching              - PASS (4738x speedup)
+TEST 3: Batch Deduplication         - PASS (5 requests → 1 inference)
+```
+
+### Commits / 提交记录
+
+```
+628ab0d fix: add inference lock to prevent concurrent vLLM calls
+6c2531d test: add Phase 2 concurrent testing script
+```
+
+---
+
 ## Next Steps / 下一步计划
 
 ### Phase 2: Performance & Efficiency Optimization / 第二阶段：性能与效率优化
