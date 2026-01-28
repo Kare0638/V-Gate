@@ -42,6 +42,7 @@ class RequestBatcher:
 
         self._queue: List[BatchRequest] = []
         self._lock = asyncio.Lock()
+        self._inference_lock = asyncio.Lock()  # Prevent concurrent vLLM calls
         self._batch_task: asyncio.Task = None
         self._running = False
 
@@ -122,61 +123,63 @@ class RequestBatcher:
 
     async def _process_batch(self):
         """Process all pending requests as a batch with deduplication."""
-        async with self._lock:
-            if not self._queue:
+        # Use inference lock to prevent concurrent vLLM calls
+        async with self._inference_lock:
+            async with self._lock:
+                if not self._queue:
+                    return
+
+                # Take all pending requests
+                batch = self._queue[:]
+                self._queue.clear()
+
+            if not batch:
                 return
 
-            # Take all pending requests
-            batch = self._queue[:]
-            self._queue.clear()
+            batch_size = len(batch)
+            self.total_batches += 1
+            self.total_batch_size += batch_size
 
-        if not batch:
-            return
+            print(f"[Batcher] Processing batch #{self.total_batches} with {batch_size} requests")
 
-        batch_size = len(batch)
-        self.total_batches += 1
-        self.total_batch_size += batch_size
+            try:
+                # Group requests by cache_key for deduplication
+                unique_prompts: Dict[str, List[BatchRequest]] = {}
+                for req in batch:
+                    if req.cache_key not in unique_prompts:
+                        unique_prompts[req.cache_key] = []
+                    unique_prompts[req.cache_key].append(req)
 
-        print(f"[Batcher] Processing batch #{self.total_batches} with {batch_size} requests")
+                # Only infer unique prompts
+                prompts_to_infer = [reqs[0].prompt for reqs in unique_prompts.values()]
+                temps_to_infer = [reqs[0].temperature for reqs in unique_prompts.values()]
+                top_ps_to_infer = [reqs[0].top_p for reqs in unique_prompts.values()]
+                max_tokens = max(req.max_tokens for req in batch)
 
-        try:
-            # Group requests by cache_key for deduplication
-            unique_prompts: Dict[str, List[BatchRequest]] = {}
-            for req in batch:
-                if req.cache_key not in unique_prompts:
-                    unique_prompts[req.cache_key] = []
-                unique_prompts[req.cache_key].append(req)
+                dedup_count = batch_size - len(prompts_to_infer)
+                if dedup_count > 0:
+                    print(f"[Batcher] Deduplicated {dedup_count} requests, inferring {len(prompts_to_infer)} unique prompts")
 
-            # Only infer unique prompts
-            prompts_to_infer = [reqs[0].prompt for reqs in unique_prompts.values()]
-            temps_to_infer = [reqs[0].temperature for reqs in unique_prompts.values()]
-            top_ps_to_infer = [reqs[0].top_p for reqs in unique_prompts.values()]
-            max_tokens = max(req.max_tokens for req in batch)
+                # Process batch through engine
+                results = await self._run_batch_inference(
+                    prompts_to_infer, max_tokens, temps_to_infer[0], top_ps_to_infer[0]
+                )
 
-            dedup_count = batch_size - len(prompts_to_infer)
-            if dedup_count > 0:
-                print(f"[Batcher] Deduplicated {dedup_count} requests, inferring {len(prompts_to_infer)} unique prompts")
+                # Distribute results to waiting requests and cache them
+                for (cache_key, reqs), result in zip(unique_prompts.items(), results):
+                    # Store in cache
+                    await self.cache.put(cache_key, result)
+                    # Distribute to all requests with this cache_key
+                    for req in reqs:
+                        if not req.future.done():
+                            req.future.set_result(result)
 
-            # Process batch through engine
-            results = await self._run_batch_inference(
-                prompts_to_infer, max_tokens, temps_to_infer[0], top_ps_to_infer[0]
-            )
-
-            # Distribute results to waiting requests and cache them
-            for (cache_key, reqs), result in zip(unique_prompts.items(), results):
-                # Store in cache
-                await self.cache.put(cache_key, result)
-                # Distribute to all requests with this cache_key
-                for req in reqs:
+            except Exception as e:
+                # On error, fail all requests in batch
+                print(f"[Batcher] Batch processing error: {e}")
+                for req in batch:
                     if not req.future.done():
-                        req.future.set_result(result)
-
-        except Exception as e:
-            # On error, fail all requests in batch
-            print(f"[Batcher] Batch processing error: {e}")
-            for req in batch:
-                if not req.future.done():
-                    req.future.set_exception(e)
+                        req.future.set_exception(e)
 
     async def _run_batch_inference(
         self,
