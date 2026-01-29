@@ -1,9 +1,18 @@
 import asyncio
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from dataclasses import dataclass, field
 
 from vgate.cache import ResultCache, CacheConfig
+from vgate.logging_config import get_logger
+from vgate.metrics import (
+    BATCH_SIZE, BATCH_PROCESSING_TIME, BATCH_QUEUE_TIME,
+    PENDING_REQUESTS, TOTAL_BATCHES, TTFT, TPOT,
+    TOKENS_GENERATED, INFERENCE_ERRORS, UNIQUE_PROMPTS_PER_BATCH,
+    DEDUPLICATED_REQUESTS, DEDUP_RATIO
+)
+
+logger = get_logger("vgate.batcher")
 
 
 @dataclass
@@ -50,6 +59,7 @@ class RequestBatcher:
         self.total_requests = 0
         self.total_batches = 0
         self.total_batch_size = 0
+        self.total_deduplicated = 0
 
     async def start(self):
         """Start the background batching task."""
@@ -57,7 +67,13 @@ class RequestBatcher:
             return
         self._running = True
         self._batch_task = asyncio.create_task(self._batch_loop())
-        print(f"[Batcher] Started with max_batch_size={self.max_batch_size}, max_wait_time_ms={self.max_wait_time_ms}")
+        logger.info(
+            "Batcher started",
+            extra={"extra_data": {
+                "max_batch_size": self.max_batch_size,
+                "max_wait_time_ms": self.max_wait_time_ms
+            }}
+        )
 
     async def stop(self):
         """Stop the batching task and process remaining requests."""
@@ -70,6 +86,7 @@ class RequestBatcher:
                 pass
         # Process any remaining requests
         await self._process_batch()
+        logger.info("Batcher stopped")
 
     async def submit(
         self,
@@ -88,6 +105,10 @@ class RequestBatcher:
         # Check cache first
         cached = await self.cache.get(cache_key)
         if cached:
+            logger.debug(
+                "Cache hit",
+                extra={"extra_data": {"cache_key": cache_key[:8]}}
+            )
             return cached
 
         request = BatchRequest(
@@ -104,6 +125,7 @@ class RequestBatcher:
             self._queue.append(request)
             self.total_requests += 1
             queue_size = len(self._queue)
+            PENDING_REQUESTS.set(queue_size)
 
         # If batch is full, signal immediate processing
         if queue_size >= self.max_batch_size:
@@ -132,6 +154,7 @@ class RequestBatcher:
                 # Take all pending requests
                 batch = self._queue[:]
                 self._queue.clear()
+                PENDING_REQUESTS.set(0)
 
             if not batch:
                 return
@@ -140,7 +163,23 @@ class RequestBatcher:
             self.total_batches += 1
             self.total_batch_size += batch_size
 
-            print(f"[Batcher] Processing batch #{self.total_batches} with {batch_size} requests")
+            # Record batch metrics
+            TOTAL_BATCHES.inc()
+            BATCH_SIZE.observe(batch_size)
+
+            # Calculate queue wait times
+            current_time = time.time()
+            for req in batch:
+                queue_time = current_time - req.created_at
+                BATCH_QUEUE_TIME.observe(queue_time)
+
+            logger.info(
+                "Processing batch",
+                extra={"extra_data": {
+                    "batch_id": self.total_batches,
+                    "batch_size": batch_size
+                }}
+            )
 
             try:
                 # Group requests by cache_key for deduplication
@@ -158,11 +197,45 @@ class RequestBatcher:
 
                 dedup_count = batch_size - len(prompts_to_infer)
                 if dedup_count > 0:
-                    print(f"[Batcher] Deduplicated {dedup_count} requests, inferring {len(prompts_to_infer)} unique prompts")
+                    self.total_deduplicated += dedup_count
+                    DEDUPLICATED_REQUESTS.inc(dedup_count)
+                    DEDUP_RATIO.set(dedup_count / batch_size)
+                    logger.info(
+                        "Deduplicated requests",
+                        extra={"extra_data": {
+                            "deduplicated": dedup_count,
+                            "unique_prompts": len(prompts_to_infer)
+                        }}
+                    )
+                else:
+                    DEDUP_RATIO.set(0)
+
+                UNIQUE_PROMPTS_PER_BATCH.observe(len(prompts_to_infer))
 
                 # Process batch through engine
+                batch_start = time.perf_counter()
                 results = await self._run_batch_inference(
                     prompts_to_infer, max_tokens, temps_to_infer[0], top_ps_to_infer[0]
+                )
+                batch_duration = time.perf_counter() - batch_start
+                BATCH_PROCESSING_TIME.observe(batch_duration)
+
+                # Record inference metrics
+                for result in results:
+                    if result.get("ttft", 0) > 0:
+                        TTFT.observe(result["ttft"])
+                    if result.get("tpot", 0) > 0:
+                        TPOT.observe(result["tpot"])
+                    TOKENS_GENERATED.inc(result.get("total_tokens", 0))
+
+                logger.info(
+                    "Batch inference completed",
+                    extra={"extra_data": {
+                        "batch_id": self.total_batches,
+                        "duration_s": round(batch_duration, 3),
+                        "prompts": len(prompts_to_infer),
+                        "tokens": sum(r.get("total_tokens", 0) for r in results)
+                    }}
                 )
 
                 # Distribute results to waiting requests and cache them
@@ -176,7 +249,15 @@ class RequestBatcher:
 
             except Exception as e:
                 # On error, fail all requests in batch
-                print(f"[Batcher] Batch processing error: {e}")
+                INFERENCE_ERRORS.labels(error_type=type(e).__name__).inc()
+                logger.error(
+                    "Batch processing error",
+                    extra={"extra_data": {
+                        "batch_id": self.total_batches,
+                        "error": str(e),
+                        "error_type": type(e).__name__
+                    }}
+                )
                 for req in batch:
                     if not req.future.done():
                         req.future.set_exception(e)
@@ -250,7 +331,6 @@ class RequestBatcher:
                 "total_tokens": num_tokens
             })
 
-        print(f"[Batcher] Batch inference completed in {total_time:.3f}s for {len(prompts)} prompts")
         return results
 
     def get_metrics(self) -> Dict[str, Any]:
@@ -261,5 +341,6 @@ class RequestBatcher:
             "total_batches": self.total_batches,
             "average_batch_size": round(avg_batch_size, 2),
             "pending_requests": len(self._queue),
+            "total_deduplicated": self.total_deduplicated,
             "cache": self.cache.get_stats(),
         }

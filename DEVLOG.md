@@ -235,21 +235,107 @@ TEST 3: Batch Deduplication         - PASS (5 requests → 1 inference)
 
 ---
 
+## 2025-01-29 - Phase 3.1 Observability / 第三阶段 3.1 可观测性
+
+### Summary / 概述
+
+Implemented structured logging and Prometheus metrics for comprehensive system observability.
+
+实现了结构化日志和 Prometheus 指标，提供全面的系统可观测性。
+
+### What Was Done / 完成内容
+
+| Feature | Description |
+|---------|-------------|
+| **Structured Logging** | JSON-formatted logs with timestamps, levels, and contextual data / JSON 格式日志，包含时间戳、级别和上下文数据 |
+| **Prometheus Metrics** | Counter, Histogram, Gauge metrics for all system components / 全组件 Prometheus 指标 |
+| **Request Middleware** | HTTP middleware for request tracking and latency measurement / HTTP 中间件用于请求追踪和延迟测量 |
+| **Metrics Endpoint** | `/metrics` endpoint in Prometheus format / Prometheus 格式的 `/metrics` 端点 |
+| **JSON Stats Endpoint** | `/stats` endpoint for JSON statistics / JSON 格式的 `/stats` 端点 |
+
+### Prometheus Metrics / 指标列表
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `vgate_requests_total` | Counter | Total requests by endpoint, method, status |
+| `vgate_request_latency_seconds` | Histogram | Request latency distribution |
+| `vgate_batch_size` | Histogram | Batch size distribution |
+| `vgate_batch_processing_seconds` | Histogram | Batch processing time |
+| `vgate_ttft_seconds` | Histogram | Time to first token |
+| `vgate_tpot_seconds` | Histogram | Time per output token |
+| `vgate_tokens_generated_total` | Counter | Total tokens generated |
+| `vgate_cache_hits_total` | Counter | Cache hits |
+| `vgate_cache_misses_total` | Counter | Cache misses |
+| `vgate_deduplicated_requests_total` | Counter | Deduplicated requests |
+
+### Log Format / 日志格式
+
+```json
+{
+  "timestamp": "2025-01-29T10:30:00.123Z",
+  "level": "INFO",
+  "logger": "vgate.batcher",
+  "message": "Batch inference completed",
+  "batch_id": 5,
+  "duration_s": 4.523,
+  "prompts": 8,
+  "tokens": 1024
+}
+```
+
+### Key Files / 关键文件
+
+| File | Purpose |
+|------|---------|
+| `vgate/logging_config.py` | Structured logging configuration with JSON/Console formatters |
+| `vgate/metrics.py` | Prometheus metrics definitions |
+| `vgate/batcher.py` | Updated with logging and metrics integration |
+| `vgate/cache.py` | Updated with Prometheus cache metrics |
+| `main.py` | Added middleware, `/metrics`, `/stats` endpoints |
+| `tests/test_observability.py` | Unit tests for logging and metrics |
+
+### Configuration / 配置
+
+```bash
+# Environment variables
+VGATE_LOG_LEVEL=INFO        # DEBUG, INFO, WARNING, ERROR
+VGATE_LOG_JSON=true         # true for JSON, false for console format
+VGATE_BATCH_SIZE=8          # Max batch size
+VGATE_BATCH_WAIT_MS=50.0    # Max wait time
+VGATE_CACHE_MAXSIZE=1000    # Cache size
+```
+
+### Endpoints / 端点
+
+| Endpoint | Format | Description |
+|----------|--------|-------------|
+| `/metrics` | Prometheus | Prometheus scrape endpoint |
+| `/stats` | JSON | Human-readable statistics |
+| `/health` | JSON | Health check with version |
+
+---
+
 ## Next Steps / 下一步计划
 
-### Phase 2: Performance & Efficiency Optimization / 第二阶段：性能与效率优化
+### Phase 3: Production-Grade Features / 第三阶段：生产级特性
 
 | Priority | Feature | Status | Description |
 |----------|---------|--------|-------------|
-| 1 | **Dynamic Request Batching** | ✅ Done | Aggregate concurrent requests into batches for GPU efficiency |
-| 2 | **Result Caching** | ✅ Done | LRU cache to avoid redundant computations |
-| 3 | **Multi-Worker Load Balancing** | 🔲 Todo | Horizontal scaling with multiple engine instances |
+| 1 | **Observability** | ✅ Done | Structured logging and Prometheus metrics |
+| 2 | **Configuration as Code** | 🔲 Todo | YAML configuration file for all settings |
+| 3 | **Security & Access Control** | 🔲 Todo | API key authentication and rate limiting |
+
+### Phase 2: Remaining / 第二阶段：剩余工作
+
+| Priority | Feature | Status | Description |
+|----------|---------|--------|-------------|
+| 1 | **Multi-Worker Load Balancing** | 🔲 Todo | Horizontal scaling with multiple engine instances (RunPod) |
 
 ### Key Objectives / 核心目标
 
-- Improve throughput under high concurrency / 提升高并发下的吞吐量
-- Reduce average latency per request / 降低平均请求延迟
-- Maximize GPU utilization / 最大化 GPU 利用率
+- Production-ready monitoring and debugging / 生产级监控和调试
+- Flexible configuration management / 灵活的配置管理
+- Secure API access / 安全的 API 访问
 
 ---
 
@@ -259,6 +345,9 @@ TEST 3: Batch Deduplication         - PASS (5 requests → 1 inference)
 - [ ] Phase 2: Performance & Efficiency Optimization / 性能与效率优化
   - [x] 2.1 Dynamic Request Batching / 动态请求批处理
   - [x] 2.2 Result Caching / 结果缓存
-  - [ ] 2.3 Multi-Worker Load Balancing / 多 Worker 负载均衡
+  - [ ] 2.3 Multi-Worker Load Balancing / 多 Worker 负载均衡 (Planned for RunPod)
 - [ ] Phase 3: Production-Grade Features / 生产级特性
+  - [x] 3.1 Observability / 可观测性
+  - [ ] 3.2 Configuration as Code / 配置化管理
+  - [ ] 3.3 Security & Access Control / 安全与访问控制
 - [ ] Phase 4: Ecosystem & Deployment / 生态与部署

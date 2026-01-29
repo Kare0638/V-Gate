@@ -5,6 +5,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from vgate.metrics import CACHE_HITS, CACHE_MISSES, CACHE_SIZE, CACHE_EVICTIONS
+
 
 @dataclass
 class CacheConfig:
@@ -21,6 +23,7 @@ class ResultCache:
         self._lock = asyncio.Lock()
         self.hits = 0
         self.misses = 0
+        self.evictions = 0
 
     @staticmethod
     def make_key(prompt: str, temperature: float, top_p: float, max_tokens: int) -> str:
@@ -39,8 +42,10 @@ class ResultCache:
             if key in self._cache:
                 self._cache.move_to_end(key)
                 self.hits += 1
+                CACHE_HITS.inc()
                 return self._cache[key]
             self.misses += 1
+            CACHE_MISSES.inc()
             return None
 
     async def put(self, key: str, value: Dict) -> None:
@@ -53,6 +58,9 @@ class ResultCache:
                 self._cache[key] = value
                 if len(self._cache) > self.config.maxsize:
                     self._cache.popitem(last=False)
+                    self.evictions += 1
+                    CACHE_EVICTIONS.inc()
+            CACHE_SIZE.set(len(self._cache))
 
     def get_stats(self) -> Dict[str, Any]:
         """Return cache statistics."""
@@ -62,5 +70,6 @@ class ResultCache:
             "maxsize": self.config.maxsize,
             "hits": self.hits,
             "misses": self.misses,
+            "evictions": self.evictions,
             "hit_rate": round(self.hits / total, 4) if total > 0 else 0
         }

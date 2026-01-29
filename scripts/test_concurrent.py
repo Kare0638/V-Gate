@@ -35,8 +35,8 @@ async def send_chat_request(session: aiohttp.ClientSession, prompt: str) -> dict
 
 
 async def get_metrics(session: aiohttp.ClientSession) -> dict:
-    """Get current metrics."""
-    async with session.get(f"{BASE_URL}/metrics") as resp:
+    """Get current metrics (JSON format from /stats endpoint)."""
+    async with session.get(f"{BASE_URL}/stats") as resp:
         return await resp.json()
 
 
