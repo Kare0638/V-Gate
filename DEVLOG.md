@@ -315,6 +315,112 @@ VGATE_CACHE_MAXSIZE=1000    # Cache size
 
 ---
 
+## 2025-01-30 - Phase 3.2 Configuration as Code / 第三阶段 3.2 配置化管理
+
+### Summary / 概述
+
+Implemented YAML-based configuration with Pydantic validation and environment variable overrides for declarative configuration management.
+
+实现了基于 YAML 的配置系统，使用 Pydantic 验证，支持环境变量覆盖，实现声明式配置管理。
+
+### What Was Done / 完成内容
+
+| Feature | Description |
+|---------|-------------|
+| **Pydantic Config Models** | Type-safe configuration with validation / 类型安全的配置验证 |
+| **YAML Configuration** | `config.yaml` for declarative settings / 声明式配置文件 |
+| **Environment Overrides** | `VGATE_<SECTION>__<KEY>` format / 环境变量覆盖支持 |
+| **Global Config Singleton** | `get_config()` for unified access / 全局配置单例 |
+| **Config Priority** | Env vars > YAML > Defaults / 配置优先级：环境变量 > YAML > 默认值 |
+
+### Configuration Structure / 配置结构
+
+```yaml
+version: "0.3.1"
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+
+model:
+  model_id: "Qwen/Qwen2.5-1.5B-Instruct-AWQ"
+  quantization: "awq"
+  gpu_memory_utilization: 0.7
+  max_model_len: 2048
+  trust_remote_code: true
+  enforce_eager: true
+
+batch:
+  max_batch_size: 8
+  max_wait_time_ms: 50.0
+
+cache:
+  enabled: true
+  maxsize: 1000
+
+inference:
+  temperature: 0.7
+  top_p: 0.9
+  max_tokens: 256
+
+logging:
+  level: "INFO"
+  json_format: true
+
+metrics:
+  enabled: true
+```
+
+### Environment Variable Mapping / 环境变量映射
+
+| Old Variable | New Variable | Description |
+|--------------|--------------|-------------|
+| `VGATE_MODEL` | `VGATE_MODEL__MODEL_ID` | Model identifier |
+| `VGATE_BATCH_SIZE` | `VGATE_BATCH__MAX_BATCH_SIZE` | Max batch size |
+| `VGATE_BATCH_WAIT_MS` | `VGATE_BATCH__MAX_WAIT_TIME_MS` | Max wait time |
+| `VGATE_CACHE_MAXSIZE` | `VGATE_CACHE__MAXSIZE` | Cache size limit |
+| `VGATE_LOG_LEVEL` | `VGATE_LOGGING__LEVEL` | Log level |
+| `VGATE_LOG_JSON` | `VGATE_LOGGING__JSON_FORMAT` | JSON log format |
+
+### Key Files / 关键文件
+
+| File | Purpose |
+|------|---------|
+| `vgate/config.py` | Pydantic models and config loading functions |
+| `config.yaml` | Default configuration file |
+| `tests/test_config.py` | Configuration tests |
+
+### Usage Examples / 使用示例
+
+```python
+from vgate.config import get_config
+
+config = get_config()
+print(config.model.model_id)      # Model name
+print(config.batch.max_batch_size) # Batch size
+print(config.logging.level)        # Log level
+```
+
+```bash
+# Override via environment
+export VGATE_SERVER__PORT=9000
+export VGATE_MODEL__MODEL_ID="my-custom-model"
+export VGATE_BATCH__MAX_BATCH_SIZE=16
+
+# Or specify config file path
+export VGATE_CONFIG_PATH=/path/to/config.yaml
+```
+
+### Dependencies Added / 新增依赖
+
+```
+pydantic>=2.0
+pydantic-settings>=2.0
+PyYAML>=6.0
+```
+
+---
+
 ## Next Steps / 下一步计划
 
 ### Phase 3: Production-Grade Features / 第三阶段：生产级特性
@@ -322,7 +428,7 @@ VGATE_CACHE_MAXSIZE=1000    # Cache size
 | Priority | Feature | Status | Description |
 |----------|---------|--------|-------------|
 | 1 | **Observability** | ✅ Done | Structured logging and Prometheus metrics |
-| 2 | **Configuration as Code** | 🔲 Todo | YAML configuration file for all settings |
+| 2 | **Configuration as Code** | ✅ Done | YAML configuration file for all settings |
 | 3 | **Security & Access Control** | 🔲 Todo | API key authentication and rate limiting |
 
 ### Phase 2: Remaining / 第二阶段：剩余工作
@@ -348,6 +454,6 @@ VGATE_CACHE_MAXSIZE=1000    # Cache size
   - [ ] 2.3 Multi-Worker Load Balancing / 多 Worker 负载均衡 (Planned for RunPod)
 - [ ] Phase 3: Production-Grade Features / 生产级特性
   - [x] 3.1 Observability / 可观测性
-  - [ ] 3.2 Configuration as Code / 配置化管理
+  - [x] 3.2 Configuration as Code / 配置化管理
   - [ ] 3.3 Security & Access Control / 安全与访问控制
 - [ ] Phase 4: Ecosystem & Deployment / 生态与部署

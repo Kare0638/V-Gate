@@ -153,6 +153,19 @@ class LogContext:
         self.logger.error(message, extra={"extra_data": extra})
 
 
-# Default configuration from environment
-DEFAULT_LOG_LEVEL = os.getenv("VGATE_LOG_LEVEL", "INFO")
-DEFAULT_JSON_FORMAT = os.getenv("VGATE_LOG_JSON", "true").lower() == "true"
+def get_default_log_level() -> str:
+    """Get the default log level from configuration."""
+    from vgate.config import get_config
+    return get_config().logging.level
+
+
+def get_default_json_format() -> bool:
+    """Get the default JSON format setting from configuration."""
+    from vgate.config import get_config
+    return get_config().logging.json_format
+
+
+# For backward compatibility, these are now functions
+# Use get_default_log_level() and get_default_json_format() instead
+DEFAULT_LOG_LEVEL = os.getenv("VGATE_LOGGING__LEVEL", os.getenv("VGATE_LOG_LEVEL", "INFO"))
+DEFAULT_JSON_FORMAT = os.getenv("VGATE_LOGGING__JSON_FORMAT", os.getenv("VGATE_LOG_JSON", "true")).lower() == "true"
