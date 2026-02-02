@@ -2,19 +2,19 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
-import os
 import sys
 import time
 import uuid
 
 # Add the vgate directory to the Python path
+import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'vgate')))
 
 # Import V-Gate modules
+from config import get_config
 from engine import VGateEngine
 from batcher import RequestBatcher
-from cache import CacheConfig
-from logging_config import setup_logging, get_logger, DEFAULT_LOG_LEVEL, DEFAULT_JSON_FORMAT
+from logging_config import setup_logging, get_logger
 from metrics import (
     REQUEST_COUNT, REQUEST_LATENCY, REQUEST_IN_PROGRESS,
     init_app_info
@@ -23,46 +23,28 @@ from metrics import (
 # Prometheus client for metrics endpoint
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
-# Setup logging
-logger = setup_logging(level=DEFAULT_LOG_LEVEL, json_format=DEFAULT_JSON_FORMAT)
+# Load configuration
+config = get_config()
+
+# Setup logging from config
+logger = setup_logging(level=config.logging.level, json_format=config.logging.json_format)
 app_logger = get_logger("vgate.app")
 
-# Configuration
-BATCH_CONFIG = {
-    "max_batch_size": int(os.getenv("VGATE_BATCH_SIZE", "8")),
-    "max_wait_time_ms": float(os.getenv("VGATE_BATCH_WAIT_MS", "50.0")),
-}
+# Version from config
+APP_VERSION = config.version
 
-CACHE_CONFIG = {
-    "maxsize": int(os.getenv("VGATE_CACHE_MAXSIZE", "1000")),
-}
+# Initialize the VGateEngine with config
+engine = VGateEngine()
 
-LOGGING_CONFIG = {
-    "level": DEFAULT_LOG_LEVEL,
-    "json_format": DEFAULT_JSON_FORMAT,
-}
-
-# Version
-APP_VERSION = "0.3.0"
-
-# Initialize the VGateEngine
-MODEL_NAME = os.getenv("VGATE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct-AWQ")
-engine = VGateEngine(model_name=MODEL_NAME)
-
-# Initialize the RequestBatcher with cache config
-batcher = RequestBatcher(
-    engine=engine,
-    max_batch_size=BATCH_CONFIG["max_batch_size"],
-    max_wait_time_ms=BATCH_CONFIG["max_wait_time_ms"],
-    cache_config=CacheConfig(maxsize=CACHE_CONFIG["maxsize"]),
-)
+# Initialize the RequestBatcher (uses config defaults)
+batcher = RequestBatcher(engine=engine)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager for startup/shutdown."""
     # Initialize app info for Prometheus
-    init_app_info(version=APP_VERSION, model=MODEL_NAME)
+    init_app_info(version=APP_VERSION, model=config.model.model_id)
 
     # Startup: start the batcher
     await batcher.start()
@@ -70,9 +52,15 @@ async def lifespan(app: FastAPI):
         "V-Gate started",
         extra={"extra_data": {
             "version": APP_VERSION,
-            "model": MODEL_NAME,
-            "batch_config": BATCH_CONFIG,
-            "cache_config": CACHE_CONFIG
+            "model": config.model.model_id,
+            "batch_config": {
+                "max_batch_size": config.batch.max_batch_size,
+                "max_wait_time_ms": config.batch.max_wait_time_ms,
+            },
+            "cache_config": {
+                "enabled": config.cache.enabled,
+                "maxsize": config.cache.maxsize,
+            }
         }}
     )
     yield
@@ -270,9 +258,18 @@ async def get_stats():
         },
         "cache": metrics["cache"],
         "config": {
-            "batch": BATCH_CONFIG,
-            "cache": CACHE_CONFIG,
-            "logging": LOGGING_CONFIG,
+            "batch": {
+                "max_batch_size": config.batch.max_batch_size,
+                "max_wait_time_ms": config.batch.max_wait_time_ms,
+            },
+            "cache": {
+                "enabled": config.cache.enabled,
+                "maxsize": config.cache.maxsize,
+            },
+            "logging": {
+                "level": config.logging.level,
+                "json_format": config.logging.json_format,
+            },
         },
         "version": APP_VERSION,
     }
@@ -280,4 +277,4 @@ async def get_stats():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=config.server.host, port=config.server.port)

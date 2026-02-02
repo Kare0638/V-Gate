@@ -2,23 +2,25 @@ import asyncio
 import hashlib
 import json
 from collections import OrderedDict
-from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+from vgate.config import get_config, CacheConfig
 from vgate.metrics import CACHE_HITS, CACHE_MISSES, CACHE_SIZE, CACHE_EVICTIONS
-
-
-@dataclass
-class CacheConfig:
-    """Configuration for the result cache."""
-    maxsize: int = 1000
 
 
 class ResultCache:
     """LRU cache for inference results."""
 
-    def __init__(self, config: CacheConfig = None):
-        self.config = config or CacheConfig()
+    def __init__(self, cache_config: Optional[CacheConfig] = None):
+        """
+        Initialize the result cache.
+
+        Args:
+            cache_config: Cache configuration. Uses global config if None.
+        """
+        if cache_config is None:
+            cache_config = get_config().cache
+        self.config = cache_config
         self._cache: OrderedDict[str, Dict] = OrderedDict()
         self._lock = asyncio.Lock()
         self.hits = 0

@@ -1,17 +1,30 @@
-import os
 import time
+from typing import Optional
+
 from vllm import LLM, SamplingParams
 
+from vgate.config import ModelConfig, get_config
+
+
 class VGateEngine:
-    def __init__(self, model_name="Qwen/Qwen2.5-1.5B-Instruct-AWQ"):
-        print(f"Loading {model_name} with AWQ quantization for RTX 3060 optimization...")
+    def __init__(self, model_config: Optional[ModelConfig] = None):
+        """
+        Initialize the vLLM engine with configuration.
+
+        Args:
+            model_config: Model configuration. If None, uses global config.
+        """
+        if model_config is None:
+            model_config = get_config().model
+
+        print(f"Loading {model_config.model_id} with {model_config.quantization} quantization...")
         self.llm = LLM(
-            model=model_name,
-            quantization="awq",           # 核心: 开启量化
-            gpu_memory_utilization=0.7,   # 预留 30% 显存给 KV Cache
-            max_model_len=2048,           # 限制上下文
-            enforce_eager=True,           # 关闭 CUDA Graph 以节省显存
-            trust_remote_code=True
+            model=model_config.model_id,
+            quantization=model_config.quantization,
+            gpu_memory_utilization=model_config.gpu_memory_utilization,
+            max_model_len=model_config.max_model_len,
+            enforce_eager=model_config.enforce_eager,
+            trust_remote_code=model_config.trust_remote_code,
         )
 
     def chat_completions(self, prompt, max_tokens=256):

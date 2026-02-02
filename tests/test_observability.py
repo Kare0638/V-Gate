@@ -21,7 +21,8 @@ from metrics import (
     REQUEST_COUNT, REQUEST_LATENCY, BATCH_SIZE, CACHE_HITS, CACHE_MISSES,
     TOKENS_GENERATED, init_app_info
 )
-from cache import ResultCache, CacheConfig
+from cache import ResultCache
+from config import CacheConfig
 from batcher import RequestBatcher
 
 
@@ -263,7 +264,6 @@ def batcher_with_metrics(mock_engine):
         engine=mock_engine,
         max_batch_size=4,
         max_wait_time_ms=50.0,
-        cache_config=CacheConfig(maxsize=100),
     )
 
 

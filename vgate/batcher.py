@@ -1,9 +1,10 @@
 import asyncio
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 
-from vgate.cache import ResultCache, CacheConfig
+from vgate.cache import ResultCache
+from vgate.config import get_config, CacheConfig as ConfigCacheConfig
 from vgate.logging_config import get_logger
 from vgate.metrics import (
     BATCH_SIZE, BATCH_PROCESSING_TIME, BATCH_QUEUE_TIME,
@@ -40,14 +41,22 @@ class RequestBatcher:
     def __init__(
         self,
         engine,
-        max_batch_size: int = 8,
-        max_wait_time_ms: float = 50.0,
-        cache_config: CacheConfig = None,
+        max_batch_size: Optional[int] = None,
+        max_wait_time_ms: Optional[float] = None,
     ):
+        """
+        Initialize the request batcher.
+
+        Args:
+            engine: The VGateEngine instance.
+            max_batch_size: Max requests per batch. Uses config default if None.
+            max_wait_time_ms: Max wait time before processing. Uses config default if None.
+        """
+        config = get_config()
         self.engine = engine
-        self.max_batch_size = max_batch_size
-        self.max_wait_time_ms = max_wait_time_ms
-        self.cache = ResultCache(cache_config)
+        self.max_batch_size = max_batch_size if max_batch_size is not None else config.batch.max_batch_size
+        self.max_wait_time_ms = max_wait_time_ms if max_wait_time_ms is not None else config.batch.max_wait_time_ms
+        self.cache = ResultCache()
 
         self._queue: List[BatchRequest] = []
         self._lock = asyncio.Lock()
@@ -91,15 +100,30 @@ class RequestBatcher:
     async def submit(
         self,
         prompt: str,
-        max_tokens: int = 256,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Submit a request for batched processing.
         Returns the result when the batch is processed.
         Checks cache first and returns cached result if available.
+
+        Args:
+            prompt: The input prompt.
+            max_tokens: Max tokens to generate. Uses config default if None.
+            temperature: Sampling temperature. Uses config default if None.
+            top_p: Top-p sampling. Uses config default if None.
         """
+        # Apply defaults from config
+        config = get_config()
+        if max_tokens is None:
+            max_tokens = config.inference.max_tokens
+        if temperature is None:
+            temperature = config.inference.temperature
+        if top_p is None:
+            top_p = config.inference.top_p
+
         cache_key = ResultCache.make_key(prompt, temperature, top_p, max_tokens)
 
         # Check cache first

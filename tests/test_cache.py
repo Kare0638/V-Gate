@@ -11,22 +11,25 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'vgate'))
 
-from cache import ResultCache, CacheConfig
+from cache import ResultCache
+from config import CacheConfig
 from batcher import RequestBatcher
 
 
 class TestCacheConfig:
-    """Tests for CacheConfig dataclass."""
+    """Tests for CacheConfig model."""
 
     def test_default_config(self):
         """Test default configuration values."""
         config = CacheConfig()
         assert config.maxsize == 1000
+        assert config.enabled is True
 
     def test_custom_config(self):
         """Test custom configuration values."""
-        config = CacheConfig(maxsize=500)
+        config = CacheConfig(maxsize=500, enabled=False)
         assert config.maxsize == 500
+        assert config.enabled is False
 
 
 class TestResultCache:
@@ -179,7 +182,6 @@ def cached_batcher(mock_engine):
         engine=mock_engine,
         max_batch_size=4,
         max_wait_time_ms=50.0,
-        cache_config=CacheConfig(maxsize=100),
     )
 
 
