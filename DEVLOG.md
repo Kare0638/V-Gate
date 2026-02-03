@@ -421,6 +421,111 @@ PyYAML>=6.0
 
 ---
 
+## 2025-02-03 - Phase 3.3 Security & Access Control / 第三阶段 3.3 安全与访问控制
+
+### Summary / 概述
+
+Implemented API key authentication and rate limiting middleware for secure API access in production environments.
+
+实现了 API 密钥认证和速率限制中间件，为生产环境提供安全的 API 访问控制。
+
+### What Was Done / 完成内容
+
+| Feature | Description |
+|---------|-------------|
+| **API Key Authentication** | Bearer token validation middleware / Bearer token 验证中间件 |
+| **Rate Limiting** | Sliding window algorithm per API key / 基于 API key 的滑动窗口限流 |
+| **X-RateLimit Headers** | Standard rate limit headers in responses / 标准速率限制响应头 |
+| **Exempt Paths** | Configurable paths that skip authentication / 可配置的免认证路径 |
+| **Configuration** | YAML and environment variable support / YAML 和环境变量配置支持 |
+
+### Architecture / 架构
+
+```
+Request → [Security Middleware] → [Observability Middleware] → [Endpoint]
+              │
+              ├─ 1. Check exempt paths (/health, /metrics)
+              ├─ 2. Extract Bearer token from Authorization header
+              ├─ 3. Validate API key → 401 if invalid
+              └─ 4. Check rate limit → 429 if exceeded
+```
+
+### Configuration / 配置
+
+```yaml
+security:
+  enabled: true  # Enable in production
+
+  api_keys:
+    - key: "sk-vgate-prod-xxxxx"
+      name: "production"
+      rate_limit: 100  # requests per minute
+    - key: "sk-vgate-dev-xxxxx"
+      name: "development"
+      rate_limit: 1000
+
+  rate_limiting:
+    enabled: true
+    default_limit: 60    # requests per minute
+    window_seconds: 60   # sliding window size
+
+  exempt_paths:
+    - "/health"
+    - "/metrics"
+```
+
+### Environment Variables / 环境变量
+
+| Variable | Description |
+|----------|-------------|
+| `VGATE_SECURITY__ENABLED` | Enable/disable security (true/false) |
+| `VGATE_SECURITY__RATE_LIMITING__ENABLED` | Enable/disable rate limiting |
+| `VGATE_SECURITY__RATE_LIMITING__DEFAULT_LIMIT` | Default rate limit |
+
+### Response Headers / 响应头
+
+| Header | Description |
+|--------|-------------|
+| `X-RateLimit-Limit` | Maximum requests allowed in window |
+| `X-RateLimit-Remaining` | Remaining requests in current window |
+| `X-RateLimit-Reset` | Unix timestamp when window resets |
+| `Retry-After` | Seconds to wait (only on 429 response) |
+
+### Error Responses / 错误响应
+
+```json
+// 401 Unauthorized - Missing or invalid API key
+{"detail": "Missing API key. Use Authorization: Bearer <api_key>"}
+{"detail": "Invalid API key"}
+
+// 429 Too Many Requests - Rate limit exceeded
+{"detail": "Rate limit exceeded", "retry_after": 30}
+```
+
+### Usage Example / 使用示例
+
+```bash
+# Request with API key
+curl -H "Authorization: Bearer sk-vgate-prod-xxxxx" \
+     http://localhost:8000/v1/chat/completions \
+     -d '{"model": "qwen", "messages": [{"role": "user", "content": "Hello"}]}'
+
+# Check rate limit headers
+curl -I -H "Authorization: Bearer sk-vgate-prod-xxxxx" \
+     http://localhost:8000/v1/chat/completions
+```
+
+### Key Files / 关键文件
+
+| File | Purpose |
+|------|---------|
+| `vgate/security.py` | RateLimiter and SecurityMiddleware implementation |
+| `vgate/config.py` | SecurityConfig, APIKeyConfig, RateLimitConfig models |
+| `config.yaml` | Security configuration section |
+| `tests/test_security.py` | Unit tests for security features |
+
+---
+
 ## Next Steps / 下一步计划
 
 ### Phase 3: Production-Grade Features / 第三阶段：生产级特性
@@ -429,7 +534,7 @@ PyYAML>=6.0
 |----------|---------|--------|-------------|
 | 1 | **Observability** | ✅ Done | Structured logging and Prometheus metrics |
 | 2 | **Configuration as Code** | ✅ Done | YAML configuration file for all settings |
-| 3 | **Security & Access Control** | 🔲 Todo | API key authentication and rate limiting |
+| 3 | **Security & Access Control** | ✅ Done | API key authentication and rate limiting |
 
 ### Phase 2: Remaining / 第二阶段：剩余工作
 
@@ -439,9 +544,9 @@ PyYAML>=6.0
 
 ### Key Objectives / 核心目标
 
-- Production-ready monitoring and debugging / 生产级监控和调试
-- Flexible configuration management / 灵活的配置管理
-- Secure API access / 安全的 API 访问
+- ✅ Production-ready monitoring and debugging / 生产级监控和调试
+- ✅ Flexible configuration management / 灵活的配置管理
+- ✅ Secure API access / 安全的 API 访问
 
 ---
 
@@ -452,8 +557,8 @@ PyYAML>=6.0
   - [x] 2.1 Dynamic Request Batching / 动态请求批处理
   - [x] 2.2 Result Caching / 结果缓存
   - [ ] 2.3 Multi-Worker Load Balancing / 多 Worker 负载均衡 (Planned for RunPod)
-- [ ] Phase 3: Production-Grade Features / 生产级特性
+- [x] Phase 3: Production-Grade Features / 生产级特性
   - [x] 3.1 Observability / 可观测性
   - [x] 3.2 Configuration as Code / 配置化管理
-  - [ ] 3.3 Security & Access Control / 安全与访问控制
+  - [x] 3.3 Security & Access Control / 安全与访问控制
 - [ ] Phase 4: Ecosystem & Deployment / 生态与部署

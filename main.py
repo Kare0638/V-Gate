@@ -19,6 +19,7 @@ from metrics import (
     REQUEST_COUNT, REQUEST_LATENCY, REQUEST_IN_PROGRESS,
     init_app_info
 )
+from security import SecurityMiddleware
 
 # Prometheus client for metrics endpoint
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
@@ -60,6 +61,11 @@ async def lifespan(app: FastAPI):
             "cache_config": {
                 "enabled": config.cache.enabled,
                 "maxsize": config.cache.maxsize,
+            },
+            "security_config": {
+                "enabled": config.security.enabled,
+                "api_keys_count": len(config.security.api_keys),
+                "rate_limiting_enabled": config.security.rate_limiting.enabled,
             }
         }}
     )
@@ -75,6 +81,10 @@ app = FastAPI(
     version=APP_VERSION,
     lifespan=lifespan,
 )
+
+# Add security middleware (runs before observability middleware)
+# Note: Middlewares are executed in LIFO order, so add security first
+app.add_middleware(SecurityMiddleware, config=config.security)
 
 
 # Request/Response middleware for logging and metrics
@@ -269,6 +279,11 @@ async def get_stats():
             "logging": {
                 "level": config.logging.level,
                 "json_format": config.logging.json_format,
+            },
+            "security": {
+                "enabled": config.security.enabled,
+                "rate_limiting_enabled": config.security.rate_limiting.enabled,
+                "exempt_paths": config.security.exempt_paths,
             },
         },
         "version": APP_VERSION,

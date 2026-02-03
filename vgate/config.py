@@ -66,6 +66,28 @@ class MetricsConfig(BaseModel):
     enabled: bool = True
 
 
+class APIKeyConfig(BaseModel):
+    """Single API key configuration."""
+    key: str
+    name: str
+    rate_limit: int = 60  # requests per minute
+
+
+class RateLimitConfig(BaseModel):
+    """Rate limiting configuration."""
+    enabled: bool = True
+    default_limit: int = 60  # requests per minute for unknown keys
+    window_seconds: int = 60  # sliding window size
+
+
+class SecurityConfig(BaseModel):
+    """Security and access control configuration."""
+    enabled: bool = False  # Disabled by default for development
+    api_keys: list[APIKeyConfig] = Field(default_factory=list)
+    rate_limiting: RateLimitConfig = Field(default_factory=RateLimitConfig)
+    exempt_paths: list[str] = Field(default_factory=lambda: ["/health", "/metrics"])
+
+
 class YamlConfigSettingsSource(PydanticBaseSettingsSource):
     """Custom settings source that loads from a YAML file."""
 
@@ -122,7 +144,7 @@ class VGateConfig(BaseSettings):
         extra="ignore",
     )
 
-    version: str = "0.3.1"
+    version: str = "0.3.2"
     server: ServerConfig = Field(default_factory=ServerConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
     batch: BatchConfig = Field(default_factory=BatchConfig)
@@ -130,6 +152,7 @@ class VGateConfig(BaseSettings):
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
 
     @classmethod
     def settings_customise_sources(
