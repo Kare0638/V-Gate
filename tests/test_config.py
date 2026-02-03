@@ -110,7 +110,7 @@ class TestDefaultConfig:
     def test_default_version(self, clean_env):
         """Test default version."""
         config = VGateConfig()
-        assert config.version == "0.3.1"
+        assert config.version == "0.3.2"
 
 
 class TestYamlLoading:

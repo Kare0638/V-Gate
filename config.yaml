@@ -8,7 +8,7 @@
 # Environment variable format: VGATE_<SECTION>__<KEY>
 # Example: VGATE_BATCH__MAX_BATCH_SIZE=16
 
-version: "0.3.1"
+version: "0.3.2"
 
 # Server settings / 服务器设置
 server:
@@ -48,3 +48,29 @@ logging:
 # Prometheus metrics / Prometheus 指标
 metrics:
   enabled: true
+
+# Security & Access Control / 安全与访问控制
+security:
+  enabled: false  # Set to true in production / 生产环境设为 true
+
+  # API Keys / API 密钥
+  # Format: Authorization: Bearer <key>
+  api_keys:
+    - key: "sk-vgate-dev-example"
+      name: "development"
+      rate_limit: 1000  # requests per minute
+    # Add more keys as needed / 按需添加更多密钥
+    # - key: "sk-vgate-prod-xxxxx"
+    #   name: "production"
+    #   rate_limit: 100
+
+  # Rate Limiting / 速率限制
+  rate_limiting:
+    enabled: true
+    default_limit: 60    # requests per minute for unknown keys / 未知密钥的默认限制
+    window_seconds: 60   # sliding window size / 滑动窗口大小
+
+  # Paths exempt from authentication / 免认证路径
+  exempt_paths:
+    - "/health"
+    - "/metrics"
