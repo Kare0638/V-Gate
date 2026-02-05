@@ -1,33 +1,31 @@
-# V-Gate Development Log / 开发日志
+# V-Gate Development Log
 
 ---
 
-## 2025-01-23 - Phase 1 MVP Complete / 第一阶段 MVP 完成
+## 2025-01-23 - Phase 1 MVP Complete
 
-### Summary / 概述
+### Summary
 
 Implemented the core API gateway with OpenAI-compatible endpoints, establishing V-Gate as a unified middleware for AI model serving.
 
-实现了核心 API 网关，提供 OpenAI 兼容接口，将 V-Gate 打造为统一的 AI 模型服务中间件。
-
-### What Was Done / 完成内容
+### What Was Done
 
 | Feature | Description |
 |---------|-------------|
-| **FastAPI Server** | Built RESTful API server with async support / 构建支持异步的 RESTful API 服务 |
-| **`/v1/chat/completions`** | Chat completion endpoint compliant with OpenAI API spec / 符合 OpenAI API 规范的聊天补全接口 |
-| **`/v1/embeddings`** | Embedding endpoint with mock implementation / 嵌入接口（Mock 实现） |
-| **`/health`** | Health check endpoint for service monitoring / 健康检查接口 |
-| **Engine Refactor** | Renamed `generate()` to `chat_completions()` for API consistency / 重命名方法以保持 API 一致性 |
+| **FastAPI Server** | Built RESTful API server with async support |
+| **`/v1/chat/completions`** | Chat completion endpoint compliant with OpenAI API spec |
+| **`/v1/embeddings`** | Embedding endpoint with mock implementation |
+| **`/health`** | Health check endpoint for service monitoring |
+| **Engine Refactor** | Renamed `generate()` to `chat_completions()` for API consistency |
 
-### Technical Highlights / 技术亮点
+### Technical Highlights
 
 - **Framework**: FastAPI with Pydantic validation
 - **Inference Engine**: vLLM with AWQ 4-bit quantization
 - **Model**: Qwen/Qwen2.5-1.5B-Instruct-AWQ (optimized for RTX 3060)
 - **API Standard**: OpenAI-compatible interface for easy integration
 
-### Commit / 提交记录
+### Commit
 
 ```
 feat: implement OpenAI-compatible API gateway (Phase 1 MVP)
@@ -37,25 +35,23 @@ Branch: `feat/phase1-api-gateway`
 
 ---
 
-## 2025-01-27 - Phase 2.1 Dynamic Request Batching / 第二阶段 2.1 动态请求批处理
+## 2025-01-27 - Phase 2.1 Dynamic Request Batching
 
-### Summary / 概述
+### Summary
 
 Implemented dynamic request batching to aggregate concurrent requests into batches for improved GPU utilization and throughput.
 
-实现了动态请求批处理功能，将并发请求聚合成批次，提升 GPU 利用率和吞吐量。
-
-### What Was Done / 完成内容
+### What Was Done
 
 | Feature | Description |
 |---------|-------------|
-| **RequestBatcher** | Core batching engine with async queue and background processing / 核心批处理引擎，支持异步队列和后台处理 |
-| **Time-bounded Batching** | Triggers batch when `max_batch_size=8` or `max_wait_time_ms=50` / 达到批次上限或超时时触发批处理 |
-| **Thread Pool Execution** | Uses `run_in_executor()` to avoid blocking event loop / 使用线程池执行避免阻塞事件循环 |
-| **Metrics Endpoint** | `/metrics` endpoint for monitoring batch statistics / `/metrics` 端点用于监控批处理统计 |
-| **Lifespan Management** | Proper startup/shutdown hooks with FastAPI lifespan / FastAPI 生命周期钩子管理启动/关闭 |
+| **RequestBatcher** | Core batching engine with async queue and background processing |
+| **Time-bounded Batching** | Triggers batch when `max_batch_size=8` or `max_wait_time_ms=50` |
+| **Thread Pool Execution** | Uses `run_in_executor()` to avoid blocking event loop |
+| **Metrics Endpoint** | `/metrics` endpoint for monitoring batch statistics |
+| **Lifespan Management** | Proper startup/shutdown hooks with FastAPI lifespan |
 
-### Architecture / 架构
+### Architecture
 
 ```
 Request 1 ─┐
@@ -63,56 +59,41 @@ Request 2 ─┼──> AsyncIO Queue ──> BatchCollector ──> vLLM.genera
 Request 3 ─┘     (List)            (50ms window)                                    (Future resolution)
 ```
 
-### Key Files / 关键文件
+### Key Files
 
 | File | Purpose |
 |------|---------|
 | `vgate/batcher.py` | `RequestBatcher` class with queue, batch loop, and metrics |
 | `main.py` | Integration with lifespan hooks and `/metrics` endpoint |
 
-### Configuration / 配置
+### Configuration
 
 ```python
 BATCH_CONFIG = {
-    "max_batch_size": 8,       # 每批最大请求数
-    "max_wait_time_ms": 50.0,  # 最大等待时间（毫秒）
-}
-```
-
-### Metrics Available / 可用指标
-
-```json
-{
-  "batcher": {
-    "total_requests": 100,
-    "total_batches": 25,
-    "average_batch_size": 4.0,
-    "pending_requests": 0
-  }
+    "max_batch_size": 8,
+    "max_wait_time_ms": 50.0,
 }
 ```
 
 ---
 
-## 2025-01-27 - Phase 2.2 Result Caching / 第二阶段 2.2 结果缓存
+## 2025-01-27 - Phase 2.2 Result Caching
 
-### Summary / 概述
+### Summary
 
 Implemented LRU result caching to avoid redundant computations, with batch-level deduplication for identical prompts within the same batch.
 
-实现了 LRU 结果缓存以避免重复计算，并支持批次内相同 prompt 的去重优化。
-
-### What Was Done / 完成内容
+### What Was Done
 
 | Feature | Description |
 |---------|-------------|
-| **ResultCache** | LRU cache with configurable size (default 1000 entries) / 可配置大小的 LRU 缓存（默认 1000 条） |
-| **Cache Key** | SHA256 hash of `prompt + temperature + top_p + max_tokens` / 基于参数组合的 SHA256 哈希键 |
-| **Batch Deduplication** | Identical prompts in same batch share single inference / 同批次相同 prompt 共享单次推理 |
-| **Cache Metrics** | Hit rate, size, and usage stats in `/metrics` endpoint / `/metrics` 端点中的缓存命中率和使用统计 |
-| **Environment Config** | `VGATE_CACHE_MAXSIZE` env var for cache size / 环境变量配置缓存大小 |
+| **ResultCache** | LRU cache with configurable size (default 1000 entries) |
+| **Cache Key** | SHA256 hash of `prompt + temperature + top_p + max_tokens` |
+| **Batch Deduplication** | Identical prompts in same batch share single inference |
+| **Cache Metrics** | Hit rate, size, and usage stats in `/metrics` endpoint |
+| **Environment Config** | `VGATE_CACHE_MAXSIZE` env var for cache size |
 
-### Architecture / 架构
+### Architecture
 
 ```
 Request 1 (prompt A) ─┐
@@ -126,44 +107,7 @@ Request 3 (prompt B) ─┘        │
                     [Cache Store] + [Result Dispatch]
 ```
 
-### Key Files / 关键文件
-
-| File | Purpose |
-|------|---------|
-| `vgate/cache.py` | `ResultCache` class with LRU eviction and stats |
-| `vgate/batcher.py` | Cache integration and batch deduplication logic |
-| `main.py` | Cache configuration and updated `/metrics` endpoint |
-| `tests/test_cache.py` | Unit tests for cache and deduplication |
-
-### Configuration / 配置
-
-```python
-CACHE_CONFIG = {
-    "maxsize": int(os.getenv("VGATE_CACHE_MAXSIZE", "1000")),
-}
-```
-
-### Metrics Available / 可用指标
-
-```json
-{
-  "batcher": {
-    "total_requests": 100,
-    "total_batches": 25,
-    "average_batch_size": 4.0,
-    "pending_requests": 0
-  },
-  "cache": {
-    "size": 50,
-    "maxsize": 1000,
-    "hits": 30,
-    "misses": 70,
-    "hit_rate": 0.3
-  }
-}
-```
-
-### Performance Impact / 性能影响
+### Performance Impact
 
 | Scenario | Latency | GPU Load |
 |----------|---------|----------|
@@ -173,30 +117,17 @@ CACHE_CONFIG = {
 
 ---
 
-## 2025-01-28 - Phase 2 Bug Fix & Testing / 第二阶段 Bug 修复与测试
+## 2025-01-28 - Phase 2 Bug Fix & Testing
 
-### Summary / 概述
+### Summary
 
 Fixed a race condition in concurrent vLLM calls and added a comprehensive testing script for Phase 2 features.
 
-修复了并发 vLLM 调用的竞态条件，并添加了 Phase 2 功能的综合测试脚本。
-
-### What Was Done / 完成内容
-
-| Feature | Description |
-|---------|-------------|
-| **Inference Lock** | Added `_inference_lock` to prevent concurrent vLLM calls / 添加推理锁防止并发 vLLM 调用 |
-| **Concurrent Test Script** | `scripts/test_concurrent.py` for testing batching, caching, and deduplication / 并发测试脚本 |
-
-### Bug Fixed / 修复的问题
+### Bug Fixed
 
 **Issue**: When multiple batches were triggered simultaneously (from timeout and queue full), concurrent `vLLM.generate()` calls caused `ValueError: b'\x00\x00' is not a valid EngineCoreRequestType`.
 
-**问题**: 当多个批次同时触发（超时和队列满）时，并发的 `vLLM.generate()` 调用导致引擎核心请求类型错误。
-
 **Solution**: Added `_inference_lock` to ensure only one batch inference runs at a time.
-
-**解决方案**: 添加 `_inference_lock` 确保同一时间只有一个批次在推理。
 
 ```python
 self._inference_lock = asyncio.Lock()
@@ -206,19 +137,7 @@ async def _process_batch(self):
         # ... batch processing logic ...
 ```
 
-### Test Script / 测试脚本
-
-```bash
-python scripts/test_concurrent.py
-```
-
-| Test | Description |
-|------|-------------|
-| **Test 1: Batching** | 10 concurrent requests → 1 batch |
-| **Test 2: Caching** | Duplicate requests hit cache (< 1ms) |
-| **Test 3: Deduplication** | 5 identical prompts → 1 inference |
-
-### Test Results / 测试结果
+### Test Results
 
 ```
 TEST 1: Dynamic Request Batching    - PASS (10 requests → 1 batch)
@@ -226,34 +145,25 @@ TEST 2: Result Caching              - PASS (4738x speedup)
 TEST 3: Batch Deduplication         - PASS (5 requests → 1 inference)
 ```
 
-### Commits / 提交记录
-
-```
-628ab0d fix: add inference lock to prevent concurrent vLLM calls
-6c2531d test: add Phase 2 concurrent testing script
-```
-
 ---
 
-## 2025-01-29 - Phase 3.1 Observability / 第三阶段 3.1 可观测性
+## 2025-01-29 - Phase 3.1 Observability
 
-### Summary / 概述
+### Summary
 
 Implemented structured logging and Prometheus metrics for comprehensive system observability.
 
-实现了结构化日志和 Prometheus 指标，提供全面的系统可观测性。
-
-### What Was Done / 完成内容
+### What Was Done
 
 | Feature | Description |
 |---------|-------------|
-| **Structured Logging** | JSON-formatted logs with timestamps, levels, and contextual data / JSON 格式日志，包含时间戳、级别和上下文数据 |
-| **Prometheus Metrics** | Counter, Histogram, Gauge metrics for all system components / 全组件 Prometheus 指标 |
-| **Request Middleware** | HTTP middleware for request tracking and latency measurement / HTTP 中间件用于请求追踪和延迟测量 |
-| **Metrics Endpoint** | `/metrics` endpoint in Prometheus format / Prometheus 格式的 `/metrics` 端点 |
-| **JSON Stats Endpoint** | `/stats` endpoint for JSON statistics / JSON 格式的 `/stats` 端点 |
+| **Structured Logging** | JSON-formatted logs with timestamps, levels, and contextual data |
+| **Prometheus Metrics** | Counter, Histogram, Gauge metrics for all system components |
+| **Request Middleware** | HTTP middleware for request tracking and latency measurement |
+| **Metrics Endpoint** | `/metrics` endpoint in Prometheus format |
+| **JSON Stats Endpoint** | `/stats` endpoint for JSON statistics |
 
-### Prometheus Metrics / 指标列表
+### Prometheus Metrics
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -266,9 +176,8 @@ Implemented structured logging and Prometheus metrics for comprehensive system o
 | `vgate_tokens_generated_total` | Counter | Total tokens generated |
 | `vgate_cache_hits_total` | Counter | Cache hits |
 | `vgate_cache_misses_total` | Counter | Cache misses |
-| `vgate_deduplicated_requests_total` | Counter | Deduplicated requests |
 
-### Log Format / 日志格式
+### Log Format
 
 ```json
 {
@@ -283,57 +192,25 @@ Implemented structured logging and Prometheus metrics for comprehensive system o
 }
 ```
 
-### Key Files / 关键文件
-
-| File | Purpose |
-|------|---------|
-| `vgate/logging_config.py` | Structured logging configuration with JSON/Console formatters |
-| `vgate/metrics.py` | Prometheus metrics definitions |
-| `vgate/batcher.py` | Updated with logging and metrics integration |
-| `vgate/cache.py` | Updated with Prometheus cache metrics |
-| `main.py` | Added middleware, `/metrics`, `/stats` endpoints |
-| `tests/test_observability.py` | Unit tests for logging and metrics |
-
-### Configuration / 配置
-
-```bash
-# Environment variables
-VGATE_LOG_LEVEL=INFO        # DEBUG, INFO, WARNING, ERROR
-VGATE_LOG_JSON=true         # true for JSON, false for console format
-VGATE_BATCH_SIZE=8          # Max batch size
-VGATE_BATCH_WAIT_MS=50.0    # Max wait time
-VGATE_CACHE_MAXSIZE=1000    # Cache size
-```
-
-### Endpoints / 端点
-
-| Endpoint | Format | Description |
-|----------|--------|-------------|
-| `/metrics` | Prometheus | Prometheus scrape endpoint |
-| `/stats` | JSON | Human-readable statistics |
-| `/health` | JSON | Health check with version |
-
 ---
 
-## 2025-01-30 - Phase 3.2 Configuration as Code / 第三阶段 3.2 配置化管理
+## 2025-01-30 - Phase 3.2 Configuration as Code
 
-### Summary / 概述
+### Summary
 
 Implemented YAML-based configuration with Pydantic validation and environment variable overrides for declarative configuration management.
 
-实现了基于 YAML 的配置系统，使用 Pydantic 验证，支持环境变量覆盖，实现声明式配置管理。
-
-### What Was Done / 完成内容
+### What Was Done
 
 | Feature | Description |
 |---------|-------------|
-| **Pydantic Config Models** | Type-safe configuration with validation / 类型安全的配置验证 |
-| **YAML Configuration** | `config.yaml` for declarative settings / 声明式配置文件 |
-| **Environment Overrides** | `VGATE_<SECTION>__<KEY>` format / 环境变量覆盖支持 |
-| **Global Config Singleton** | `get_config()` for unified access / 全局配置单例 |
-| **Config Priority** | Env vars > YAML > Defaults / 配置优先级：环境变量 > YAML > 默认值 |
+| **Pydantic Config Models** | Type-safe configuration with validation |
+| **YAML Configuration** | `config.yaml` for declarative settings |
+| **Environment Overrides** | `VGATE_<SECTION>__<KEY>` format |
+| **Global Config Singleton** | `get_config()` for unified access |
+| **Config Priority** | Env vars > YAML > Defaults |
 
-### Configuration Structure / 配置结构
+### Configuration Structure
 
 ```yaml
 version: "0.3.1"
@@ -346,9 +223,6 @@ model:
   model_id: "Qwen/Qwen2.5-1.5B-Instruct-AWQ"
   quantization: "awq"
   gpu_memory_utilization: 0.7
-  max_model_len: 2048
-  trust_remote_code: true
-  enforce_eager: true
 
 batch:
   max_batch_size: 8
@@ -358,88 +232,41 @@ cache:
   enabled: true
   maxsize: 1000
 
-inference:
-  temperature: 0.7
-  top_p: 0.9
-  max_tokens: 256
-
 logging:
   level: "INFO"
   json_format: true
-
-metrics:
-  enabled: true
 ```
 
-### Environment Variable Mapping / 环境变量映射
-
-| Old Variable | New Variable | Description |
-|--------------|--------------|-------------|
-| `VGATE_MODEL` | `VGATE_MODEL__MODEL_ID` | Model identifier |
-| `VGATE_BATCH_SIZE` | `VGATE_BATCH__MAX_BATCH_SIZE` | Max batch size |
-| `VGATE_BATCH_WAIT_MS` | `VGATE_BATCH__MAX_WAIT_TIME_MS` | Max wait time |
-| `VGATE_CACHE_MAXSIZE` | `VGATE_CACHE__MAXSIZE` | Cache size limit |
-| `VGATE_LOG_LEVEL` | `VGATE_LOGGING__LEVEL` | Log level |
-| `VGATE_LOG_JSON` | `VGATE_LOGGING__JSON_FORMAT` | JSON log format |
-
-### Key Files / 关键文件
-
-| File | Purpose |
-|------|---------|
-| `vgate/config.py` | Pydantic models and config loading functions |
-| `config.yaml` | Default configuration file |
-| `tests/test_config.py` | Configuration tests |
-
-### Usage Examples / 使用示例
-
-```python
-from vgate.config import get_config
-
-config = get_config()
-print(config.model.model_id)      # Model name
-print(config.batch.max_batch_size) # Batch size
-print(config.logging.level)        # Log level
-```
+### Usage
 
 ```bash
 # Override via environment
 export VGATE_SERVER__PORT=9000
 export VGATE_MODEL__MODEL_ID="my-custom-model"
-export VGATE_BATCH__MAX_BATCH_SIZE=16
 
 # Or specify config file path
 export VGATE_CONFIG_PATH=/path/to/config.yaml
 ```
 
-### Dependencies Added / 新增依赖
-
-```
-pydantic>=2.0
-pydantic-settings>=2.0
-PyYAML>=6.0
-```
-
 ---
 
-## 2025-02-03 - Phase 3.3 Security & Access Control / 第三阶段 3.3 安全与访问控制
+## 2025-02-03 - Phase 3.3 Security & Access Control
 
-### Summary / 概述
+### Summary
 
 Implemented API key authentication and rate limiting middleware for secure API access in production environments.
 
-实现了 API 密钥认证和速率限制中间件，为生产环境提供安全的 API 访问控制。
-
-### What Was Done / 完成内容
+### What Was Done
 
 | Feature | Description |
 |---------|-------------|
-| **API Key Authentication** | Bearer token validation middleware / Bearer token 验证中间件 |
-| **Rate Limiting** | Sliding window algorithm per API key / 基于 API key 的滑动窗口限流 |
-| **X-RateLimit Headers** | Standard rate limit headers in responses / 标准速率限制响应头 |
-| **Exempt Paths** | Configurable paths that skip authentication / 可配置的免认证路径 |
-| **Configuration** | YAML and environment variable support / YAML 和环境变量配置支持 |
+| **API Key Authentication** | Bearer token validation middleware |
+| **Rate Limiting** | Sliding window algorithm per API key |
+| **X-RateLimit Headers** | Standard rate limit headers in responses |
+| **Exempt Paths** | Configurable paths that skip authentication |
+| **Configuration** | YAML and environment variable support |
 
-### Architecture / 架构
+### Architecture
 
 ```
 Request → [Security Middleware] → [Observability Middleware] → [Endpoint]
@@ -450,39 +277,28 @@ Request → [Security Middleware] → [Observability Middleware] → [Endpoint]
               └─ 4. Check rate limit → 429 if exceeded
 ```
 
-### Configuration / 配置
+### Configuration
 
 ```yaml
 security:
-  enabled: true  # Enable in production
+  enabled: true
 
   api_keys:
     - key: "sk-vgate-prod-xxxxx"
       name: "production"
-      rate_limit: 100  # requests per minute
-    - key: "sk-vgate-dev-xxxxx"
-      name: "development"
-      rate_limit: 1000
+      rate_limit: 100
 
   rate_limiting:
     enabled: true
-    default_limit: 60    # requests per minute
-    window_seconds: 60   # sliding window size
+    default_limit: 60
+    window_seconds: 60
 
   exempt_paths:
     - "/health"
     - "/metrics"
 ```
 
-### Environment Variables / 环境变量
-
-| Variable | Description |
-|----------|-------------|
-| `VGATE_SECURITY__ENABLED` | Enable/disable security (true/false) |
-| `VGATE_SECURITY__RATE_LIMITING__ENABLED` | Enable/disable rate limiting |
-| `VGATE_SECURITY__RATE_LIMITING__DEFAULT_LIMIT` | Default rate limit |
-
-### Response Headers / 响应头
+### Response Headers
 
 | Header | Description |
 |--------|-------------|
@@ -491,74 +307,99 @@ security:
 | `X-RateLimit-Reset` | Unix timestamp when window resets |
 | `Retry-After` | Seconds to wait (only on 429 response) |
 
-### Error Responses / 错误响应
+---
 
-```json
-// 401 Unauthorized - Missing or invalid API key
-{"detail": "Missing API key. Use Authorization: Bearer <api_key>"}
-{"detail": "Invalid API key"}
+## 2025-02-05 - Phase 4.1 Containerization
 
-// 429 Too Many Requests - Rate limit exceeded
-{"detail": "Rate limit exceeded", "retry_after": 30}
-```
+### Summary
 
-### Usage Example / 使用示例
+Implemented Docker containerization with multi-stage builds supporting both GPU production inference and CPU dry-run mode for CI/CD testing.
+
+### What Was Done
+
+| Feature | Description |
+|---------|-------------|
+| **Multi-stage Dockerfile** | GPU target (`vllm-openai`) and CPU target (`python:3.12-slim`) |
+| **Docker Compose** | Service orchestration with vgate, prometheus, and grafana |
+| **Dry-run Mode** | `VGATE_DRY_RUN=true` for testing without GPU |
+| **Monitoring Stack** | Prometheus + Grafana integration |
+| **Package Structure** | Standardized Python imports with `vgate/__init__.py` |
+
+### Docker Images
+
+| Image | Base | Size | Use Case |
+|-------|------|------|----------|
+| `vgate:latest` | `vllm/vllm-openai:latest` | ~9GB | Production GPU inference |
+| `vgate:cpu` | `python:3.12-slim` | ~220MB | CI/CD, testing, dry-run |
+
+### Quick Start
 
 ```bash
-# Request with API key
-curl -H "Authorization: Bearer sk-vgate-prod-xxxxx" \
-     http://localhost:8000/v1/chat/completions \
-     -d '{"model": "qwen", "messages": [{"role": "user", "content": "Hello"}]}'
+# GPU Mode (Production)
+docker compose up vgate
 
-# Check rate limit headers
-curl -I -H "Authorization: Bearer sk-vgate-prod-xxxxx" \
-     http://localhost:8000/v1/chat/completions
+# CPU Mode (CI/Testing)
+docker compose --profile cpu up vgate-cpu
+
+# Full Monitoring Stack
+docker compose --profile monitoring up
 ```
 
-### Key Files / 关键文件
+### Issues Fixed During Development
+
+1. **vLLM Import in Dry-run**: Added conditional import to skip vLLM when `VGATE_DRY_RUN=true`
+2. **Python Path**: Changed `python` to `python3` for vLLM base image compatibility
+3. **Multiprocessing Spawn**: Moved `VGateEngine` initialization to FastAPI lifespan context
+
+### Key Files
 
 | File | Purpose |
 |------|---------|
-| `vgate/security.py` | RateLimiter and SecurityMiddleware implementation |
-| `vgate/config.py` | SecurityConfig, APIKeyConfig, RateLimitConfig models |
-| `config.yaml` | Security configuration section |
-| `tests/test_security.py` | Unit tests for security features |
+| `Dockerfile` | Multi-stage build (vgate-gpu, vgate-cpu) |
+| `docker-compose.yml` | Service orchestration + monitoring |
+| `.dockerignore` | Exclude unnecessary files from build |
+| `requirements.txt` | Python dependencies |
+| `monitoring/prometheus.yml` | Prometheus scrape configuration |
+| `vgate/__init__.py` | Package initialization |
+
+### Test Results
+
+| Test Item | Status |
+|-----------|--------|
+| Unit Tests (97) | ✅ Pass |
+| CPU Image Build | ✅ Pass |
+| GPU Image Build | ✅ Pass |
+| GPU Inference | ✅ Pass |
+| Health Endpoint | ✅ Pass |
+| Metrics Endpoint | ✅ Pass |
+
+Branch: `feat/phase4.1-containerization`
+PR: #14
 
 ---
 
-## Next Steps / 下一步计划
+## Project Progress
 
-### Phase 3: Production-Grade Features / 第三阶段：生产级特性
-
-| Priority | Feature | Status | Description |
-|----------|---------|--------|-------------|
-| 1 | **Observability** | ✅ Done | Structured logging and Prometheus metrics |
-| 2 | **Configuration as Code** | ✅ Done | YAML configuration file for all settings |
-| 3 | **Security & Access Control** | ✅ Done | API key authentication and rate limiting |
-
-### Phase 2: Remaining / 第二阶段：剩余工作
-
-| Priority | Feature | Status | Description |
-|----------|---------|--------|-------------|
-| 1 | **Multi-Worker Load Balancing** | 🔲 Todo | Horizontal scaling with multiple engine instances (RunPod) |
-
-### Key Objectives / 核心目标
-
-- ✅ Production-ready monitoring and debugging / 生产级监控和调试
-- ✅ Flexible configuration management / 灵活的配置管理
-- ✅ Secure API access / 安全的 API 访问
+- [x] **Phase 1**: Core MVP - Unified API Gateway
+- [ ] **Phase 2**: Performance & Efficiency Optimization
+  - [x] 2.1 Dynamic Request Batching
+  - [x] 2.2 Result Caching
+  - [ ] 2.3 Multi-Worker Load Balancing (Planned for RunPod)
+- [x] **Phase 3**: Production-Grade Features
+  - [x] 3.1 Observability (Logging + Metrics)
+  - [x] 3.2 Configuration as Code
+  - [x] 3.3 Security & Access Control
+- [ ] **Phase 4**: Ecosystem & Deployment
+  - [x] 4.1 Containerization (Docker)
+  - [ ] 4.2 Python Client SDK
+  - [ ] 4.3 Kubernetes Deployment
 
 ---
 
-## Project Progress / 项目进度
+## Next Steps
 
-- [x] Phase 1: Core MVP - Unified API Gateway / 核心 MVP - 统一 API 网关
-- [ ] Phase 2: Performance & Efficiency Optimization / 性能与效率优化
-  - [x] 2.1 Dynamic Request Batching / 动态请求批处理
-  - [x] 2.2 Result Caching / 结果缓存
-  - [ ] 2.3 Multi-Worker Load Balancing / 多 Worker 负载均衡 (Planned for RunPod)
-- [x] Phase 3: Production-Grade Features / 生产级特性
-  - [x] 3.1 Observability / 可观测性
-  - [x] 3.2 Configuration as Code / 配置化管理
-  - [x] 3.3 Security & Access Control / 安全与访问控制
-- [ ] Phase 4: Ecosystem & Deployment / 生态与部署
+| Priority | Feature | Description |
+|----------|---------|-------------|
+| 1 | **Python Client SDK** | `pip install vgate-client` with `vgate.Chat.create()` API |
+| 2 | **Kubernetes Deployment** | Helm chart with HPA for auto-scaling |
+| 3 | **Multi-Worker Load Balancing** | Horizontal scaling with Ray/RunPod |
