@@ -9,11 +9,7 @@ import time
 from unittest.mock import MagicMock, patch
 from dataclasses import dataclass
 
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'vgate'))
-
-from batcher import RequestBatcher, BatchRequest
+from vgate.batcher import RequestBatcher, BatchRequest
 
 
 class MockLLM:

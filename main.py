@@ -2,24 +2,19 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
-import sys
 import time
 import uuid
 
-# Add the vgate directory to the Python path
-import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'vgate')))
-
 # Import V-Gate modules
-from config import get_config
-from engine import VGateEngine
-from batcher import RequestBatcher
-from logging_config import setup_logging, get_logger
-from metrics import (
+from vgate.config import get_config
+from vgate.engine import VGateEngine
+from vgate.batcher import RequestBatcher
+from vgate.logging_config import setup_logging, get_logger
+from vgate.metrics import (
     REQUEST_COUNT, REQUEST_LATENCY, REQUEST_IN_PROGRESS,
     init_app_info
 )
-from security import SecurityMiddleware
+from vgate.security import SecurityMiddleware
 
 # Prometheus client for metrics endpoint
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
@@ -34,16 +29,22 @@ app_logger = get_logger("vgate.app")
 # Version from config
 APP_VERSION = config.version
 
-# Initialize the VGateEngine with config
-engine = VGateEngine()
-
-# Initialize the RequestBatcher (uses config defaults)
-batcher = RequestBatcher(engine=engine)
+# Lazy initialization - will be set in lifespan
+engine = None
+batcher = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager for startup/shutdown."""
+    global engine, batcher
+
+    # Initialize the VGateEngine with config (inside lifespan for multiprocessing safety)
+    engine = VGateEngine()
+
+    # Initialize the RequestBatcher (uses config defaults)
+    batcher = RequestBatcher(engine=engine)
+
     # Initialize app info for Prometheus
     init_app_info(version=APP_VERSION, model=config.model.model_id)
 

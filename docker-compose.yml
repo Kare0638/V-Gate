@@ -1,0 +1,84 @@
+services:
+  # ---------------------------------------------------------------------------
+  # GPU mode — production inference
+  # docker compose up vgate
+  # ---------------------------------------------------------------------------
+  vgate:
+    build:
+      context: .
+      target: vgate-gpu
+    image: vgate:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
+    environment:
+      - VGATE_CONFIG_PATH=/app/config.yaml
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # CPU mode — CI / testing / dry-run
+  # docker compose --profile cpu up vgate-cpu
+  # ---------------------------------------------------------------------------
+  vgate-cpu:
+    build:
+      context: .
+      target: vgate-cpu
+    image: vgate:cpu
+    ports:
+      - "8000:8000"
+    environment:
+      - VGATE_DRY_RUN=true
+      - VGATE_CONFIG_PATH=/app/config.yaml
+    profiles:
+      - cpu
+
+  # ---------------------------------------------------------------------------
+  # Prometheus — metrics collection
+  # docker compose --profile monitoring up
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    depends_on:
+      - vgate
+    profiles:
+      - monitoring
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Grafana — visualization
+  # docker compose --profile monitoring up
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+    profiles:
+      - monitoring
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:
