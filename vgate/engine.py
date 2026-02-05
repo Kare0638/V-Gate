@@ -1,9 +1,26 @@
+import os
 import time
 from typing import Optional
 
-from vllm import LLM, SamplingParams
-
 from vgate.config import ModelConfig, get_config
+
+DRY_RUN = os.getenv("VGATE_DRY_RUN", "false").lower() in ("true", "1", "yes")
+
+
+class _DryRunLLM:
+    """Mock LLM that returns placeholder responses without GPU."""
+
+    def generate(self, prompts, sampling_params):
+        from unittest.mock import MagicMock
+        outputs = []
+        for prompt in prompts:
+            mock_output = MagicMock()
+            mock_output.outputs = [MagicMock()]
+            mock_output.outputs[0].text = f"[dry-run] echo: {prompt[:80]}"
+            mock_output.outputs[0].token_ids = list(range(8))
+            mock_output.metrics = None
+            outputs.append(mock_output)
+        return outputs
 
 
 class VGateEngine:
@@ -14,6 +31,13 @@ class VGateEngine:
         Args:
             model_config: Model configuration. If None, uses global config.
         """
+        if DRY_RUN:
+            print("V-Gate starting in DRY-RUN mode (no GPU required)")
+            self.llm = _DryRunLLM()
+            return
+
+        from vllm import LLM, SamplingParams  # noqa: F811
+
         if model_config is None:
             model_config = get_config().model
 
@@ -29,7 +53,11 @@ class VGateEngine:
 
     def chat_completions(self, prompt, max_tokens=256):
         # 构造采样参数
-        sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=max_tokens)
+        if DRY_RUN:
+            sampling_params = {"temperature": 0.7, "top_p": 0.9, "max_tokens": max_tokens}
+        else:
+            from vllm import SamplingParams
+            sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=max_tokens)
         
         # 🟢 1. 开始手动计时 (Wall Clock Time)
         start_time = time.perf_counter()

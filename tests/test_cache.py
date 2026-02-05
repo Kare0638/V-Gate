@@ -7,13 +7,9 @@ import asyncio
 import pytest
 from unittest.mock import MagicMock
 
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'vgate'))
-
-from cache import ResultCache
-from config import CacheConfig
-from batcher import RequestBatcher
+from vgate.cache import ResultCache
+from vgate.config import CacheConfig
+from vgate.batcher import RequestBatcher
 
 
 class TestCacheConfig:

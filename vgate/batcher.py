@@ -1,7 +1,10 @@
 import asyncio
+import os
 import time
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
+
+DRY_RUN = os.getenv("VGATE_DRY_RUN", "false").lower() in ("true", "1", "yes")
 
 from vgate.cache import ResultCache
 from vgate.config import get_config, CacheConfig as ConfigCacheConfig
@@ -318,13 +321,15 @@ class RequestBatcher:
         top_p: float = 0.9,
     ) -> List[Dict[str, Any]]:
         """Synchronous batch inference - runs in thread pool."""
-        from vllm import SamplingParams
-
-        sampling_params = SamplingParams(
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens
-        )
+        if DRY_RUN:
+            sampling_params = {"temperature": temperature, "top_p": top_p, "max_tokens": max_tokens}
+        else:
+            from vllm import SamplingParams
+            sampling_params = SamplingParams(
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens
+            )
 
         start_time = time.perf_counter()
         outputs = self.engine.llm.generate(prompts, sampling_params)

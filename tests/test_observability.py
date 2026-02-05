@@ -10,20 +10,16 @@ import json
 from io import StringIO
 from unittest.mock import MagicMock, patch
 
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'vgate'))
-
-from logging_config import (
+from vgate.logging_config import (
     JSONFormatter, ConsoleFormatter, setup_logging, get_logger, LogContext
 )
-from metrics import (
+from vgate.metrics import (
     REQUEST_COUNT, REQUEST_LATENCY, BATCH_SIZE, CACHE_HITS, CACHE_MISSES,
     TOKENS_GENERATED, init_app_info
 )
-from cache import ResultCache
-from config import CacheConfig
-from batcher import RequestBatcher
+from vgate.cache import ResultCache
+from vgate.config import CacheConfig
+from vgate.batcher import RequestBatcher
 
 
 class TestJSONFormatter:
