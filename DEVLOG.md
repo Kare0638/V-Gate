@@ -378,6 +378,79 @@ PR: #14
 
 ---
 
+## 2025-02-06 - Phase 4.2 Python Client SDK
+
+### Summary
+
+Implemented a Python Client SDK (`vgate-client`) providing both synchronous and asynchronous clients for interacting with the V-Gate API, with automatic retry, rate-limit handling, and typed responses.
+
+### What Was Done
+
+| Feature | Description |
+|---------|-------------|
+| **VGate (Sync Client)** | Synchronous client using `httpx.Client` |
+| **AsyncVGate (Async Client)** | Asynchronous client using `httpx.AsyncClient` |
+| **Chat Completions** | `client.chat.create()` with OpenAI-compatible response models |
+| **Embeddings** | `client.embeddings.create()` with typed response |
+| **Auto Retry** | Exponential backoff on 429/5xx with configurable `max_retries` |
+| **Rate Limit Parsing** | Automatic parsing of `X-RateLimit-*` and `Retry-After` headers |
+| **Typed Exceptions** | `AuthenticationError`, `RateLimitError`, `ServerError`, `ConnectionError` |
+| **Pydantic Models** | Full request/response model coverage matching server API |
+| **Context Manager** | `with VGate() as client:` / `async with AsyncVGate() as client:` |
+
+### Architecture
+
+```
+vgate-client/
+├── pyproject.toml              # Package metadata (PEP 621)
+├── vgate_client/
+│   ├── __init__.py             # Public API exports
+│   ├── client.py               # VGate (sync) + AsyncVGate (async)
+│   ├── models.py               # Pydantic request/response models
+│   └── exceptions.py           # Typed exception hierarchy
+└── tests/
+    ├── conftest.py             # Shared fixtures
+    ├── test_client.py          # Client tests (sync + async)
+    ├── test_models.py          # Model serialization tests
+    └── test_exceptions.py      # Exception hierarchy tests
+```
+
+### Usage
+
+```python
+from vgate_client import VGate
+
+client = VGate(base_url="http://localhost:8000", api_key="sk-vgate-dev-example")
+response = client.chat.create(
+    model="Qwen/Qwen2.5-1.5B-Instruct-AWQ",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(response.choices[0].message.content)
+client.close()
+```
+
+### Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| `httpx>=0.25.0` | HTTP client (sync + async) |
+| `pydantic>=2.0.0` | Data validation and response models |
+
+### Test Results
+
+| Test Item | Status |
+|-----------|--------|
+| Sync client tests (19) | Pass |
+| Async client tests (9) | Pass |
+| Model tests (11) | Pass |
+| Exception tests (9) | Pass |
+| **Total (48)** | **Pass** |
+| Server tests (97) | Pass |
+
+Branch: `feat/phase4.2-python-sdk`
+
+---
+
 ## Project Progress
 
 - [x] **Phase 1**: Core MVP - Unified API Gateway
@@ -391,7 +464,7 @@ PR: #14
   - [x] 3.3 Security & Access Control
 - [ ] **Phase 4**: Ecosystem & Deployment
   - [x] 4.1 Containerization (Docker)
-  - [ ] 4.2 Python Client SDK
+  - [x] 4.2 Python Client SDK
   - [ ] 4.3 Kubernetes Deployment
 
 ---
@@ -400,6 +473,5 @@ PR: #14
 
 | Priority | Feature | Description |
 |----------|---------|-------------|
-| 1 | **Python Client SDK** | `pip install vgate-client` with `vgate.Chat.create()` API |
-| 2 | **Kubernetes Deployment** | Helm chart with HPA for auto-scaling |
-| 3 | **Multi-Worker Load Balancing** | Horizontal scaling with Ray/RunPod |
+| 1 | **Kubernetes Deployment** | Helm chart with HPA for auto-scaling |
+| 2 | **Multi-Worker Load Balancing** | Horizontal scaling with Ray/RunPod |

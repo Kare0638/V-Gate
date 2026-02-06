@@ -23,6 +23,7 @@ Optimized for memory-constrained environments (e.g., RTX 3060/4060).
 | **Rate Limiting** | Sliding window algorithm to prevent abuse |
 | **Configuration as Code** | YAML configuration with environment variable overrides |
 | **Docker Ready** | Multi-stage build with GPU and CPU targets |
+| **Python Client SDK** | `pip install` ready client with sync/async support |
 
 ---
 
@@ -109,6 +110,45 @@ curl http://localhost:8000/metrics
 ### Statistics
 ```bash
 curl http://localhost:8000/stats
+```
+
+### Python Client SDK
+
+```bash
+pip install ./vgate-client
+```
+
+```python
+from vgate_client import VGate
+
+# Synchronous client
+client = VGate(base_url="http://localhost:8000", api_key="sk-vgate-dev-example")
+
+response = client.chat.create(
+    model="Qwen/Qwen2.5-1.5B-Instruct-AWQ",
+    messages=[{"role": "user", "content": "What is 2+2?"}],
+    max_tokens=100,
+)
+print(response.choices[0].message.content)
+
+# Embeddings
+embedding = client.embeddings.create(model="mock-embedding-model", input="Hello world")
+
+# Health check
+health = client.health()
+
+client.close()
+```
+
+```python
+from vgate_client import AsyncVGate
+
+# Asynchronous client
+async with AsyncVGate(base_url="http://localhost:8000", api_key="sk-...") as client:
+    response = await client.chat.create(
+        model="Qwen/Qwen2.5-1.5B-Instruct-AWQ",
+        messages=[{"role": "user", "content": "Hello!"}],
+    )
 ```
 
 ---
@@ -262,6 +302,14 @@ V-Gate/
 │   ├── logging_config.py   # Structured logging
 │   ├── metrics.py          # Prometheus metrics
 │   └── security.py         # Authentication & rate limiting
+├── vgate-client/               # Python Client SDK
+│   ├── pyproject.toml
+│   ├── vgate_client/
+│   │   ├── __init__.py
+│   │   ├── client.py           # Sync & async clients
+│   │   ├── models.py           # Request/response models
+│   │   └── exceptions.py       # Error classes
+│   └── tests/
 ├── monitoring/
 │   └── prometheus.yml      # Prometheus configuration
 └── tests/
@@ -314,7 +362,7 @@ ruff check .
   - [x] 3.3 Security & Access Control
 - [x] **Phase 4**: Ecosystem & Deployment
   - [x] 4.1 Containerization (Docker)
-  - [ ] 4.2 Python Client SDK
+  - [x] 4.2 Python Client SDK
   - [ ] 4.3 Kubernetes Deployment
 
 ---
