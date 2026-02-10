@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vgate-model-cache
+  labels:
+    app.kubernetes.io/name: vgate
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # For multi-replica GPU deployments, consider upgrading to:
+  #   - ReadWriteMany with an NFS-based StorageClass
+  #   - A shared model cache layer (e.g., S3 + init container)

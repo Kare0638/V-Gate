@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vgate
+  labels:
+    app.kubernetes.io/name: vgate
+    app.kubernetes.io/part-of: vgate

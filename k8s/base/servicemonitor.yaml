@@ -1,0 +1,18 @@
+# ServiceMonitor for Prometheus Operator integration.
+# Requires the Prometheus Operator CRDs to be installed in the cluster.
+# This resource is commented out in kustomization.yaml by default.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vgate
+  labels:
+    app.kubernetes.io/name: vgate
+    app.kubernetes.io/component: monitoring
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vgate
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

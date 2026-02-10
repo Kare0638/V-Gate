@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vgate
+  labels:
+    app.kubernetes.io/name: vgate
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vgate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vgate
+        app.kubernetes.io/component: gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: vgate
+          image: vgate:cpu
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: VGATE_DRY_RUN
+              value: "true"
+            - name: VGATE_CONFIG_PATH
+              value: "/app/config.yaml"
+            - name: HF_HOME
+              value: "/cache/huggingface"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vgate-secrets
+                  key: hf-token
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            - name: model-cache
+              mountPath: /cache/huggingface
+      volumes:
+        - name: config
+          configMap:
+            name: vgate-config
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: vgate-model-cache
