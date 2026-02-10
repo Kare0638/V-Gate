@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vgate
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: vgate
+          image: vgate:latest
+          env:
+            - name: VGATE_DRY_RUN
+              value: "false"
+            - name: VGATE_CONFIG_PATH
+              value: "/app/config.yaml"
+            - name: HF_HOME
+              value: "/cache/huggingface"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vgate-secrets
+                  key: hf-token
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule

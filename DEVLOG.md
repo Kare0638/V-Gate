@@ -451,6 +451,92 @@ Branch: `feat/phase4.2-python-sdk`
 
 ---
 
+## 2025-02-10 - Phase 4.3 Kubernetes Deployment
+
+### Summary
+
+Implemented Kubernetes deployment manifests using Kustomize with a base/overlays pattern, supporting both GPU production and CPU dry-run modes with HorizontalPodAutoscaler for elastic scaling.
+
+### What Was Done
+
+| Feature | Description |
+|---------|-------------|
+| **Kustomize Base** | Core K8s resources: Deployment, Service, ConfigMap, Secret, HPA, PVC |
+| **GPU Overlay** | Production overlay with NVIDIA GPU scheduling, tolerations, and tuned resources |
+| **CPU Overlay** | Lightweight overlay for testing/demo with fast startup probes |
+| **HPA** | Horizontal Pod Autoscaler with CPU-based scaling (1-4 replicas) |
+| **Health Probes** | Startup, readiness, and liveness probes using `/health` endpoint |
+| **Prometheus Integration** | Pod annotations for scraping + optional ServiceMonitor |
+| **Model Cache PVC** | 10Gi PersistentVolumeClaim for HuggingFace model cache |
+
+### Architecture
+
+```
+k8s/
+├── base/                        # Shared resources (CPU/dry-run defaults)
+│   ├── kustomization.yaml       # Resource aggregation
+│   ├── namespace.yaml           # vgate namespace
+│   ├── configmap.yaml           # Full config.yaml as ConfigMap
+│   ├── secret.yaml              # API keys + HF_TOKEN (placeholder)
+│   ├── deployment.yaml          # Core workload with probes & volumes
+│   ├── service.yaml             # ClusterIP on port 8000
+│   ├── hpa.yaml                 # Autoscaler (CPU 70%, 1-4 replicas)
+│   ├── pvc.yaml                 # 10Gi model cache
+│   └── servicemonitor.yaml      # Prometheus Operator (optional)
+└── overlays/
+    ├── gpu/                     # Production: real inference
+    │   ├── kustomization.yaml
+    │   ├── deployment-patch.yaml  # GPU resources, tolerations, NVIDIA env
+    │   └── hpa-patch.yaml         # maxReplicas=2, CPU target 80%
+    └── cpu/                     # Testing: dry-run mode
+        ├── kustomization.yaml
+        └── deployment-patch.yaml  # Lighter resources, 2 replicas
+```
+
+### Key Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Templating | Kustomize | Built into kubectl, shows raw K8s resource knowledge |
+| Base default | CPU/dry-run | Universally testable without GPU hardware |
+| HPA metric | CPU utilization | No extra infra needed (no Prometheus Adapter) |
+| PVC access | ReadWriteOnce | Sufficient for single GPU pod |
+| Secret format | stringData | Portfolio readability; production uses sealed secrets |
+
+### Quick Start
+
+```bash
+# CPU mode (testing/demo)
+kubectl apply -k k8s/overlays/cpu/
+
+# GPU mode (production)
+kubectl apply -k k8s/overlays/gpu/
+
+# Verify
+kubectl get all -n vgate
+kubectl get hpa -n vgate --watch
+
+# Access
+kubectl port-forward svc/vgate 8000:8000 -n vgate
+
+# Cleanup
+kubectl delete -k k8s/overlays/cpu/
+```
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `k8s/base/deployment.yaml` | Core workload with probes, volumes, Prometheus annotations |
+| `k8s/base/hpa.yaml` | HorizontalPodAutoscaler with scale-up/down policies |
+| `k8s/base/configmap.yaml` | Full V-Gate config mounted at `/app/config.yaml` |
+| `k8s/overlays/gpu/deployment-patch.yaml` | GPU resources, NVIDIA tolerations |
+| `k8s/overlays/cpu/deployment-patch.yaml` | Lightweight CPU resources |
+
+Branch: `feat/phase4.2-python-sdk`
+
+---
+
 ## Project Progress
 
 - [x] **Phase 1**: Core MVP - Unified API Gateway
@@ -465,7 +551,7 @@ Branch: `feat/phase4.2-python-sdk`
 - [ ] **Phase 4**: Ecosystem & Deployment
   - [x] 4.1 Containerization (Docker)
   - [x] 4.2 Python Client SDK
-  - [ ] 4.3 Kubernetes Deployment
+  - [x] 4.3 Kubernetes Deployment
 
 ---
 
@@ -473,5 +559,5 @@ Branch: `feat/phase4.2-python-sdk`
 
 | Priority | Feature | Description |
 |----------|---------|-------------|
-| 1 | **Kubernetes Deployment** | Helm chart with HPA for auto-scaling |
-| 2 | **Multi-Worker Load Balancing** | Horizontal scaling with Ray/RunPod |
+| 1 | **Multi-Worker Load Balancing** | Horizontal scaling with Ray/RunPod |
+| 2 | **CI/CD Pipeline** | GitHub Actions for automated testing and deployment |
