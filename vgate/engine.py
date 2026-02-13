@@ -3,6 +3,9 @@ import time
 from typing import Optional
 
 from vgate.config import ModelConfig, get_config
+from vgate.tracing import get_tracer
+
+tracer = get_tracer("vgate.engine")
 
 DRY_RUN = os.getenv("VGATE_DRY_RUN", "false").lower() in ("true", "1", "yes")
 
@@ -52,48 +55,47 @@ class VGateEngine:
         )
 
     def chat_completions(self, prompt, max_tokens=256):
-        # 构造采样参数
-        if DRY_RUN:
-            sampling_params = {"temperature": 0.7, "top_p": 0.9, "max_tokens": max_tokens}
-        else:
-            from vllm import SamplingParams
-            sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=max_tokens)
-        
-        # 🟢 1. 开始手动计时 (Wall Clock Time)
-        start_time = time.perf_counter()
-        
-        # 执行推理
-        outputs = self.llm.generate([prompt], sampling_params)
-        
-        # 🔴 2. 结束计时
-        end_time = time.perf_counter()
-        
-        output = outputs[0]
-        generated_text = output.outputs[0].text
-        num_tokens = len(output.outputs[0].token_ids)
-        
-        # 🟡 3. 获取 Metrics (带 Fallback 机制)
-        metrics = output.metrics
-        
-        if metrics:
-            # 如果 vLLM 给了内部数据，优先使用 (更准)
-            ttft = metrics.first_token_time - metrics.arrival_time
-            total_time = metrics.finished_time - metrics.first_token_time
-        else:
-            # 🛡️ Fallback: 如果 metrics 是 None，使用手动计时
-            print("⚠️ Warning: vLLM internal metrics missing. Using wall-clock time.")
-            ttft = 0.0  # 离线模式下很难测准 TTFT，暂置为 0
-            total_time = end_time - start_time
+        with tracer.start_as_current_span("engine.chat_completions") as span:
+            span.set_attribute("prompt_length", len(prompt))
+            span.set_attribute("max_tokens", max_tokens)
+            span.set_attribute("dry_run", DRY_RUN)
 
-        # 计算 TPOT (避免除以零)
-        tpot = (total_time / num_tokens) if num_tokens > 0 else 0
-        
-        return {
-            "text": generated_text,
-            "ttft": ttft,
-            "tpot": tpot,
-            "total_tokens": num_tokens
-        }
+            # 构造采样参数
+            if DRY_RUN:
+                sampling_params = {"temperature": 0.7, "top_p": 0.9, "max_tokens": max_tokens}
+            else:
+                from vllm import SamplingParams
+                sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=max_tokens)
+
+            start_time = time.perf_counter()
+            outputs = self.llm.generate([prompt], sampling_params)
+            end_time = time.perf_counter()
+
+            output = outputs[0]
+            generated_text = output.outputs[0].text
+            num_tokens = len(output.outputs[0].token_ids)
+
+            metrics = output.metrics
+
+            if metrics:
+                ttft = metrics.first_token_time - metrics.arrival_time
+                total_time = metrics.finished_time - metrics.first_token_time
+            else:
+                print("Warning: vLLM internal metrics missing. Using wall-clock time.")
+                ttft = 0.0
+                total_time = end_time - start_time
+
+            tpot = (total_time / num_tokens) if num_tokens > 0 else 0
+
+            span.set_attribute("tokens_generated", num_tokens)
+            span.set_attribute("ttft_ms", round(ttft * 1000, 2))
+
+            return {
+                "text": generated_text,
+                "ttft": ttft,
+                "tpot": tpot,
+                "total_tokens": num_tokens
+            }
 
     def embeddings(self, input_text: str):
         """

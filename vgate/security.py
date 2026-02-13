@@ -19,8 +19,10 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from vgate.config import SecurityConfig, APIKeyConfig
 from vgate.logging_config import get_logger
+from vgate.tracing import get_tracer
 
 logger = get_logger("vgate.security")
+tracer = get_tracer("vgate.security")
 
 
 class RateLimiter:
@@ -160,71 +162,76 @@ class SecurityMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         """Process the request through security checks."""
-        path = request.url.path
+        with tracer.start_as_current_span("security.check") as span:
+            path = request.url.path
+            span.set_attribute("http.path", path)
+            span.set_attribute("security_enabled", self.config.enabled)
 
-        # Skip if security is disabled
-        if not self.config.enabled:
-            return await call_next(request)
+            # Skip if security is disabled
+            if not self.config.enabled:
+                return await call_next(request)
 
-        # Check exempt paths
-        if self._is_exempt(path):
-            return await call_next(request)
+            # Check exempt paths
+            if self._is_exempt(path):
+                return await call_next(request)
 
-        # Extract and validate API key
-        api_key = extract_api_key(request)
+            # Extract and validate API key
+            api_key = extract_api_key(request)
 
-        if not api_key:
-            logger.warning(
-                "Missing API key",
-                extra={"extra_data": {"path": path, "method": request.method}}
-            )
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Missing API key. Use Authorization: Bearer <api_key>"},
-            )
-
-        key_config = self.key_map.get(api_key)
-
-        if not key_config:
-            logger.warning(
-                "Invalid API key",
-                extra={"extra_data": {"path": path, "method": request.method}}
-            )
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Invalid API key"},
-            )
-
-        # Check rate limit
-        if self.config.rate_limiting.enabled:
-            limit = key_config.rate_limit
-            allowed, headers = self.limiter.is_allowed(api_key, limit)
-
-            if not allowed:
+            if not api_key:
                 logger.warning(
-                    "Rate limit exceeded",
-                    extra={"extra_data": {
-                        "key_name": key_config.name,
-                        "path": path,
-                        "limit": limit,
-                    }}
+                    "Missing API key",
+                    extra={"extra_data": {"path": path, "method": request.method}}
                 )
                 return JSONResponse(
-                    status_code=429,
-                    content={
-                        "detail": "Rate limit exceeded",
-                        "retry_after": int(headers.get("Retry-After", 60)),
-                    },
-                    headers=headers,
+                    status_code=401,
+                    content={"detail": "Missing API key. Use Authorization: Bearer <api_key>"},
                 )
-        else:
-            headers = {}
 
-        # Process request
-        response = await call_next(request)
+            key_config = self.key_map.get(api_key)
 
-        # Add rate limit headers to response
-        for key, value in headers.items():
-            response.headers[key] = value
+            if not key_config:
+                logger.warning(
+                    "Invalid API key",
+                    extra={"extra_data": {"path": path, "method": request.method}}
+                )
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid API key"},
+                )
 
-        return response
+            span.set_attribute("api_key_name", key_config.name)
+
+            # Check rate limit
+            if self.config.rate_limiting.enabled:
+                limit = key_config.rate_limit
+                allowed, headers = self.limiter.is_allowed(api_key, limit)
+
+                if not allowed:
+                    logger.warning(
+                        "Rate limit exceeded",
+                        extra={"extra_data": {
+                            "key_name": key_config.name,
+                            "path": path,
+                            "limit": limit,
+                        }}
+                    )
+                    return JSONResponse(
+                        status_code=429,
+                        content={
+                            "detail": "Rate limit exceeded",
+                            "retry_after": int(headers.get("Retry-After", 60)),
+                        },
+                        headers=headers,
+                    )
+            else:
+                headers = {}
+
+            # Process request
+            response = await call_next(request)
+
+            # Add rate limit headers to response
+            for key, value in headers.items():
+                response.headers[key] = value
+
+            return response

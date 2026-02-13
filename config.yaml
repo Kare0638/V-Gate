@@ -49,6 +49,15 @@ logging:
 metrics:
   enabled: true
 
+# Distributed Tracing (OpenTelemetry) / 分布式追踪 (OpenTelemetry)
+tracing:
+  enabled: false              # Enable OpenTelemetry tracing / 启用 OpenTelemetry 追踪
+  service_name: "vgate"       # Service name in traces / 追踪中的服务名称
+  otlp_endpoint: "http://localhost:4317"  # OTLP gRPC endpoint / OTLP gRPC 端点
+  otlp_insecure: true         # Use insecure connection / 使用非加密连接
+  sample_rate: 1.0            # Sampling rate (0.0-1.0) / 采样率
+  log_correlation: true       # Inject trace_id into logs / 将 trace_id 注入日志
+
 # Security & Access Control / 安全与访问控制
 security:
   enabled: false  # Set to true in production / 生产环境设为 true

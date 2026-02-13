@@ -66,6 +66,16 @@ class MetricsConfig(BaseModel):
     enabled: bool = True
 
 
+class TracingConfig(BaseModel):
+    """Distributed tracing configuration."""
+    enabled: bool = False
+    service_name: str = "vgate"
+    otlp_endpoint: str = "http://localhost:4317"
+    otlp_insecure: bool = True
+    sample_rate: float = 1.0
+    log_correlation: bool = True
+
+
 class APIKeyConfig(BaseModel):
     """Single API key configuration."""
     key: str
@@ -153,6 +163,7 @@ class VGateConfig(BaseSettings):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+    tracing: TracingConfig = Field(default_factory=TracingConfig)
 
     @classmethod
     def settings_customise_sources(
