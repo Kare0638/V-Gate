@@ -14,6 +14,8 @@ services:
       - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
     environment:
       - VGATE_CONFIG_PATH=/app/config.yaml
+      - VGATE_TRACING__ENABLED=true
+      - VGATE_TRACING__OTLP_ENDPOINT=http://jaeger:4317
     deploy:
       resources:
         reservations:
@@ -38,6 +40,8 @@ services:
     environment:
       - VGATE_DRY_RUN=true
       - VGATE_CONFIG_PATH=/app/config.yaml
+      - VGATE_TRACING__ENABLED=true
+      - VGATE_TRACING__OTLP_ENDPOINT=http://jaeger:4317
     profiles:
       - cpu
 
@@ -75,6 +79,22 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     depends_on:
       - prometheus
+    profiles:
+      - monitoring
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Jaeger — distributed tracing
+  # docker compose --profile monitoring up
+  # ---------------------------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
     profiles:
       - monitoring
     restart: unless-stopped

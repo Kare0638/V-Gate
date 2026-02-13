@@ -11,6 +11,24 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 
+def _get_otel_ids() -> tuple:
+    """
+    Extract trace_id and span_id from the current OTel span context.
+
+    Returns:
+        Tuple of (trace_id, span_id) as hex strings, or ("", "") if unavailable.
+    """
+    try:
+        from opentelemetry import trace
+        span = trace.get_current_span()
+        ctx = span.get_span_context()
+        if ctx and ctx.trace_id != 0:
+            return format(ctx.trace_id, "032x"), format(ctx.span_id, "016x")
+    except ImportError:
+        pass
+    return "", ""
+
+
 class JSONFormatter(logging.Formatter):
     """JSON log formatter for structured logging."""
 
@@ -22,6 +40,12 @@ class JSONFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
+
+        # Add OTel trace/span IDs when available
+        trace_id, span_id = _get_otel_ids()
+        if trace_id:
+            log_data["trace_id"] = trace_id
+            log_data["span_id"] = span_id
 
         # Add extra fields if present
         if hasattr(record, "request_id"):
@@ -61,6 +85,11 @@ class ConsoleFormatter(logging.Formatter):
         if hasattr(record, "extra_data") and record.extra_data:
             extra_str = " | ".join(f"{k}={v}" for k, v in record.extra_data.items())
             message += f" | {extra_str}"
+
+        # Append OTel trace/span IDs when available
+        trace_id, span_id = _get_otel_ids()
+        if trace_id:
+            message += f" | trace_id={trace_id} span_id={span_id}"
 
         return message
 

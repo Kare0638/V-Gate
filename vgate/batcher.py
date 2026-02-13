@@ -9,6 +9,7 @@ DRY_RUN = os.getenv("VGATE_DRY_RUN", "false").lower() in ("true", "1", "yes")
 from vgate.cache import ResultCache
 from vgate.config import get_config, CacheConfig as ConfigCacheConfig
 from vgate.logging_config import get_logger
+from vgate.tracing import get_tracer, get_current_trace_id
 from vgate.metrics import (
     BATCH_SIZE, BATCH_PROCESSING_TIME, BATCH_QUEUE_TIME,
     PENDING_REQUESTS, TOTAL_BATCHES, TTFT, TPOT,
@@ -17,6 +18,7 @@ from vgate.metrics import (
 )
 
 logger = get_logger("vgate.batcher")
+tracer = get_tracer("vgate.batcher")
 
 
 @dataclass
@@ -118,49 +120,55 @@ class RequestBatcher:
             temperature: Sampling temperature. Uses config default if None.
             top_p: Top-p sampling. Uses config default if None.
         """
-        # Apply defaults from config
-        config = get_config()
-        if max_tokens is None:
-            max_tokens = config.inference.max_tokens
-        if temperature is None:
-            temperature = config.inference.temperature
-        if top_p is None:
-            top_p = config.inference.top_p
+        with tracer.start_as_current_span("batcher.submit") as span:
+            # Apply defaults from config
+            config = get_config()
+            if max_tokens is None:
+                max_tokens = config.inference.max_tokens
+            if temperature is None:
+                temperature = config.inference.temperature
+            if top_p is None:
+                top_p = config.inference.top_p
 
-        cache_key = ResultCache.make_key(prompt, temperature, top_p, max_tokens)
+            span.set_attribute("prompt_length", len(prompt))
 
-        # Check cache first
-        cached = await self.cache.get(cache_key)
-        if cached:
-            logger.debug(
-                "Cache hit",
-                extra={"extra_data": {"cache_key": cache_key[:8]}}
+            cache_key = ResultCache.make_key(prompt, temperature, top_p, max_tokens)
+
+            # Check cache first
+            cached = await self.cache.get(cache_key)
+            if cached:
+                span.set_attribute("cache_hit", True)
+                logger.debug(
+                    "Cache hit",
+                    extra={"extra_data": {"cache_key": cache_key[:8]}}
+                )
+                return cached
+
+            span.set_attribute("cache_hit", False)
+
+            request = BatchRequest(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                cache_key=cache_key,
+                future=asyncio.get_event_loop().create_future(),
+                created_at=time.time(),
             )
-            return cached
 
-        request = BatchRequest(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            cache_key=cache_key,
-            future=asyncio.get_event_loop().create_future(),
-            created_at=time.time(),
-        )
+            async with self._lock:
+                self._queue.append(request)
+                self.total_requests += 1
+                queue_size = len(self._queue)
+                PENDING_REQUESTS.set(queue_size)
 
-        async with self._lock:
-            self._queue.append(request)
-            self.total_requests += 1
-            queue_size = len(self._queue)
-            PENDING_REQUESTS.set(queue_size)
+            # If batch is full, signal immediate processing
+            if queue_size >= self.max_batch_size:
+                asyncio.create_task(self._process_batch())
 
-        # If batch is full, signal immediate processing
-        if queue_size >= self.max_batch_size:
-            asyncio.create_task(self._process_batch())
-
-        # Wait for result
-        result = await request.future
-        return result
+            # Wait for result
+            result = await request.future
+            return result
 
     async def _batch_loop(self):
         """Background loop that triggers batch processing on timeout."""
@@ -190,104 +198,119 @@ class RequestBatcher:
             self.total_batches += 1
             self.total_batch_size += batch_size
 
-            # Record batch metrics
-            TOTAL_BATCHES.inc()
-            BATCH_SIZE.observe(batch_size)
+            with tracer.start_as_current_span("batcher.process_batch") as span:
+                # Record batch metrics
+                TOTAL_BATCHES.inc()
+                BATCH_SIZE.observe(batch_size)
 
-            # Calculate queue wait times
-            current_time = time.time()
-            for req in batch:
-                queue_time = current_time - req.created_at
-                BATCH_QUEUE_TIME.observe(queue_time)
+                span.set_attribute("batch_id", self.total_batches)
+                span.set_attribute("batch_size", batch_size)
 
-            logger.info(
-                "Processing batch",
-                extra={"extra_data": {
-                    "batch_id": self.total_batches,
-                    "batch_size": batch_size
-                }}
-            )
-
-            try:
-                # Group requests by cache_key for deduplication
-                unique_prompts: Dict[str, List[BatchRequest]] = {}
+                # Calculate queue wait times
+                current_time = time.time()
                 for req in batch:
-                    if req.cache_key not in unique_prompts:
-                        unique_prompts[req.cache_key] = []
-                    unique_prompts[req.cache_key].append(req)
-
-                # Only infer unique prompts
-                prompts_to_infer = [reqs[0].prompt for reqs in unique_prompts.values()]
-                temps_to_infer = [reqs[0].temperature for reqs in unique_prompts.values()]
-                top_ps_to_infer = [reqs[0].top_p for reqs in unique_prompts.values()]
-                max_tokens = max(req.max_tokens for req in batch)
-
-                dedup_count = batch_size - len(prompts_to_infer)
-                if dedup_count > 0:
-                    self.total_deduplicated += dedup_count
-                    DEDUPLICATED_REQUESTS.inc(dedup_count)
-                    DEDUP_RATIO.set(dedup_count / batch_size)
-                    logger.info(
-                        "Deduplicated requests",
-                        extra={"extra_data": {
-                            "deduplicated": dedup_count,
-                            "unique_prompts": len(prompts_to_infer)
-                        }}
-                    )
-                else:
-                    DEDUP_RATIO.set(0)
-
-                UNIQUE_PROMPTS_PER_BATCH.observe(len(prompts_to_infer))
-
-                # Process batch through engine
-                batch_start = time.perf_counter()
-                results = await self._run_batch_inference(
-                    prompts_to_infer, max_tokens, temps_to_infer[0], top_ps_to_infer[0]
-                )
-                batch_duration = time.perf_counter() - batch_start
-                BATCH_PROCESSING_TIME.observe(batch_duration)
-
-                # Record inference metrics
-                for result in results:
-                    if result.get("ttft", 0) > 0:
-                        TTFT.observe(result["ttft"])
-                    if result.get("tpot", 0) > 0:
-                        TPOT.observe(result["tpot"])
-                    TOKENS_GENERATED.inc(result.get("total_tokens", 0))
+                    queue_time = current_time - req.created_at
+                    BATCH_QUEUE_TIME.observe(queue_time)
 
                 logger.info(
-                    "Batch inference completed",
+                    "Processing batch",
                     extra={"extra_data": {
                         "batch_id": self.total_batches,
-                        "duration_s": round(batch_duration, 3),
-                        "prompts": len(prompts_to_infer),
-                        "tokens": sum(r.get("total_tokens", 0) for r in results)
+                        "batch_size": batch_size
                     }}
                 )
 
-                # Distribute results to waiting requests and cache them
-                for (cache_key, reqs), result in zip(unique_prompts.items(), results):
-                    # Store in cache
-                    await self.cache.put(cache_key, result)
-                    # Distribute to all requests with this cache_key
-                    for req in reqs:
+                try:
+                    # Group requests by cache_key for deduplication
+                    unique_prompts: Dict[str, List[BatchRequest]] = {}
+                    for req in batch:
+                        if req.cache_key not in unique_prompts:
+                            unique_prompts[req.cache_key] = []
+                        unique_prompts[req.cache_key].append(req)
+
+                    # Only infer unique prompts
+                    prompts_to_infer = [reqs[0].prompt for reqs in unique_prompts.values()]
+                    temps_to_infer = [reqs[0].temperature for reqs in unique_prompts.values()]
+                    top_ps_to_infer = [reqs[0].top_p for reqs in unique_prompts.values()]
+                    max_tokens = max(req.max_tokens for req in batch)
+
+                    dedup_count = batch_size - len(prompts_to_infer)
+                    span.set_attribute("unique_prompts", len(prompts_to_infer))
+                    span.set_attribute("deduplicated", dedup_count)
+
+                    if dedup_count > 0:
+                        self.total_deduplicated += dedup_count
+                        DEDUPLICATED_REQUESTS.inc(dedup_count)
+                        DEDUP_RATIO.set(dedup_count / batch_size)
+                        logger.info(
+                            "Deduplicated requests",
+                            extra={"extra_data": {
+                                "deduplicated": dedup_count,
+                                "unique_prompts": len(prompts_to_infer)
+                            }}
+                        )
+                    else:
+                        DEDUP_RATIO.set(0)
+
+                    UNIQUE_PROMPTS_PER_BATCH.observe(len(prompts_to_infer))
+
+                    # Process batch through engine
+                    batch_start = time.perf_counter()
+                    results = await self._run_batch_inference(
+                        prompts_to_infer, max_tokens, temps_to_infer[0], top_ps_to_infer[0]
+                    )
+                    batch_duration = time.perf_counter() - batch_start
+
+                    # Exemplar for metric-trace correlation
+                    trace_id = get_current_trace_id()
+                    exemplar = {"trace_id": trace_id} if trace_id else None
+                    BATCH_PROCESSING_TIME.observe(batch_duration, exemplar=exemplar)
+
+                    # Record inference metrics
+                    total_tokens = 0
+                    for result in results:
+                        if result.get("ttft", 0) > 0:
+                            TTFT.observe(result["ttft"])
+                        if result.get("tpot", 0) > 0:
+                            TPOT.observe(result["tpot"])
+                        tokens = result.get("total_tokens", 0)
+                        TOKENS_GENERATED.inc(tokens)
+                        total_tokens += tokens
+
+                    logger.info(
+                        "Batch inference completed",
+                        extra={"extra_data": {
+                            "batch_id": self.total_batches,
+                            "duration_s": round(batch_duration, 3),
+                            "prompts": len(prompts_to_infer),
+                            "tokens": total_tokens
+                        }}
+                    )
+
+                    # Distribute results to waiting requests and cache them
+                    for (cache_key, reqs), result in zip(unique_prompts.items(), results):
+                        # Store in cache
+                        await self.cache.put(cache_key, result)
+                        # Distribute to all requests with this cache_key
+                        for req in reqs:
+                            if not req.future.done():
+                                req.future.set_result(result)
+
+                except Exception as e:
+                    span.set_attribute("error", True)
+                    # On error, fail all requests in batch
+                    INFERENCE_ERRORS.labels(error_type=type(e).__name__).inc()
+                    logger.error(
+                        "Batch processing error",
+                        extra={"extra_data": {
+                            "batch_id": self.total_batches,
+                            "error": str(e),
+                            "error_type": type(e).__name__
+                        }}
+                    )
+                    for req in batch:
                         if not req.future.done():
-                            req.future.set_result(result)
-
-            except Exception as e:
-                # On error, fail all requests in batch
-                INFERENCE_ERRORS.labels(error_type=type(e).__name__).inc()
-                logger.error(
-                    "Batch processing error",
-                    extra={"extra_data": {
-                        "batch_id": self.total_batches,
-                        "error": str(e),
-                        "error_type": type(e).__name__
-                    }}
-                )
-                for req in batch:
-                    if not req.future.done():
-                        req.future.set_exception(e)
+                            req.future.set_exception(e)
 
     async def _run_batch_inference(
         self,
@@ -299,18 +322,31 @@ class RequestBatcher:
         """
         Run batched inference through the engine.
         This runs in a thread pool to avoid blocking the event loop.
+        OTel context is captured and re-attached in the thread.
         """
+        from opentelemetry import context as otel_context
+
         loop = asyncio.get_event_loop()
 
-        # Run synchronous vLLM inference in thread pool
-        results = await loop.run_in_executor(
-            None,
-            self._sync_batch_inference,
-            prompts,
-            max_tokens,
-            temperature,
-            top_p,
-        )
+        # Capture OTel context before crossing thread boundary
+        ctx = otel_context.get_current()
+
+        def _inference_with_context():
+            # Re-attach OTel context in the thread pool thread
+            token = otel_context.attach(ctx)
+            try:
+                with tracer.start_as_current_span("batcher.inference") as span:
+                    span.set_attribute("num_prompts", len(prompts))
+                    results = self._sync_batch_inference(
+                        prompts, max_tokens, temperature, top_p
+                    )
+                    total_tokens = sum(r.get("total_tokens", 0) for r in results)
+                    span.set_attribute("total_tokens_generated", total_tokens)
+                    return results
+            finally:
+                otel_context.detach(token)
+
+        results = await loop.run_in_executor(None, _inference_with_context)
         return results
 
     def _sync_batch_inference(

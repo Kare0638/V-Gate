@@ -12,7 +12,7 @@
 FROM vllm/vllm-openai:latest AS vgate-gpu
 
 # pydantic-settings is not bundled in the base image
-RUN pip install --no-cache-dir pydantic-settings>=2.0.0
+RUN pip install --no-cache-dir pydantic-settings>=2.0.0 opentelemetry-api>=1.25.0 opentelemetry-sdk>=1.25.0 opentelemetry-exporter-otlp-proto-grpc>=1.25.0 opentelemetry-instrumentation-fastapi>=0.46b0
 
 WORKDIR /app
 

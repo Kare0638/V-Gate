@@ -15,6 +15,7 @@ from vgate.metrics import (
     init_app_info
 )
 from vgate.security import SecurityMiddleware
+from vgate.tracing import init_tracing, shutdown_tracing, get_current_trace_id
 
 # Prometheus client for metrics endpoint
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
@@ -38,6 +39,14 @@ batcher = None
 async def lifespan(app: FastAPI):
     """Lifecycle manager for startup/shutdown."""
     global engine, batcher
+
+    # Initialize tracing before other components
+    init_tracing(config)
+
+    # Instrument FastAPI with OpenTelemetry if tracing is enabled
+    if config.tracing.enabled:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        FastAPIInstrumentor.instrument_app(app)
 
     # Initialize the VGateEngine with config (inside lifespan for multiprocessing safety)
     engine = VGateEngine()
@@ -73,6 +82,7 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown: stop the batcher
     await batcher.stop()
+    shutdown_tracing()
     app_logger.info("V-Gate stopped")
 
 
@@ -92,7 +102,10 @@ app.add_middleware(SecurityMiddleware, config=config.security)
 @app.middleware("http")
 async def observability_middleware(request: Request, call_next):
     """Middleware for request logging and Prometheus metrics."""
-    request_id = str(uuid.uuid4())[:8]
+    # Use OTel trace_id when available, fallback to 8-char UUID
+    trace_id = get_current_trace_id()
+    request_id = trace_id if trace_id else str(uuid.uuid4())[:8]
+
     start_time = time.perf_counter()
 
     # Track in-progress requests
@@ -109,16 +122,19 @@ async def observability_middleware(request: Request, call_next):
         # Calculate latency
         latency = time.perf_counter() - start_time
 
+        # Build exemplar for metric-trace correlation
+        exemplar = {"trace_id": trace_id} if trace_id else None
+
         # Update Prometheus metrics
         REQUEST_COUNT.labels(
             endpoint=endpoint,
             method=request.method,
             status=str(status_code)
-        ).inc()
+        ).inc(exemplar=exemplar)
         REQUEST_LATENCY.labels(
             endpoint=endpoint,
             method=request.method
-        ).observe(latency)
+        ).observe(latency, exemplar=exemplar)
         REQUEST_IN_PROGRESS.labels(endpoint=endpoint).dec()
 
         # Log request completion (skip /metrics and /health for less noise)
@@ -127,6 +143,7 @@ async def observability_middleware(request: Request, call_next):
                 "Request completed",
                 extra={"extra_data": {
                     "request_id": request_id,
+                    "trace_id": trace_id,
                     "method": request.method,
                     "path": endpoint,
                     "status": status_code,
@@ -134,6 +151,8 @@ async def observability_middleware(request: Request, call_next):
                 }}
             )
 
+    # Add request ID header
+    response.headers["X-Request-ID"] = request_id
     return response
 
 
@@ -241,14 +260,22 @@ async def create_embeddings(request: EmbeddingRequest):
 
 
 @app.get("/metrics", summary="Prometheus Metrics")
-async def prometheus_metrics():
+async def prometheus_metrics(request: Request):
     """
-    Returns metrics in Prometheus format.
-    Scrape this endpoint with Prometheus for monitoring.
+    Returns metrics in Prometheus or OpenMetrics format.
+    Supports content negotiation: use Accept: application/openmetrics-text
+    for OpenMetrics format (required for exemplar export).
     """
+    accept = request.headers.get("accept", "")
+    if "application/openmetrics-text" in accept:
+        from prometheus_client.openmetrics.exposition import generate_latest as om_generate_latest
+        return Response(
+            content=om_generate_latest(),
+            media_type="application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )
     return Response(
         content=generate_latest(),
-        media_type=CONTENT_TYPE_LATEST
+        media_type=CONTENT_TYPE_LATEST,
     )
 
 
