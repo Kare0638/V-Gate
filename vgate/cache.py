@@ -6,6 +6,9 @@ from typing import Any, Dict, Optional
 
 from vgate.config import get_config, CacheConfig
 from vgate.metrics import CACHE_HITS, CACHE_MISSES, CACHE_SIZE, CACHE_EVICTIONS
+from vgate.tracing import get_tracer
+
+tracer = get_tracer("vgate.cache")
 
 
 class ResultCache:
@@ -40,29 +43,39 @@ class ResultCache:
 
     async def get(self, key: str) -> Optional[Dict]:
         """Get a value from the cache. Returns None if not found."""
-        async with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                self.hits += 1
-                CACHE_HITS.inc()
-                return self._cache[key]
-            self.misses += 1
-            CACHE_MISSES.inc()
-            return None
+        with tracer.start_as_current_span("cache.get") as span:
+            span.set_attribute("cache_key", key[:8])
+            async with self._lock:
+                if key in self._cache:
+                    self._cache.move_to_end(key)
+                    self.hits += 1
+                    CACHE_HITS.inc()
+                    span.set_attribute("cache_hit", True)
+                    return self._cache[key]
+                self.misses += 1
+                CACHE_MISSES.inc()
+                span.set_attribute("cache_hit", False)
+                return None
 
     async def put(self, key: str, value: Dict) -> None:
         """Put a value in the cache, evicting oldest if at capacity."""
-        async with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                self._cache[key] = value
-            else:
-                self._cache[key] = value
-                if len(self._cache) > self.config.maxsize:
-                    self._cache.popitem(last=False)
-                    self.evictions += 1
-                    CACHE_EVICTIONS.inc()
-            CACHE_SIZE.set(len(self._cache))
+        with tracer.start_as_current_span("cache.put") as span:
+            span.set_attribute("cache_key", key[:8])
+            evicted = False
+            async with self._lock:
+                if key in self._cache:
+                    self._cache.move_to_end(key)
+                    self._cache[key] = value
+                else:
+                    self._cache[key] = value
+                    if len(self._cache) > self.config.maxsize:
+                        self._cache.popitem(last=False)
+                        self.evictions += 1
+                        CACHE_EVICTIONS.inc()
+                        evicted = True
+                CACHE_SIZE.set(len(self._cache))
+            span.set_attribute("cache_size", len(self._cache))
+            span.set_attribute("evicted", evicted)
 
     def get_stats(self) -> Dict[str, Any]:
         """Return cache statistics."""
