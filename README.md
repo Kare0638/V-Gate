@@ -1,6 +1,6 @@
 # V-Gate
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
 
@@ -367,9 +367,14 @@ ruff check .
 
 ---
 
-## License
+## Compliance & Legal Disclaimer
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+1. **License**: This project is licensed under the Apache License 2.0.
+2. **Model Terms**: V-Gate is an inference server. Users must separately adhere to the license terms of the underlying models (e.g., Qwen, LLaMA).
+3. **Content Responsibility**: The author of V-Gate is NOT responsible for any content generated using this software. Users are fully responsible for the outputs and must ensure compliance with local safety laws and ethical guidelines.
+4. **No Warranty**: This software is provided "as is", optimized for RTX 3060; use on other hardware is at your own risk.
+
+See the [LICENSE](LICENSE) file for full license text.
 
 ---
 
