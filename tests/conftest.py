@@ -205,7 +205,38 @@ def _install_otel_stub_if_missing() -> None:
     sys.modules["opentelemetry.instrumentation.fastapi"] = instrumentation_fastapi_mod
 
 
+def _install_sglang_stub_if_missing() -> None:
+    """Install a minimal SGLang stub when dependency is unavailable."""
+    if importlib.util.find_spec("sglang") is not None:
+        return
+    if "sglang" in sys.modules:
+        return
+
+    class MockEngine:
+        def __init__(self, model_path=None, mem_fraction_static=None, tp_size=None):
+            self.model_path = model_path
+
+        def generate(self, prompts, sampling_params):
+            results = []
+            for prompt in prompts:
+                results.append({
+                    "text": f"[sglang-stub] echo: {prompt[:80]}",
+                    "meta_info": {
+                        "completion_tokens_ids": list(range(8)),
+                    },
+                })
+            return results
+
+        def shutdown(self):
+            pass
+
+    sglang_mod = types.ModuleType("sglang")
+    sglang_mod.Engine = MockEngine
+    sys.modules["sglang"] = sglang_mod
+
+
 _install_otel_stub_if_missing()
+_install_sglang_stub_if_missing()
 
 
 @pytest.fixture(autouse=True)

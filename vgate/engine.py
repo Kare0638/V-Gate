@@ -16,6 +16,7 @@ import os
 import time
 from typing import Optional
 
+from vgate.backends.base import DryRunBackend, InferenceBackend
 from vgate.config import ModelConfig, get_config
 from vgate.tracing import get_tracer
 
@@ -24,49 +25,36 @@ tracer = get_tracer("vgate.engine")
 DRY_RUN = os.getenv("VGATE_DRY_RUN", "false").lower() in ("true", "1", "yes")
 
 
-class _DryRunLLM:
-    """Mock LLM that returns placeholder responses without GPU."""
-
-    def generate(self, prompts, sampling_params):
-        from unittest.mock import MagicMock
-        outputs = []
-        for prompt in prompts:
-            mock_output = MagicMock()
-            mock_output.outputs = [MagicMock()]
-            mock_output.outputs[0].text = f"[dry-run] echo: {prompt[:80]}"
-            mock_output.outputs[0].token_ids = list(range(8))
-            mock_output.metrics = None
-            outputs.append(mock_output)
-        return outputs
+def _create_backend(engine_type: str) -> InferenceBackend:
+    """Factory function to create the appropriate inference backend."""
+    if DRY_RUN:
+        return DryRunBackend()
+    if engine_type == "vllm":
+        from vgate.backends.vllm_backend import VLLMBackend
+        return VLLMBackend()
+    if engine_type == "sglang":
+        from vgate.backends.sglang_backend import SGLangBackend
+        return SGLangBackend()
+    raise ValueError(f"Unknown engine_type: {engine_type!r}")
 
 
 class VGateEngine:
     def __init__(self, model_config: Optional[ModelConfig] = None):
         """
-        Initialize the vLLM engine with configuration.
+        Initialize the inference engine with configuration.
 
         Args:
             model_config: Model configuration. If None, uses global config.
         """
-        if DRY_RUN:
-            print("V-Gate starting in DRY-RUN mode (no GPU required)")
-            self.llm = _DryRunLLM()
-            return
-
-        from vllm import LLM, SamplingParams  # noqa: F811
-
         if model_config is None:
             model_config = get_config().model
 
-        print(f"Loading {model_config.model_id} with {model_config.quantization} quantization...")
-        self.llm = LLM(
-            model=model_config.model_id,
-            quantization=model_config.quantization,
-            gpu_memory_utilization=model_config.gpu_memory_utilization,
-            max_model_len=model_config.max_model_len,
-            enforce_eager=model_config.enforce_eager,
-            trust_remote_code=model_config.trust_remote_code,
-        )
+        self.backend: InferenceBackend = _create_backend(model_config.engine_type)
+
+        if DRY_RUN:
+            print("V-Gate starting in DRY-RUN mode (no GPU required)")
+        else:
+            self.backend.load_model(model_config)
 
     def chat_completions(self, prompt, max_tokens=256):
         with tracer.start_as_current_span("engine.chat_completions") as span:
@@ -74,32 +62,23 @@ class VGateEngine:
             span.set_attribute("max_tokens", max_tokens)
             span.set_attribute("dry_run", DRY_RUN)
 
-            # 构造采样参数
-            if DRY_RUN:
-                sampling_params = {"temperature": 0.7, "top_p": 0.9, "max_tokens": max_tokens}
-            else:
-                from vllm import SamplingParams
-                sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=max_tokens)
+            sampling_params = self.backend.create_sampling_params(
+                temperature=0.7, top_p=0.9, max_tokens=max_tokens
+            )
 
             start_time = time.perf_counter()
-            outputs = self.llm.generate([prompt], sampling_params)
+            results = self.backend.generate([prompt], sampling_params)
             end_time = time.perf_counter()
 
-            output = outputs[0]
-            generated_text = output.outputs[0].text
-            num_tokens = len(output.outputs[0].token_ids)
+            result = results[0]
+            generated_text = result["text"]
+            num_tokens = result["num_tokens"]
 
-            metrics = output.metrics
+            metrics = result.get("metrics", {})
+            ttft = metrics.get("ttft", 0.0)
+            gen_time = metrics.get("gen_time", end_time - start_time)
 
-            if metrics:
-                ttft = metrics.first_token_time - metrics.arrival_time
-                total_time = metrics.finished_time - metrics.first_token_time
-            else:
-                print("Warning: vLLM internal metrics missing. Using wall-clock time.")
-                ttft = 0.0
-                total_time = end_time - start_time
-
-            tpot = (total_time / num_tokens) if num_tokens > 0 else 0
+            tpot = (gen_time / num_tokens) if num_tokens > 0 else 0
 
             span.set_attribute("tokens_generated", num_tokens)
             span.set_attribute("ttft_ms", round(ttft * 1000, 2))
@@ -118,13 +97,12 @@ class VGateEngine:
         Returns a mock embedding for MVP.
         """
         print(f"VGateEngine: Generating mock embeddings for input: '{input_text}'")
-        # Return a fixed mock embedding for now
         return {
             "object": "list",
             "data": [
                 {
                     "object": "embedding",
-                    "embedding": [i * 0.01 for i in range(1536)], # A longer mock embedding
+                    "embedding": [i * 0.01 for i in range(1536)],
                     "index": 0,
                 }
             ],

@@ -23,6 +23,7 @@ model:
   max_model_len: 2048
   trust_remote_code: true
   enforce_eager: true
+  engine_type: "vllm"  # "vllm" or "sglang" / 推理后端引擎
 
 # Request batching / 请求批处理
 batch:

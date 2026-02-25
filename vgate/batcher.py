@@ -13,12 +13,9 @@
 # limitations under the License.
 
 import asyncio
-import os
 import time
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
-
-DRY_RUN = os.getenv("VGATE_DRY_RUN", "false").lower() in ("true", "1", "yes")
 
 from vgate.cache import ResultCache
 from vgate.config import get_config, CacheConfig as ConfigCacheConfig
@@ -371,43 +368,32 @@ class RequestBatcher:
         top_p: float = 0.9,
     ) -> List[Dict[str, Any]]:
         """Synchronous batch inference - runs in thread pool."""
-        if DRY_RUN:
-            sampling_params = {"temperature": temperature, "top_p": top_p, "max_tokens": max_tokens}
-        else:
-            from vllm import SamplingParams
-            sampling_params = SamplingParams(
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens
-            )
+        backend = self.engine.backend
+        sampling_params = backend.create_sampling_params(
+            temperature=temperature, top_p=top_p, max_tokens=max_tokens
+        )
 
         start_time = time.perf_counter()
-        outputs = self.engine.llm.generate(prompts, sampling_params)
+        backend_results = backend.generate(prompts, sampling_params)
         end_time = time.perf_counter()
 
         total_time = end_time - start_time
 
         results = []
-        for output in outputs:
-            generated_text = output.outputs[0].text
-            num_tokens = len(output.outputs[0].token_ids)
+        for br in backend_results:
+            num_tokens = br["num_tokens"]
+            metrics = br.get("metrics", {})
 
-            # Calculate metrics
-            metrics = output.metrics
-            if metrics:
-                ttft = metrics.first_token_time - metrics.arrival_time
-                gen_time = metrics.finished_time - metrics.first_token_time
-            else:
-                ttft = 0.0
-                gen_time = total_time / len(prompts)
+            ttft = metrics.get("ttft", 0.0)
+            gen_time = metrics.get("gen_time", total_time / len(prompts))
 
             tpot = (gen_time / num_tokens) if num_tokens > 0 else 0
 
             results.append({
-                "text": generated_text,
+                "text": br["text"],
                 "ttft": ttft,
                 "tpot": tpot,
-                "total_tokens": num_tokens
+                "total_tokens": num_tokens,
             })
 
         return results

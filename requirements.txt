@@ -10,3 +10,4 @@ opentelemetry-sdk>=1.25.0
 opentelemetry-exporter-otlp-proto-grpc>=1.25.0
 opentelemetry-instrumentation-fastapi>=0.46b0
 # vllm>=0.14.0  # GPU mode: provided by base image
+# sglang[all]>=0.4.0  # SGLang mode: alternative backend
