@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Optional, Tuple, Type
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 
@@ -41,13 +41,22 @@ class ServerConfig(BaseModel):
 
 
 class ModelConfig(BaseModel):
-    """Model configuration for vLLM engine."""
+    """Model configuration for inference engine."""
     model_id: str = "Qwen/Qwen2.5-1.5B-Instruct-AWQ"
     quantization: str = "awq"
     gpu_memory_utilization: float = 0.7
     max_model_len: int = 2048
     trust_remote_code: bool = True
     enforce_eager: bool = True
+    engine_type: str = "vllm"
+
+    @field_validator("engine_type")
+    @classmethod
+    def validate_engine_type(cls, v: str) -> str:
+        allowed = ("vllm", "sglang")
+        if v not in allowed:
+            raise ValueError(f"engine_type must be one of {allowed}, got '{v}'")
+        return v
 
 
 class BatchConfig(BaseModel):
@@ -102,6 +111,18 @@ class RateLimitConfig(BaseModel):
     enabled: bool = True
     default_limit: int = 60  # requests per minute for unknown keys
     window_seconds: int = 60  # sliding window size
+
+
+class BenchmarkConfig(BaseModel):
+    """Benchmark configuration."""
+    warmup_rounds: int = 1
+    test_rounds: int = 3
+    max_tokens: int = 128
+    prompts: list[str] = Field(default_factory=lambda: [
+        "Explain the concept of machine learning in one paragraph.",
+        "Write a Python function that computes the Fibonacci sequence.",
+        "What are the benefits of using a load balancer?",
+    ])
 
 
 class SecurityConfig(BaseModel):
@@ -178,6 +199,7 @@ class VGateConfig(BaseSettings):
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     tracing: TracingConfig = Field(default_factory=TracingConfig)
+    benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
 
     @classmethod
     def settings_customise_sources(

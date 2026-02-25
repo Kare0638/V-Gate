@@ -238,27 +238,33 @@ class TestPrometheusMetrics:
         # Info metric should be set (no exception raised)
 
 
-class MockLLM:
-    """Mock vLLM for testing without GPU."""
+class MockBackend:
+    """Mock inference backend for testing without GPU."""
+
+    def create_sampling_params(self, temperature, top_p, max_tokens):
+        return {"temperature": temperature, "top_p": top_p, "max_tokens": max_tokens}
 
     def generate(self, prompts, sampling_params):
-        """Simulate batch generation with mock outputs."""
-        outputs = []
+        """Simulate batch generation with standardized dict output."""
+        results = []
         for prompt in prompts:
-            mock_output = MagicMock()
-            mock_output.outputs = [MagicMock()]
-            mock_output.outputs[0].text = f"Response to: {prompt[:30]}"
-            mock_output.outputs[0].token_ids = list(range(10))
-            mock_output.metrics = None
-            outputs.append(mock_output)
-        return outputs
+            results.append({
+                "text": f"Response to: {prompt[:30]}",
+                "token_ids": list(range(10)),
+                "num_tokens": 10,
+                "metrics": {},
+            })
+        return results
+
+    def shutdown(self):
+        pass
 
 
 class MockEngine:
     """Mock VGateEngine for testing."""
 
     def __init__(self):
-        self.llm = MockLLM()
+        self.backend = MockBackend()
 
 
 @pytest.fixture

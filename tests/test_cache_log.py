@@ -16,44 +16,51 @@
 Tests for cache-related logging behavior.
 """
 import logging
-from unittest.mock import MagicMock
-
 import pytest
 
 from vgate.batcher import RequestBatcher
 from vgate.cache import ResultCache
 
 
-class MockLLM:
-    """Mock vLLM for testing without GPU."""
+class MockBackend:
+    """Mock inference backend for testing without GPU."""
 
     def __init__(self):
         self.call_count = 0
 
+    def create_sampling_params(self, temperature, top_p, max_tokens):
+        return {"temperature": temperature, "top_p": top_p, "max_tokens": max_tokens}
+
     def generate(self, prompts, sampling_params):
         self.call_count += 1
-        outputs = []
+        results = []
         for prompt in prompts:
-            mock_output = MagicMock()
-            mock_output.outputs = [MagicMock()]
-            mock_output.outputs[0].text = f"Response to: {prompt[:30]}"
-            mock_output.outputs[0].token_ids = list(range(10))
-            mock_output.metrics = None
-            outputs.append(mock_output)
-        return outputs
+            results.append({
+                "text": f"Response to: {prompt[:30]}",
+                "token_ids": list(range(10)),
+                "num_tokens": 10,
+                "metrics": {},
+            })
+        return results
+
+    def shutdown(self):
+        pass
 
 
 class MockEngine:
     """Mock VGateEngine for testing."""
 
     def __init__(self):
-        self.llm = MockLLM()
+        self.backend = MockBackend()
 
 
 @pytest.mark.asyncio
 async def test_cache_hit_emits_debug_log(caplog, monkeypatch):
     """Second identical request should emit 'Cache hit' debug log."""
-    monkeypatch.setattr("vgate.batcher.DRY_RUN", True)
+    # Ensure propagation is enabled so caplog can capture records
+    # (importing main.py sets propagate=False on the vgate root logger)
+    logging.getLogger("vgate").propagate = True
+    logging.getLogger("vgate.batcher").propagate = True
 
     batcher = RequestBatcher(
         engine=MockEngine(),

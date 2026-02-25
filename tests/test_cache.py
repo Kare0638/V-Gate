@@ -149,34 +149,40 @@ class TestResultCache:
         assert result_c is not None
 
 
-class MockLLM:
-    """Mock vLLM for testing without GPU."""
+class MockBackend:
+    """Mock inference backend for testing without GPU."""
 
     def __init__(self):
         self.call_count = 0
         self.prompts_seen = []
 
+    def create_sampling_params(self, temperature, top_p, max_tokens):
+        return {"temperature": temperature, "top_p": top_p, "max_tokens": max_tokens}
+
     def generate(self, prompts, sampling_params):
-        """Track prompts and return mock outputs."""
+        """Track prompts and return standardized dict output."""
         self.call_count += 1
         self.prompts_seen.extend(prompts)
 
-        outputs = []
+        results = []
         for prompt in prompts:
-            mock_output = MagicMock()
-            mock_output.outputs = [MagicMock()]
-            mock_output.outputs[0].text = f"Response to: {prompt[:30]}"
-            mock_output.outputs[0].token_ids = list(range(10))
-            mock_output.metrics = None
-            outputs.append(mock_output)
-        return outputs
+            results.append({
+                "text": f"Response to: {prompt[:30]}",
+                "token_ids": list(range(10)),
+                "num_tokens": 10,
+                "metrics": {},
+            })
+        return results
+
+    def shutdown(self):
+        pass
 
 
 class MockEngine:
     """Mock VGateEngine for testing."""
 
     def __init__(self):
-        self.llm = MockLLM()
+        self.backend = MockBackend()
 
 
 @pytest.fixture
@@ -205,11 +211,11 @@ class TestBatcherCache:
 
         # First request - cache miss
         result1 = await cached_batcher.submit("Hello world", max_tokens=50)
-        call_count_after_first = cached_batcher.engine.llm.call_count
+        call_count_after_first = cached_batcher.engine.backend.call_count
 
         # Second identical request - should hit cache
         result2 = await cached_batcher.submit("Hello world", max_tokens=50)
-        call_count_after_second = cached_batcher.engine.llm.call_count
+        call_count_after_second = cached_batcher.engine.backend.call_count
 
         assert result1["text"] == result2["text"]
         assert call_count_after_second == call_count_after_first  # No new inference
@@ -267,7 +273,7 @@ class TestBatchDedup:
         assert all(r["text"] == results[0]["text"] for r in results)
 
         # Only 1 unique prompt should have been inferred
-        assert len(cached_batcher.engine.llm.prompts_seen) == 1
+        assert len(cached_batcher.engine.backend.prompts_seen) == 1
 
         await cached_batcher.stop()
 
@@ -288,7 +294,7 @@ class TestBatchDedup:
 
         assert len(results) == 5
         # Should have inferred only 3 unique prompts
-        unique_prompts = set(cached_batcher.engine.llm.prompts_seen)
+        unique_prompts = set(cached_batcher.engine.backend.prompts_seen)
         assert len(unique_prompts) == 3
 
         await cached_batcher.stop()

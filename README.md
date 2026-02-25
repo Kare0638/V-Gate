@@ -4,7 +4,7 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
 
-**V-Gate** is a high-performance AI model serving gateway built on [vLLM](https://github.com/vllm-project/vllm). It provides a unified, OpenAI-compatible API interface with enterprise-grade features including dynamic request batching, result caching, observability, and security.
+**V-Gate** is a high-performance AI model serving gateway with pluggable inference backends. It currently supports [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang), while exposing a unified OpenAI-compatible API with enterprise-grade features including dynamic request batching, result caching, observability, and security.
 
 Optimized for memory-constrained environments (e.g., RTX 3060/4060).
 
@@ -17,6 +17,8 @@ Optimized for memory-constrained environments (e.g., RTX 3060/4060).
 | **OpenAI-Compatible API** | Drop-in replacement for OpenAI API (`/v1/chat/completions`, `/v1/embeddings`) |
 | **Dynamic Request Batching** | Aggregate concurrent requests for improved GPU utilization |
 | **Result Caching** | LRU cache with batch-level deduplication |
+| **Multi-Backend Inference** | Switch backend with `model.engine_type` (`vllm` / `sglang`) |
+| **Built-in Benchmarking** | Compare backends with CLI tool and `/v1/benchmark` API |
 | **Prometheus Metrics** | Full observability with `/metrics` endpoint |
 | **Structured Logging** | JSON-formatted logs for production debugging |
 | **API Key Authentication** | Bearer token validation with per-key rate limits |
@@ -80,6 +82,26 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### Option 3: Isolated SGLang Environment (Recommended)
+
+Use a dedicated virtual environment for `sglang[all]` to avoid dependency conflicts with your existing `vllm` environment.
+
+```bash
+cd V-Gate
+
+# Create isolated env for SGLang
+uv venv .venv-sglang --python 3.12
+
+# Install base project deps
+uv pip install --python .venv-sglang/bin/python -r requirements.txt
+
+# Install SGLang full stack
+uv pip install --python .venv-sglang/bin/python "sglang[all]==0.5.9"
+
+# Optional: install test tools in this env
+uv pip install --python .venv-sglang/bin/python pytest pytest-asyncio
+```
+
 ---
 
 ## API Usage
@@ -110,6 +132,17 @@ curl http://localhost:8000/metrics
 ### Statistics
 ```bash
 curl http://localhost:8000/stats
+```
+
+### Inline Benchmark API
+```bash
+curl -X POST http://localhost:8000/v1/benchmark \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompts": ["Explain KV cache in one paragraph."],
+    "max_tokens": 128,
+    "rounds": 3
+  }'
 ```
 
 ### Python Client SDK
@@ -153,6 +186,27 @@ async with AsyncVGate(base_url="http://localhost:8000", api_key="sk-...") as cli
 
 ---
 
+## Benchmark
+
+### Compare Backends (CLI)
+
+```bash
+# Compare vLLM and SGLang in dry-run mode
+PYTHONPATH=. VGATE_DRY_RUN=true python benchmarks/bench_compare.py --backends vllm sglang
+
+# Run vLLM only, custom rounds/tokens
+PYTHONPATH=. python benchmarks/bench_compare.py --backends vllm --rounds 5 --max-tokens 256
+
+# JSON output for automation
+PYTHONPATH=. python benchmarks/bench_compare.py --backends vllm sglang --output json
+```
+
+### Benchmark Current Server Backend
+
+`POST /v1/benchmark` runs benchmark through the full server pipeline (batcher + cache + backend) using the active `model.engine_type`.
+
+---
+
 ## Configuration
 
 V-Gate uses a layered configuration system with the following priority:
@@ -173,6 +227,9 @@ model:
   quantization: "awq"
   gpu_memory_utilization: 0.7
   max_model_len: 2048
+  trust_remote_code: true
+  enforce_eager: true
+  engine_type: "vllm"  # "vllm" or "sglang"
 
 batch:
   max_batch_size: 8
@@ -199,6 +256,25 @@ security:
   exempt_paths:
     - "/health"
     - "/metrics"
+
+benchmark:
+  warmup_rounds: 1
+  test_rounds: 3
+  max_tokens: 128
+  prompts:
+    - "Explain the concept of machine learning in one paragraph."
+    - "Write a Python function that computes the Fibonacci sequence."
+    - "What are the benefits of using a load balancer?"
+```
+
+### Backend Selection
+
+```bash
+# Default backend: vllm
+VGATE_MODEL__ENGINE_TYPE=vllm python main.py
+
+# Switch to SGLang backend
+VGATE_MODEL__ENGINE_TYPE=sglang python main.py
 ```
 
 ### Environment Variables
@@ -208,6 +284,7 @@ security:
 | `VGATE_CONFIG_PATH` | Path to config file | `./config.yaml` |
 | `VGATE_DRY_RUN` | Enable dry-run mode (no GPU) | `false` |
 | `VGATE_SERVER__PORT` | Server port | `8000` |
+| `VGATE_MODEL__ENGINE_TYPE` | Inference backend (`vllm`/`sglang`) | `vllm` |
 | `VGATE_MODEL__MODEL_ID` | Model identifier | `Qwen/Qwen2.5-1.5B-Instruct-AWQ` |
 | `VGATE_BATCH__MAX_BATCH_SIZE` | Max batch size | `8` |
 | `VGATE_CACHE__MAXSIZE` | Cache size limit | `1000` |
@@ -293,10 +370,17 @@ V-Gate/
 ├── Dockerfile              # Multi-stage Docker build
 ├── docker-compose.yml      # Service orchestration
 ├── requirements.txt        # Python dependencies
+├── benchmarks/
+│   ├── benchmark.py         # Single-engine benchmark entry
+│   └── bench_compare.py     # Multi-backend benchmark comparison CLI
 ├── vgate/
 │   ├── __init__.py
-│   ├── engine.py           # vLLM inference engine
+│   ├── engine.py           # Backend factory + engine wrapper
 │   ├── batcher.py          # Request batching logic
+│   ├── backends/
+│   │   ├── base.py         # Inference backend protocol + dry-run backend
+│   │   ├── vllm_backend.py # vLLM backend adapter
+│   │   └── sglang_backend.py # SGLang backend adapter
 │   ├── cache.py            # LRU result cache
 │   ├── config.py           # Configuration management
 │   ├── logging_config.py   # Structured logging
@@ -313,6 +397,8 @@ V-Gate/
 ├── monitoring/
 │   └── prometheus.yml      # Prometheus configuration
 └── tests/
+    ├── test_backends.py
+    ├── test_benchmark.py
     ├── test_batcher.py
     ├── test_cache.py
     ├── test_config.py
@@ -335,6 +421,12 @@ PYTHONPATH=. VGATE_DRY_RUN=true pytest tests/ -v
 
 # Run specific test file
 pytest tests/test_batcher.py -v
+
+# Validate vLLM backend path
+VGATE_DRY_RUN=true pytest tests/test_backends.py -k vllm -v
+
+# Validate SGLang backend path (in .venv-sglang)
+VGATE_DRY_RUN=true ./.venv-sglang/bin/pytest tests/test_backends.py -k sglang -v
 ```
 
 ### Code Style

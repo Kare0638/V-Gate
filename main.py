@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+import asyncio
 import time
 import uuid
 
@@ -78,6 +79,7 @@ async def lifespan(app: FastAPI):
         extra={"extra_data": {
             "version": APP_VERSION,
             "model": config.model.model_id,
+            "engine_type": config.model.engine_type,
             "batch_config": {
                 "max_batch_size": config.batch.max_batch_size,
                 "max_wait_time_ms": config.batch.max_wait_time_ms,
@@ -329,6 +331,58 @@ async def get_stats():
             },
         },
         "version": APP_VERSION,
+    }
+
+
+class BenchmarkRequest(BaseModel):
+    prompts: list[str] = []
+    max_tokens: int = 128
+    rounds: int = 3
+
+
+@app.post("/v1/benchmark", summary="Run Inline Benchmark")
+async def run_benchmark(request: BenchmarkRequest):
+    """
+    Run a quick inline benchmark through the full pipeline (batcher + cache + engine).
+    Returns latency stats and throughput for the current engine_type.
+    """
+    bench_config = config.benchmark
+    prompts = request.prompts or bench_config.prompts
+    max_tokens = request.max_tokens
+    rounds = request.rounds
+
+    latencies: list[float] = []
+    token_counts: list[int] = []
+
+    for _ in range(rounds):
+        round_start = time.perf_counter()
+        tasks = [
+            batcher.submit(prompt, max_tokens=max_tokens)
+            for prompt in prompts
+        ]
+        results = await asyncio.gather(*tasks)
+        round_latency = time.perf_counter() - round_start
+        latencies.append(round_latency)
+        token_counts.append(sum(r.get("total_tokens", 0) for r in results))
+
+    total_tokens = sum(token_counts)
+    total_time = sum(latencies)
+    sorted_lat = sorted(latencies)
+
+    return {
+        "engine_type": config.model.engine_type,
+        "rounds": rounds,
+        "prompts_per_round": len(prompts),
+        "latency": {
+            "mean_s": round(total_time / rounds, 4),
+            "p50_s": round(sorted_lat[len(sorted_lat) // 2], 4),
+            "p95_s": round(sorted_lat[int(len(sorted_lat) * 0.95)], 4),
+            "total_s": round(total_time, 4),
+        },
+        "throughput": {
+            "total_tokens": total_tokens,
+            "tokens_per_second": round(total_tokens / total_time, 2) if total_time > 0 else 0,
+        },
     }
 
 
