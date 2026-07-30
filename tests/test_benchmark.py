@@ -110,6 +110,10 @@ class TestBenchmarkEndpoint:
             assert "latency" in data
             assert "throughput" in data
             assert data["rounds"] == 3  # default
+            assert "ttft" in data and "p50_s" in data["ttft"] and "p95_s" in data["ttft"]
+            assert "tpot" in data and "p50_s" in data["tpot"] and "p95_s" in data["tpot"]
+            assert "batching" in data and "average_batch_size" in data["batching"]
+            assert "cache" in data and "hit_rate" in data["cache"]
 
     @pytest.mark.asyncio
     async def test_benchmark_endpoint_custom(self):

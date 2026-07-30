@@ -143,10 +143,14 @@ class TestVLLMBackendNormalization:
         mock_output.outputs = [MagicMock()]
         mock_output.outputs[0].text = "Generated text"
         mock_output.outputs[0].token_ids = [1, 2, 3, 4, 5]
+        # Field names/semantics match vllm.v1.metrics.stats.RequestStateStats:
+        # first_token_latency is precomputed by vLLM; first_token_ts/last_token_ts
+        # are monotonic engine-core timestamps (arrival_time is a separate
+        # wall-clock frontend timestamp and is not used for these deltas).
         mock_output.metrics = MagicMock()
-        mock_output.metrics.first_token_time = 1.1
-        mock_output.metrics.arrival_time = 1.0
-        mock_output.metrics.finished_time = 1.5
+        mock_output.metrics.first_token_latency = 0.1
+        mock_output.metrics.first_token_ts = 1.1
+        mock_output.metrics.last_token_ts = 1.5
 
         mock_llm = MagicMock()
         mock_llm.generate.return_value = [mock_output]

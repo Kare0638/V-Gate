@@ -41,7 +41,7 @@ class BatchRequest:
     top_p: float = 0.9
     cache_key: str = ""
     future: asyncio.Future = field(default_factory=lambda: asyncio.get_event_loop().create_future())
-    created_at: float = field(default_factory=time.time)
+    created_at: float = field(default_factory=time.monotonic)  # monotonic: used only for queue-time deltas
 
 
 class RequestBatcher:
@@ -85,6 +85,11 @@ class RequestBatcher:
         self.total_batches = 0
         self.total_batch_size = 0
         self.total_deduplicated = 0
+        self.total_queue_time = 0.0
+        self.total_queue_samples = 0
+        self.total_ttft = 0.0
+        self.total_tpot = 0.0
+        self.total_inference_samples = 0
 
     async def start(self):
         """Start the background batching task."""
@@ -164,7 +169,7 @@ class RequestBatcher:
                 top_p=top_p,
                 cache_key=cache_key,
                 future=asyncio.get_event_loop().create_future(),
-                created_at=time.time(),
+                created_at=time.monotonic(),
             )
 
             async with self._lock:
@@ -217,11 +222,13 @@ class RequestBatcher:
                 span.set_attribute("batch_id", self.total_batches)
                 span.set_attribute("batch_size", batch_size)
 
-                # Calculate queue wait times
-                current_time = time.time()
+                # Calculate queue wait times (monotonic: immune to wall-clock adjustments)
+                current_time = time.monotonic()
                 for req in batch:
                     queue_time = current_time - req.created_at
                     BATCH_QUEUE_TIME.observe(queue_time)
+                    self.total_queue_time += queue_time
+                    self.total_queue_samples += 1
 
                 logger.info(
                     "Processing batch",
@@ -282,8 +289,11 @@ class RequestBatcher:
                     for result in results:
                         if result.get("ttft", 0) > 0:
                             TTFT.observe(result["ttft"])
+                            self.total_ttft += result["ttft"]
                         if result.get("tpot", 0) > 0:
                             TPOT.observe(result["tpot"])
+                            self.total_tpot += result["tpot"]
+                            self.total_inference_samples += 1
                         tokens = result.get("total_tokens", 0)
                         TOKENS_GENERATED.inc(tokens)
                         total_tokens += tokens
@@ -401,11 +411,23 @@ class RequestBatcher:
     def get_metrics(self) -> Dict[str, Any]:
         """Return batching metrics including cache stats."""
         avg_batch_size = (self.total_batch_size / self.total_batches) if self.total_batches > 0 else 0
+        avg_queue_time = (
+            self.total_queue_time / self.total_queue_samples if self.total_queue_samples > 0 else 0
+        )
+        avg_ttft = (
+            self.total_ttft / self.total_inference_samples if self.total_inference_samples > 0 else 0
+        )
+        avg_tpot = (
+            self.total_tpot / self.total_inference_samples if self.total_inference_samples > 0 else 0
+        )
         return {
             "total_requests": self.total_requests,
             "total_batches": self.total_batches,
             "average_batch_size": round(avg_batch_size, 2),
             "pending_requests": len(self._queue),
             "total_deduplicated": self.total_deduplicated,
+            "avg_queue_time_s": round(avg_queue_time, 4),
+            "avg_ttft_s": round(avg_ttft, 4),
+            "avg_tpot_s": round(avg_tpot, 4),
             "cache": self.cache.get_stats(),
         }

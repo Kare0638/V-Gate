@@ -203,7 +203,27 @@ PYTHONPATH=. python benchmarks/bench_compare.py --backends vllm sglang --output 
 
 ### Benchmark Current Server Backend
 
-`POST /v1/benchmark` runs benchmark through the full server pipeline (batcher + cache + backend) using the active `model.engine_type`.
+`POST /v1/benchmark` runs benchmark through the full server pipeline (batcher + cache + backend) using the active `model.engine_type`. It reports latency (mean/p50/p95), TTFT/TPOT (mean/p50/p95), batching stats (batches formed, average batch size, deduplication), and cache hit rate for the run.
+
+### Concurrent Load Benchmark
+
+`benchmarks/bench_load.py` drives real concurrent HTTP traffic at a *running* server's `/v1/chat/completions`, then diffs `/stats` before/after to attribute batching and cache behavior to the run:
+
+```bash
+# Start a server first, e.g.: VGATE_DRY_RUN=true python main.py
+PYTHONPATH=. python benchmarks/bench_load.py --concurrency 8 --requests 80
+PYTHONPATH=. python benchmarks/bench_load.py --prompt-file prompts.txt --output json
+```
+
+`benchmarks/run_report.py` orchestrates a full report: it spawns a fresh server subprocess per scenario (dry-run baseline, a batch-size sweep, and a cache/dedup-impact comparison) and writes the results to [`benchmarks/results/baseline.md`](benchmarks/results/baseline.md):
+
+```bash
+PYTHONPATH=. python benchmarks/run_report.py --requests 60 --concurrency 8
+```
+
+[`benchmarks/results/baseline.md`](benchmarks/results/baseline.md) is a **dry-run baseline** (no GPU) — the mock backend uses a synthetic per-call delay (`VGATE_DRYRUN_SIMULATED_LATENCY_MS`) so batching has something real to amortize, but it does not measure actual model throughput.
+
+[`benchmarks/results/vllm_baseline.md`](benchmarks/results/vllm_baseline.md) is a **real GPU baseline**: `Qwen/Qwen2.5-1.5B-Instruct-AWQ` on an RTX 3060 Laptop GPU (6GB VRAM) via vLLM 0.26. Producing it surfaced two real bugs (now fixed): vLLM disables pinned memory by default under WSL2 even on kernels that support it (crashes at startup unless `VLLM_WSL2_ENABLE_PIN_MEMORY=1`), and `VLLMBackend` was reading vLLM metrics fields that had been renamed upstream combined with an `LLM()` default that disables stats collection — so TTFT/TPOT were silently always 0 for the real backend before this fix. See the report for the full data and a known `max_batch_size` batching-cap gap it also surfaced.
 
 ---
 

@@ -1,0 +1,43 @@
+{
+  "config": {
+    "concurrency": 8,
+    "total_requests": 40,
+    "unique_prompts": 3,
+    "max_tokens": 64
+  },
+  "wall_time_s": 1.3958,
+  "failures": 0,
+  "latency": {
+    "mean_s": 0.2787,
+    "p50_s": 0.0072,
+    "p95_s": 1.366,
+    "p99_s": 1.3663,
+    "max_s": 1.3663
+  },
+  "throughput": {
+    "total_tokens": 2560,
+    "tokens_per_second": 1834.03,
+    "requests_per_second": 28.66
+  },
+  "batching": {
+    "requests": 8,
+    "batches": 1,
+    "average_batch_size": 8.0,
+    "deduplicated": 5,
+    "avg_queue_time_s": 0.0013,
+    "avg_ttft_s": 0.0,
+    "avg_tpot_s": 0.0173
+  },
+  "cache": {
+    "hits": 32,
+    "misses": 8,
+    "hit_rate": 0.8
+  },
+  "title": "Cache impact: 3 repeated prompts (high reuse) vs. baseline's all-unique prompts",
+  "env": {
+    "VGATE_MODEL__ENGINE_TYPE": "vllm",
+    "VLLM_WSL2_ENABLE_PIN_MEMORY": "1",
+    "VGATE_BATCH__MAX_BATCH_SIZE": "8",
+    "VGATE_BATCH__MAX_WAIT_TIME_MS": "50"
+  }
+}

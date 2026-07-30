@@ -1,0 +1,43 @@
+{
+  "config": {
+    "concurrency": 8,
+    "total_requests": 40,
+    "unique_prompts": 64,
+    "max_tokens": 64
+  },
+  "wall_time_s": 9.6132,
+  "failures": 0,
+  "latency": {
+    "mean_s": 1.922,
+    "p50_s": 1.9941,
+    "p95_s": 2.1149,
+    "p99_s": 2.1151,
+    "max_s": 2.1151
+  },
+  "throughput": {
+    "total_tokens": 1818,
+    "tokens_per_second": 189.12,
+    "requests_per_second": 4.16
+  },
+  "batching": {
+    "requests": 40,
+    "batches": 5,
+    "average_batch_size": 8.0,
+    "deduplicated": 0,
+    "avg_queue_time_s": 0.039,
+    "avg_ttft_s": 0.1265,
+    "avg_tpot_s": 0.0268
+  },
+  "cache": {
+    "hits": 0,
+    "misses": 40,
+    "hit_rate": 0.0
+  },
+  "title": "Batch size sweep: max_batch_size=32",
+  "env": {
+    "VGATE_MODEL__ENGINE_TYPE": "vllm",
+    "VLLM_WSL2_ENABLE_PIN_MEMORY": "1",
+    "VGATE_BATCH__MAX_BATCH_SIZE": "32",
+    "VGATE_BATCH__MAX_WAIT_TIME_MS": "50"
+  }
+}
