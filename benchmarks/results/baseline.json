@@ -1,0 +1,254 @@
+[
+  {
+    "config": {
+      "concurrency": 2,
+      "total_requests": 10,
+      "unique_prompts": 64,
+      "max_tokens": 64
+    },
+    "wall_time_s": 0.9369,
+    "failures": 0,
+    "latency": {
+      "mean_s": 0.1873,
+      "p50_s": 0.1938,
+      "p95_s": 0.1953,
+      "p99_s": 0.1953,
+      "max_s": 0.1953
+    },
+    "throughput": {
+      "total_tokens": 80,
+      "tokens_per_second": 85.39,
+      "requests_per_second": 10.67
+    },
+    "batching": {
+      "requests": 10,
+      "batches": 5,
+      "average_batch_size": 2.0,
+      "deduplicated": 0,
+      "avg_queue_time_s": 0.0406,
+      "avg_ttft_s": 0.0,
+      "avg_tpot_s": 0.009
+    },
+    "cache": {
+      "hits": 0,
+      "misses": 10,
+      "hit_rate": 0.0
+    },
+    "title": "Baseline (max_batch_size=8, all-unique prompts)",
+    "env": {
+      "VGATE_DRY_RUN": "true",
+      "VGATE_BATCH__MAX_BATCH_SIZE": "8",
+      "VGATE_BATCH__MAX_WAIT_TIME_MS": "50"
+    }
+  },
+  {
+    "config": {
+      "concurrency": 2,
+      "total_requests": 10,
+      "unique_prompts": 64,
+      "max_tokens": 64
+    },
+    "wall_time_s": 1.4431,
+    "failures": 0,
+    "latency": {
+      "mean_s": 0.2742,
+      "p50_s": 0.288,
+      "p95_s": 0.2911,
+      "p99_s": 0.2911,
+      "max_s": 0.2911
+    },
+    "throughput": {
+      "total_tokens": 80,
+      "tokens_per_second": 55.44,
+      "requests_per_second": 6.93
+    },
+    "batching": {
+      "requests": 10,
+      "batches": 10,
+      "average_batch_size": 1.0,
+      "deduplicated": 0,
+      "avg_queue_time_s": 0.1278,
+      "avg_ttft_s": 0.0,
+      "avg_tpot_s": 0.0179
+    },
+    "cache": {
+      "hits": 0,
+      "misses": 10,
+      "hit_rate": 0.0
+    },
+    "title": "Batch size sweep: max_batch_size=1",
+    "env": {
+      "VGATE_DRY_RUN": "true",
+      "VGATE_BATCH__MAX_BATCH_SIZE": "1",
+      "VGATE_BATCH__MAX_WAIT_TIME_MS": "50"
+    }
+  },
+  {
+    "config": {
+      "concurrency": 2,
+      "total_requests": 10,
+      "unique_prompts": 64,
+      "max_tokens": 64
+    },
+    "wall_time_s": 0.9496,
+    "failures": 0,
+    "latency": {
+      "mean_s": 0.1899,
+      "p50_s": 0.1941,
+      "p95_s": 0.1946,
+      "p99_s": 0.1946,
+      "max_s": 0.1946
+    },
+    "throughput": {
+      "total_tokens": 80,
+      "tokens_per_second": 84.24,
+      "requests_per_second": 10.53
+    },
+    "batching": {
+      "requests": 10,
+      "batches": 5,
+      "average_batch_size": 2.0,
+      "deduplicated": 0,
+      "avg_queue_time_s": 0.043,
+      "avg_ttft_s": 0.0,
+      "avg_tpot_s": 0.0089
+    },
+    "cache": {
+      "hits": 0,
+      "misses": 10,
+      "hit_rate": 0.0
+    },
+    "title": "Batch size sweep: max_batch_size=4",
+    "env": {
+      "VGATE_DRY_RUN": "true",
+      "VGATE_BATCH__MAX_BATCH_SIZE": "4",
+      "VGATE_BATCH__MAX_WAIT_TIME_MS": "50"
+    }
+  },
+  {
+    "config": {
+      "concurrency": 2,
+      "total_requests": 10,
+      "unique_prompts": 64,
+      "max_tokens": 64
+    },
+    "wall_time_s": 0.9298,
+    "failures": 0,
+    "latency": {
+      "mean_s": 0.1858,
+      "p50_s": 0.1941,
+      "p95_s": 0.1958,
+      "p99_s": 0.1958,
+      "max_s": 0.1958
+    },
+    "throughput": {
+      "total_tokens": 80,
+      "tokens_per_second": 86.04,
+      "requests_per_second": 10.76
+    },
+    "batching": {
+      "requests": 10,
+      "batches": 5,
+      "average_batch_size": 2.0,
+      "deduplicated": 0,
+      "avg_queue_time_s": 0.0388,
+      "avg_ttft_s": 0.0,
+      "avg_tpot_s": 0.0089
+    },
+    "cache": {
+      "hits": 0,
+      "misses": 10,
+      "hit_rate": 0.0
+    },
+    "title": "Batch size sweep: max_batch_size=16",
+    "env": {
+      "VGATE_DRY_RUN": "true",
+      "VGATE_BATCH__MAX_BATCH_SIZE": "16",
+      "VGATE_BATCH__MAX_WAIT_TIME_MS": "50"
+    }
+  },
+  {
+    "config": {
+      "concurrency": 2,
+      "total_requests": 10,
+      "unique_prompts": 64,
+      "max_tokens": 64
+    },
+    "wall_time_s": 0.937,
+    "failures": 0,
+    "latency": {
+      "mean_s": 0.1873,
+      "p50_s": 0.1939,
+      "p95_s": 0.1942,
+      "p99_s": 0.1942,
+      "max_s": 0.1942
+    },
+    "throughput": {
+      "total_tokens": 80,
+      "tokens_per_second": 85.38,
+      "requests_per_second": 10.67
+    },
+    "batching": {
+      "requests": 10,
+      "batches": 5,
+      "average_batch_size": 2.0,
+      "deduplicated": 0,
+      "avg_queue_time_s": 0.0406,
+      "avg_ttft_s": 0.0,
+      "avg_tpot_s": 0.009
+    },
+    "cache": {
+      "hits": 0,
+      "misses": 10,
+      "hit_rate": 0.0
+    },
+    "title": "Batch size sweep: max_batch_size=32",
+    "env": {
+      "VGATE_DRY_RUN": "true",
+      "VGATE_BATCH__MAX_BATCH_SIZE": "32",
+      "VGATE_BATCH__MAX_WAIT_TIME_MS": "50"
+    }
+  },
+  {
+    "config": {
+      "concurrency": 2,
+      "total_requests": 10,
+      "unique_prompts": 3,
+      "max_tokens": 64
+    },
+    "wall_time_s": 0.381,
+    "failures": 0,
+    "latency": {
+      "mean_s": 0.0761,
+      "p50_s": 0.002,
+      "p95_s": 0.1944,
+      "p99_s": 0.1944,
+      "max_s": 0.1944
+    },
+    "throughput": {
+      "total_tokens": 80,
+      "tokens_per_second": 209.96,
+      "requests_per_second": 26.24
+    },
+    "batching": {
+      "requests": 4,
+      "batches": 2,
+      "average_batch_size": 2.0,
+      "deduplicated": 1,
+      "avg_queue_time_s": 0.0401,
+      "avg_ttft_s": 0.0,
+      "avg_tpot_s": 0.0119
+    },
+    "cache": {
+      "hits": 6,
+      "misses": 4,
+      "hit_rate": 0.6
+    },
+    "title": "Cache impact: 3 repeated prompts (high reuse) vs. baseline's all-unique prompts",
+    "env": {
+      "VGATE_DRY_RUN": "true",
+      "VGATE_BATCH__MAX_BATCH_SIZE": "8",
+      "VGATE_BATCH__MAX_WAIT_TIME_MS": "50"
+    }
+  }
+]

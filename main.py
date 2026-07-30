@@ -309,6 +309,9 @@ async def get_stats():
             "average_batch_size": metrics["average_batch_size"],
             "pending_requests": metrics["pending_requests"],
             "total_deduplicated": metrics["total_deduplicated"],
+            "avg_queue_time_s": metrics["avg_queue_time_s"],
+            "avg_ttft_s": metrics["avg_ttft_s"],
+            "avg_tpot_s": metrics["avg_tpot_s"],
         },
         "cache": metrics["cache"],
         "config": {
@@ -351,8 +354,12 @@ async def run_benchmark(request: BenchmarkRequest):
     max_tokens = request.max_tokens
     rounds = request.rounds
 
+    stats_before = batcher.get_metrics()
+
     latencies: list[float] = []
     token_counts: list[int] = []
+    ttfts: list[float] = []
+    tpots: list[float] = []
 
     for _ in range(rounds):
         round_start = time.perf_counter()
@@ -364,10 +371,27 @@ async def run_benchmark(request: BenchmarkRequest):
         round_latency = time.perf_counter() - round_start
         latencies.append(round_latency)
         token_counts.append(sum(r.get("total_tokens", 0) for r in results))
+        ttfts.extend(r["ttft"] for r in results if r.get("ttft", 0) > 0)
+        tpots.extend(r["tpot"] for r in results if r.get("tpot", 0) > 0)
+
+    stats_after = batcher.get_metrics()
 
     total_tokens = sum(token_counts)
     total_time = sum(latencies)
     sorted_lat = sorted(latencies)
+
+    def _percentile(data: list[float], pct: float) -> float:
+        if not data:
+            return 0.0
+        s = sorted(data)
+        idx = min(int(len(s) * pct / 100), len(s) - 1)
+        return s[idx]
+
+    new_requests = stats_after["total_requests"] - stats_before["total_requests"]
+    new_batches = stats_after["total_batches"] - stats_before["total_batches"]
+    new_dedup = stats_after["total_deduplicated"] - stats_before["total_deduplicated"]
+    new_cache_hits = stats_after["cache"]["hits"] - stats_before["cache"]["hits"]
+    new_cache_misses = stats_after["cache"]["misses"] - stats_before["cache"]["misses"]
 
     return {
         "engine_type": config.model.engine_type,
@@ -378,6 +402,30 @@ async def run_benchmark(request: BenchmarkRequest):
             "p50_s": round(sorted_lat[len(sorted_lat) // 2], 4),
             "p95_s": round(sorted_lat[int(len(sorted_lat) * 0.95)], 4),
             "total_s": round(total_time, 4),
+        },
+        "ttft": {
+            "mean_s": round(sum(ttfts) / len(ttfts), 4) if ttfts else 0,
+            "p50_s": round(_percentile(ttfts, 50), 4),
+            "p95_s": round(_percentile(ttfts, 95), 4),
+        },
+        "tpot": {
+            "mean_s": round(sum(tpots) / len(tpots), 4) if tpots else 0,
+            "p50_s": round(_percentile(tpots, 50), 4),
+            "p95_s": round(_percentile(tpots, 95), 4),
+        },
+        "batching": {
+            "requests": new_requests,
+            "batches": new_batches,
+            "average_batch_size": round(new_requests / new_batches, 2) if new_batches > 0 else 0,
+            "deduplicated": new_dedup,
+        },
+        "cache": {
+            "hits": new_cache_hits,
+            "misses": new_cache_misses,
+            "hit_rate": (
+                round(new_cache_hits / (new_cache_hits + new_cache_misses), 4)
+                if (new_cache_hits + new_cache_misses) > 0 else 0
+            ),
         },
         "throughput": {
             "total_tokens": total_tokens,

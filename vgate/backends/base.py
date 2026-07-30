@@ -12,9 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
 from typing import Any, Dict, List, Protocol, runtime_checkable
 
 from vgate.config import ModelConfig
+
+# Optional synthetic per-call delay for the dry-run backend, used only by
+# benchmarks/run_report.py to give dry-run batching scenarios a non-zero
+# compute cost to amortize. Unset (0) by default, so it never affects tests.
+_DRYRUN_LATENCY_MS = float(os.getenv("VGATE_DRYRUN_SIMULATED_LATENCY_MS", "0"))
+
+
+def _simulate_batch_compute(sampling_params: Any) -> None:
+    if _DRYRUN_LATENCY_MS <= 0:
+        return
+    max_tokens = sampling_params.get("max_tokens", 0) if isinstance(sampling_params, dict) else 0
+    time.sleep((_DRYRUN_LATENCY_MS + max_tokens * 2) / 1000.0)
 
 
 @runtime_checkable
@@ -48,6 +62,7 @@ class DryRunBackend:
     def generate(
         self, prompts: List[str], sampling_params: Any
     ) -> List[Dict[str, Any]]:
+        _simulate_batch_compute(sampling_params)
         results = []
         for prompt in prompts:
             results.append({

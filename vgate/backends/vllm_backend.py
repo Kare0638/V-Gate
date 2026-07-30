@@ -34,6 +34,10 @@ class VLLMBackend:
             max_model_len=model_config.max_model_len,
             enforce_eager=model_config.enforce_eager,
             trust_remote_code=model_config.trust_remote_code,
+            # LLM() defaults this to True (unlike EngineArgs), which leaves
+            # output.metrics as None for every request and silently zeroes
+            # out TTFT/TPOT.
+            disable_log_stats=False,
         )
 
     def create_sampling_params(
@@ -58,8 +62,12 @@ class VLLMBackend:
             metrics_dict = {}
             metrics = output.metrics
             if metrics:
-                metrics_dict["ttft"] = metrics.first_token_time - metrics.arrival_time
-                metrics_dict["gen_time"] = metrics.finished_time - metrics.first_token_time
+                # first_token_latency is precomputed by vLLM; first_token_ts/
+                # last_token_ts are monotonic engine-core timestamps, safe to
+                # subtract (unlike arrival_time, which is a wall-clock
+                # frontend timestamp from a different clock domain).
+                metrics_dict["ttft"] = metrics.first_token_latency
+                metrics_dict["gen_time"] = metrics.last_token_ts - metrics.first_token_ts
 
             results.append({
                 "text": text,

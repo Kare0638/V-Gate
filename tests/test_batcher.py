@@ -170,6 +170,24 @@ class TestRequestBatcher:
         assert "pending_requests" in metrics
         assert metrics["total_requests"] >= 2
 
+        # Queue time / TTFT / TPOT averages used by the load benchmark report
+        assert metrics["avg_queue_time_s"] >= 0
+        assert metrics["avg_ttft_s"] >= 0
+        assert metrics["avg_tpot_s"] >= 0
+
+        await batcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_queue_time_uses_monotonic_clock(self, batcher):
+        """
+        Queue time must be computed from a monotonic clock, not wall time,
+        so a backward wall-clock adjustment (e.g. NTP correction) can never
+        produce a negative avg_queue_time_s.
+        """
+        await batcher.start()
+        await batcher.submit("Test", max_tokens=50)
+        metrics = batcher.get_metrics()
+        assert metrics["avg_queue_time_s"] >= 0
         await batcher.stop()
 
     @pytest.mark.asyncio
