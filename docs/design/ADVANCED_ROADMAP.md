@@ -1,6 +1,8 @@
 # V-Gate Advanced Architectural Roadmap
 
-This document outlines the advanced engineering phases of V-Gate, focusing on system design, distributed scaling, and production maturity. It is intended for technical interviewers, contributors, and infra-engineers.
+> **Status**: Superseded. The staged, numbered plan in [ROADMAP.md](../../ROADMAP.md) is the canonical engineering roadmap. This document's distinct ideas (mTLS/audit logging, model registry with canary rollouts, chaos-style failure testing) have been folded into ROADMAP.md Phase 4 and Phase 5. Kept for historical reference; do not treat the phase lettering (E/A/D/B/G/C/F/H) below as active sequencing.
+
+This document outlines the advanced engineering phases of V-Gate, focusing on system design, distributed scaling, and production maturity. It is intended for contributors and infrastructure engineers evaluating the project's future direction.
 
 ---
 
@@ -81,18 +83,12 @@ graph TD
 
 ---
 
-## Role Tags (CV-Ready Highlights)
+## Engineering Focus Areas
 
-### For HR: Competency Labels
-- **AI Infra Specialist**: Built a multi-worker LLM gateway with latency-aware routing.
-- **Reliability Engineer (SRE)**: Defined SLOs and implemented automated load shedding and circuit breaking.
-- **Platform Engineer**: Designed a K8s-native serving platform with custom metrics-based autoscaling.
-
-### For Technical Interviewers: Deep-Dive Topics
-- **Distributed Systems**: Implementation of EWMA routing and mTLS-secured RPCs.
-- **Concurrency**: High-performance async Python (FastAPI/Trio) and non-blocking I/O.
-- **LLM Performance**: Optimizing TTFT via SSE streaming and KV-cache aware scheduling.
-- **Observability**: Metric-Trace correlation using OpenTelemetry exemplars.
+- **Distributed Systems**: EWMA routing, worker health, circuit breaking, and failure isolation.
+- **Concurrency**: High-performance async Python, non-blocking I/O, and safe request scheduling.
+- **LLM Performance**: TTFT, TPOT, streaming, batching, and KV-cache-aware scheduling.
+- **Observability**: Metric-trace correlation using OpenTelemetry exemplars and Prometheus metrics.
 
 ---
 

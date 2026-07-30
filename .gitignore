@@ -219,7 +219,9 @@ weights/
 __pycache__/
 *.pyc
 
+# Local-only translated documentation
+ROADMAP.zh-local.md
+
 # Ignore Virtual Environment
 .venv/
 venv/
-

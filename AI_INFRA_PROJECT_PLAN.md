@@ -6,8 +6,7 @@ V-Gate is a unified, high-performance middleware designed to bridge the gap betw
 
 ## Target Audience
 - **Users**: Developers seeking an OpenAI-compatible API with superior performance and reliability.
-- **HR & Recruiters**: Professionals looking for evidence of core AI Infrastructure and System Engineering competencies.
-- **Technical Interviewers**: Engineers evaluating deep-dive knowledge in concurrency, distributed systems, and LLM optimization.
+- **Infrastructure Engineers**: Engineers evaluating the system design, concurrency model, observability, and LLM serving tradeoffs.
 - **Contributors**: Open-source developers interested in building scalable AI infrastructure.
 
 ---
@@ -18,13 +17,12 @@ To provide a **"Zero-Friction"** infrastructure for AI models, ensuring that any
 ### Core Value Propositions
 - **Compatibility**: Standard OpenAI-compatible RESTful API.
 - **Efficiency**: Advanced request batching and caching to maximize GPU/CPU utilization.
-- **Reliability**: Built-in rate limiting, health monitoring, and circuit breaking.
+- **Reliability**: Built-in rate limiting and health checks, with backpressure and circuit breaking planned in the roadmap.
 - **Observability**: Native Prometheus metrics and structured logging.
 
 ---
 
-## Core Competencies Demonstrated
-*For HR and Interviewers, this project serves as a portfolio of the following skills:*
+## Engineering Areas
 - **Model Serving**: vLLM integration, quantization, and inference optimization.
 - **System Design**: High-concurrency programming (FastAPI/Asynchronous Python).
 - **Cloud-Native**: Docker, Kubernetes, HPA, and Helm.
@@ -32,35 +30,33 @@ To provide a **"Zero-Friction"** infrastructure for AI models, ensuring that any
 
 ---
 
-## Phased Roadmap
+## Delivery Phases (Completed So Far)
 
-### Phase 1: Unified API Gateway (The MVP)
-Build the foundational entry point for all AI requests.
+These phase names (MVP / Engine / Shield / Platform) describe what has already been built and are historical, not an active plan. For current engineering priorities, sequencing, and what's next, [ROADMAP.md](./ROADMAP.md) is the single source of truth — its Phase 0-8 numbering is independent of the names below.
+
+### Phase 1: Unified API Gateway (The MVP) — done
 - **Unified API**: OpenAI-compatible endpoints (`/v1/chat/completions`).
 - **Dynamic Routing**: Route requests to specific model backends based on the request body.
-- **Base Engine**: Stable integration with local LLM engines for text and embeddings.
+- **Base Engine**: Stable integration with local LLM engines for text generation. The embedding endpoint is still a mock MVP implementation.
 
-### Phase 2: Performance & Efficiency (The Engine)
-Showcase the ability to optimize low-level resource handling.
-- **Dynamic Batching**: Aggregate concurrent requests to improve GPU throughput.
-- **Result Caching**: LRU caching for embeddings and common queries to reduce redundant computation.
-- **Multi-Worker Management**: Horizontal scaling across multiple inference processes.
+### Phase 2: Performance & Efficiency (The Engine) — partially done
+- **Dynamic Micro-Batching**: Aggregate concurrent requests into static backend batches.
+- **Result Caching**: LRU caching with batch-level deduplication.
+- **Multi-Worker Management**: not yet implemented — see ROADMAP.md Phase 4.
 
-### Phase 3: Production Reliability (The Shield)
-Transition from a functional tool to a mission-critical service.
+### Phase 3: Production Reliability (The Shield) — done
 - **Observability**: Prometheus metrics and JSON structured logging.
 - **Config-as-Code**: Centralized YAML-based configuration management.
 - **Security**: API key authentication and Token Bucket rate limiting.
 
-### Phase 4: Ecosystem & Delivery (The Platform)
-Go beyond the code to deliver a complete product.
+### Phase 4: Ecosystem & Delivery (The Platform) — done
 - **Containerization**: Optimized multi-stage Docker builds.
 - **Client SDK**: A developer-friendly Python client for easy integration.
-- **K8s Orchestration**: Production-ready Kubernetes manifests with HPA.
+- **K8s Orchestration**: Kubernetes manifests with HPA (single-node; multi-worker deployment is ROADMAP.md Phase 5).
 
 ---
 
 ## For Contributors & Users
-V-Gate is built with extensibility in mind. Whether you are looking to integrate a new model provider or optimize the batching loop, we welcome your contributions. 
+V-Gate is built with extensibility in mind. Whether you are looking to integrate a new model provider or optimize the batching loop, we welcome your contributions.
 
-Check our [PROJECT_EXTRA_PLAN.md](./PROJECT_EXTRA_PLAN.md) for the advanced architectural roadmap and deep-dive design choices.
+Check [ROADMAP.md](./ROADMAP.md) for the current engineering roadmap. `docs/design/ADVANCED_ROADMAP.md` is superseded by it; `docs/design/V2_ARCHITECTURE_PROPOSAL.md` covers the future C++/CUDA data-plane proposal.
