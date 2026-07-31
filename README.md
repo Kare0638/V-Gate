@@ -451,8 +451,9 @@ V-Gate/
 ### Running Tests
 
 ```bash
-# Install test dependencies
-pip install pytest pytest-asyncio
+# Install test dependencies (httpx2 is required by FastAPI's TestClient;
+# httpx is used directly by some tests for ASGI-transport requests)
+pip install pytest pytest-asyncio httpx httpx2
 
 # Run all tests
 PYTHONPATH=. VGATE_DRY_RUN=true pytest tests/ -v
