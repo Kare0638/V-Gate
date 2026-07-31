@@ -25,7 +25,6 @@ Current gaps:
 
 - OpenAI API compatibility is still shallow; streaming is missing.
 - Current batching is static micro-batching, not true continuous batching. New requests cannot join an already-running decode batch.
-- `max_batch_size` is a trigger threshold, not an enforced cap — `_process_batch` drains the entire queue when it fires, so realized batch sizes can exceed the configured value under concurrent burst arrival (confirmed on real hardware, see `benchmarks/results/vllm_baseline.md`).
 - The runtime is still a single gateway with a single local backend, not real multi-worker serving.
 - Benchmark tooling exists, but systematic benchmark reports and analysis are missing.
 - Cache is RAM-only. There is no persistent local disk cache layer, and cache value depends on process lifetime.
@@ -113,6 +112,15 @@ Completion criteria:
 
 ### Phase 0: Credibility Fixes
 
+**Status: done.** All six tasks are implemented and covered by tests (`pytest tests/ vgate-client/tests/` — 146 + 48 passing):
+
+1. `cache.enabled=False` now makes `ResultCache.get/put` a true no-op instead of being silently ignored.
+2. `RequestBatcher._process_batch` now groups deduplicated requests by `(temperature, top_p, max_tokens)` and dispatches one backend call per group, so requests with different sampling params can no longer silently share (and corrupt) each other's params. Fixing this also fixed the `max_batch_size`-is-only-a-trigger gap noted in Phase 1: `_process_batch` now drains at most `max_batch_size` requests per call instead of the whole queue, and `stop()` loops until the queue is fully drained so a burst larger than one batch can't strand unresolved requests on shutdown.
+3. `RequestBatcher.submit()` takes an optional `timeout` and cleans up the queue entry on both `asyncio.TimeoutError` and caller-side cancellation.
+4. `ChatCompletionRequest.messages` is now `list[ChatMessage]` (was a bare, unvalidated `list`) — a malformed message now returns 422 instead of an unhandled 500 (`'str' object has no attribute 'get'`).
+5. README documents `/v1/embeddings` as a mock MVP implementation.
+6. `.github/workflows/tests.yml` runs the dry-run server suite and the client SDK suite on every push/PR to `main`.
+
 Priority: highest.
 
 Reason: these issues affect project trust. Fix the semantics of the main path before expanding the architecture.
@@ -152,7 +160,7 @@ Expected outcome:
 
 **Status: done.** `benchmarks/bench_load.py` (concurrent HTTP load generator) and `benchmarks/run_report.py` (multi-scenario orchestrator) are implemented; `benchmarks/results/baseline.md` (dry-run) and `benchmarks/results/vllm_baseline.md` (real GPU: RTX 3060 Laptop, Qwen2.5-1.5B-AWQ, vLLM 0.26) are both checked in. Batcher tracks `avg_queue_time_s`/`avg_ttft_s`/`avg_tpot_s` and `/v1/benchmark` reports TTFT/TPOT percentiles plus batch/cache stats.
 
-Producing the real GPU baseline surfaced and fixed three bugs that only show up against live hardware/dependencies: (1) `time.time()` for queue-time deltas could go negative on wall-clock adjustment, now `time.monotonic()`; (2) vLLM under WSL2 needs `VLLM_WSL2_ENABLE_PIN_MEMORY=1` or it crashes at startup; (3) `VLLMBackend` read renamed/removed vLLM metrics fields plus relied on a stats-collection flag that `LLM()` defaults off, so TTFT/TPOT were silently always 0 for the real backend. It also surfaced (not yet fixed): `max_batch_size` in `vgate/batcher.py` is only a trigger threshold, not a hard cap — `_process_batch` drains the entire queue regardless of the configured size, so realized batch sizes can exceed it under concurrent burst arrival. See `benchmarks/results/vllm_baseline.md` for the data.
+Producing the real GPU baseline surfaced and fixed three bugs that only show up against live hardware/dependencies: (1) `time.time()` for queue-time deltas could go negative on wall-clock adjustment, now `time.monotonic()`; (2) vLLM under WSL2 needs `VLLM_WSL2_ENABLE_PIN_MEMORY=1` or it crashes at startup; (3) `VLLMBackend` read renamed/removed vLLM metrics fields plus relied on a stats-collection flag that `LLM()` defaults off, so TTFT/TPOT were silently always 0 for the real backend. It also surfaced a fourth issue, fixed in Phase 0: `max_batch_size` was only a trigger threshold, not a hard cap. See `benchmarks/results/vllm_baseline.md` for the original data.
 
 Priority: highest.
 

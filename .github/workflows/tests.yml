@@ -1,0 +1,43 @@
+name: Tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  server-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio
+
+      - name: Run tests (dry-run mode, no GPU)
+        env:
+          PYTHONPATH: .
+          VGATE_DRY_RUN: "true"
+        run: pytest tests/ -v
+
+  client-sdk-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install client SDK with dev dependencies
+        run: pip install -e "./vgate-client[dev]"
+
+      - name: Run client SDK tests
+        run: pytest vgate-client/tests/ -v

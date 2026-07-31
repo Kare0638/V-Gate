@@ -173,9 +173,14 @@ async def observability_middleware(request: Request, call_next):
 
 
 # Request models for OpenAI-like API
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
-    messages: list
+    messages: list[ChatMessage]
     temperature: float = 0.7
     top_p: float = 0.9
     max_tokens: int = 256
@@ -187,12 +192,8 @@ class EmbeddingRequest(BaseModel):
 
 
 # Helper function to convert messages to a prompt string
-def messages_to_prompt(messages: list) -> str:
-    prompt_parts = []
-    for message in messages:
-        role = message.get("role", "user")
-        content = message.get("content", "")
-        prompt_parts.append(f"{role.capitalize()}: {content}")
+def messages_to_prompt(messages: list[ChatMessage]) -> str:
+    prompt_parts = [f"{m.role.capitalize()}: {m.content}" for m in messages]
     return "\n".join(prompt_parts) + "\nAssistant:"
 
 

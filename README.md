@@ -1,10 +1,11 @@
 # V-Gate
 
+[![Tests](https://github.com/Kare0638/V-Gate/actions/workflows/tests.yml/badge.svg)](https://github.com/Kare0638/V-Gate/actions/workflows/tests.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
 
-**V-Gate** is a high-performance AI model serving gateway with pluggable inference backends. It currently supports [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang), while exposing a unified OpenAI-compatible API with enterprise-grade features including dynamic request batching, result caching, observability, and security.
+**V-Gate** is a high-performance AI model serving gateway with pluggable inference backends. It currently supports [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang), while exposing a unified OpenAI-compatible API with enterprise-grade features including dynamic micro-batching, result caching, observability, and security.
 
 Optimized for memory-constrained environments (e.g., RTX 3060/4060).
 
@@ -14,8 +15,8 @@ Optimized for memory-constrained environments (e.g., RTX 3060/4060).
 
 | Feature | Description |
 |---------|-------------|
-| **OpenAI-Compatible API** | Drop-in replacement for OpenAI API (`/v1/chat/completions`, `/v1/embeddings`) |
-| **Dynamic Request Batching** | Aggregate concurrent requests for improved GPU utilization |
+| **OpenAI-Compatible API** | OpenAI-style API surface (`/v1/chat/completions`, `/v1/embeddings`) |
+| **Dynamic Micro-Batching** | Aggregate queued requests into static backend batches for improved throughput |
 | **Result Caching** | LRU cache with batch-level deduplication |
 | **Multi-Backend Inference** | Switch backend with `model.engine_type` (`vllm` / `sglang`) |
 | **Built-in Benchmarking** | Compare backends with CLI tool and `/v1/benchmark` API |
@@ -26,6 +27,18 @@ Optimized for memory-constrained environments (e.g., RTX 3060/4060).
 | **Configuration as Code** | YAML configuration with environment variable overrides |
 | **Docker Ready** | Multi-stage build with GPU and CPU targets |
 | **Python Client SDK** | `pip install` ready client with sync/async support |
+
+Note: `/v1/embeddings` currently returns a mock 1536-dimensional embedding for MVP/testing workflows. A real embedding backend is planned but not implemented yet.
+
+---
+
+## Documentation
+
+- [Roadmap](ROADMAP.md): staged engineering plan from the current gateway to reliable distributed inference serving.
+- [Documentation index](docs/README.md): public docs and status conventions.
+- [Advanced roadmap](docs/design/ADVANCED_ROADMAP.md): superseded by ROADMAP.md; kept for historical reference on reliability, scaling, and governance ideas.
+- [V2 architecture proposal](docs/design/V2_ARCHITECTURE_PROPOSAL.md): design proposal for future C++/CUDA data-plane work.
+- [Containerization test report](docs/reports/CONTAINERIZATION_TEST_REPORT.md): Docker validation notes.
 
 ---
 
@@ -390,9 +403,14 @@ V-Gate/
 ├── Dockerfile              # Multi-stage Docker build
 ├── docker-compose.yml      # Service orchestration
 ├── requirements.txt        # Python dependencies
+├── ROADMAP.md              # Public engineering roadmap
 ├── benchmarks/
 │   ├── benchmark.py         # Single-engine benchmark entry
 │   └── bench_compare.py     # Multi-backend benchmark comparison CLI
+├── docs/
+│   ├── README.md            # Documentation index
+│   ├── design/              # Architecture and roadmap proposals
+│   └── reports/             # Validation and test reports
 ├── vgate/
 │   ├── __init__.py
 │   ├── engine.py           # Backend factory + engine wrapper
@@ -449,6 +467,8 @@ VGATE_DRY_RUN=true pytest tests/test_backends.py -k vllm -v
 VGATE_DRY_RUN=true ./.venv-sglang/bin/pytest tests/test_backends.py -k sglang -v
 ```
 
+CI ([`.github/workflows/tests.yml`](.github/workflows/tests.yml)) runs the same dry-run suite plus the client SDK tests (`vgate-client/tests/`) on every push/PR to `main`.
+
 ### Code Style
 
 ```bash
@@ -465,7 +485,7 @@ ruff check .
 
 - [x] **Phase 1**: Core MVP - Unified API Gateway
 - [x] **Phase 2**: Performance Optimization
-  - [x] 2.1 Dynamic Request Batching
+  - [x] 2.1 Dynamic Micro-Batching
   - [x] 2.2 Result Caching
   - [ ] 2.3 Multi-Worker Load Balancing
 - [x] **Phase 3**: Production-Grade Features
@@ -475,7 +495,9 @@ ruff check .
 - [x] **Phase 4**: Ecosystem & Deployment
   - [x] 4.1 Containerization (Docker)
   - [x] 4.2 Python Client SDK
-  - [ ] 4.3 Kubernetes Deployment
+  - [x] 4.3 Kubernetes manifests
+
+See [ROADMAP.md](ROADMAP.md) for the next engineering milestones, including streaming with engine-native continuous batching, benchmark-gated sqlite L2 cache, backpressure, multi-worker routing, and low-level performance work.
 
 ---
 
