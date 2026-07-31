@@ -148,6 +148,20 @@ class TestResultCache:
         assert result_b is None  # Evicted
         assert result_c is not None
 
+    @pytest.mark.asyncio
+    async def test_disabled_cache_is_noop(self):
+        """cache.enabled=False must make get/put a no-op, not just a stats label."""
+        cache = ResultCache(CacheConfig(enabled=False, maxsize=10))
+        key = ResultCache.make_key("Hello", 0.7, 0.9, 256)
+
+        await cache.put(key, {"text": "World"})
+        result = await cache.get(key)
+
+        assert result is None
+        assert cache.get_stats()["size"] == 0
+        assert cache.hits == 0
+        assert cache.misses == 0
+
 
 class MockBackend:
     """Mock inference backend for testing without GPU."""

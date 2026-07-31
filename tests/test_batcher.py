@@ -29,11 +29,17 @@ from vgate.batcher import RequestBatcher, BatchRequest
 class MockBackend:
     """Mock inference backend for testing without GPU."""
 
+    def __init__(self):
+        # Records (prompts, sampling_params) for every generate() call, so
+        # tests can assert on how requests were actually grouped/dispatched.
+        self.calls = []
+
     def create_sampling_params(self, temperature, top_p, max_tokens):
         return {"temperature": temperature, "top_p": top_p, "max_tokens": max_tokens}
 
     def generate(self, prompts, sampling_params):
         """Simulate batch generation with standardized dict output."""
+        self.calls.append((list(prompts), dict(sampling_params)))
         results = []
         for prompt in prompts:
             results.append({
@@ -154,6 +160,52 @@ class TestRequestBatcher:
         await batcher.stop()
 
     @pytest.mark.asyncio
+    async def test_max_batch_size_is_hard_cap(self, batcher):
+        """No single generate() call should receive more than max_batch_size prompts.
+
+        _process_batch used to drain the entire queue regardless of
+        max_batch_size (only using it as a trigger threshold), so a burst of
+        concurrent requests could produce a call larger than configured.
+        """
+        await batcher.start()
+
+        tasks = [
+            batcher.submit(f"Unique question {i}", max_tokens=50)
+            for i in range(10)  # max_batch_size is 4
+        ]
+        await asyncio.gather(*tasks)
+
+        assert len(batcher.engine.backend.calls) >= 1
+        for prompts, _ in batcher.engine.backend.calls:
+            assert len(prompts) <= batcher.max_batch_size
+
+        await batcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_different_sampling_params_not_mixed(self, batcher):
+        """Requests with different temperature/top_p/max_tokens landing in the
+        same drained batch must not share a single generate() call — a shared
+        SamplingParams would silently apply the wrong params to some prompts.
+        """
+        await batcher.start()
+
+        tasks = [
+            batcher.submit("Prompt hot", max_tokens=50, temperature=1.0, top_p=0.9),
+            batcher.submit("Prompt cold", max_tokens=50, temperature=0.0, top_p=0.9),
+        ]
+        await asyncio.gather(*tasks)
+
+        calls_by_prompt = {}
+        for prompts, sampling_params in batcher.engine.backend.calls:
+            for prompt in prompts:
+                calls_by_prompt[prompt] = sampling_params
+
+        assert calls_by_prompt["Prompt hot"]["temperature"] == 1.0
+        assert calls_by_prompt["Prompt cold"]["temperature"] == 0.0
+
+        await batcher.stop()
+
+    @pytest.mark.asyncio
     async def test_metrics_tracking(self, batcher):
         """Test metrics are tracked correctly."""
         await batcher.start()
@@ -189,6 +241,37 @@ class TestRequestBatcher:
         metrics = batcher.get_metrics()
         assert metrics["avg_queue_time_s"] >= 0
         await batcher.stop()
+
+    @pytest.mark.asyncio
+    async def test_submit_timeout_raises_and_cleans_up_queue(self, mock_engine):
+        """A submit() timeout must raise and remove the request from the
+        queue, not leave a dead entry that would occupy a future batch slot."""
+        # max_batch_size high enough, and no start(), so nothing ever drains
+        # the queue: submit() has no way to resolve except the timeout.
+        batcher = RequestBatcher(engine=mock_engine, max_batch_size=100, max_wait_time_ms=50000.0)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await batcher.submit("Never processed", max_tokens=50, timeout=0.05)
+
+        assert len(batcher._queue) == 0
+        assert batcher.get_metrics()["pending_requests"] == 0
+
+    @pytest.mark.asyncio
+    async def test_submit_cancellation_cleans_up_queue(self, mock_engine):
+        """Cancelling the caller's task while awaiting submit() must remove
+        the request from the queue instead of leaking it."""
+        batcher = RequestBatcher(engine=mock_engine, max_batch_size=100, max_wait_time_ms=50000.0)
+
+        task = asyncio.create_task(batcher.submit("Never processed", max_tokens=50))
+        await asyncio.sleep(0.01)  # let it enqueue
+        assert len(batcher._queue) == 1
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert len(batcher._queue) == 0
+        assert batcher.get_metrics()["pending_requests"] == 0
 
     @pytest.mark.asyncio
     async def test_timeout_triggers_batch(self, batcher):

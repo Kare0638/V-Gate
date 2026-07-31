@@ -56,7 +56,9 @@ class ResultCache:
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
     async def get(self, key: str) -> Optional[Dict]:
-        """Get a value from the cache. Returns None if not found."""
+        """Get a value from the cache. Returns None if not found or if caching is disabled."""
+        if not self.config.enabled:
+            return None
         with tracer.start_as_current_span("cache.get") as span:
             span.set_attribute("cache_key", key[:8])
             async with self._lock:
@@ -72,7 +74,9 @@ class ResultCache:
                 return None
 
     async def put(self, key: str, value: Dict) -> None:
-        """Put a value in the cache, evicting oldest if at capacity."""
+        """Put a value in the cache, evicting oldest if at capacity. No-op if caching is disabled."""
+        if not self.config.enabled:
+            return
         with tracer.start_as_current_span("cache.put") as span:
             span.set_attribute("cache_key", key[:8])
             evicted = False

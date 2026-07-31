@@ -114,8 +114,12 @@ class RequestBatcher:
                 await self._batch_task
             except asyncio.CancelledError:
                 pass
-        # Process any remaining requests
-        await self._process_batch()
+        # Process any remaining requests. _process_batch only drains up to
+        # max_batch_size per call, so loop until the queue is fully empty —
+        # otherwise a queue longer than max_batch_size would strand requests
+        # with unresolved futures on shutdown.
+        while self._queue:
+            await self._process_batch()
         logger.info("Batcher stopped")
 
     async def submit(
@@ -124,6 +128,7 @@ class RequestBatcher:
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Submit a request for batched processing.
@@ -135,6 +140,13 @@ class RequestBatcher:
             max_tokens: Max tokens to generate. Uses config default if None.
             temperature: Sampling temperature. Uses config default if None.
             top_p: Top-p sampling. Uses config default if None.
+            timeout: Max seconds to wait for a result. Raises
+                asyncio.TimeoutError and removes the request from the queue
+                if it hasn't been picked up by a batch yet. No timeout if None.
+
+        Raises:
+            asyncio.TimeoutError: if `timeout` elapses before a result is ready.
+            asyncio.CancelledError: if the calling task is cancelled while waiting.
         """
         with tracer.start_as_current_span("batcher.submit") as span:
             # Apply defaults from config
@@ -183,8 +195,23 @@ class RequestBatcher:
                 asyncio.create_task(self._process_batch())
 
             # Wait for result
-            result = await request.future
-            return result
+            try:
+                if timeout is not None:
+                    result = await asyncio.wait_for(request.future, timeout=timeout)
+                else:
+                    result = await request.future
+                return result
+            finally:
+                # Best-effort cleanup: if this request timed out, was
+                # cancelled, or errored before a batch picked it up, remove
+                # it from the queue instead of leaving a dead entry that
+                # would still occupy a batch slot later. No-op if it was
+                # already dequeued for processing.
+                async with self._lock:
+                    before = len(self._queue)
+                    self._queue = [r for r in self._queue if r is not request]
+                    if len(self._queue) != before:
+                        PENDING_REQUESTS.set(len(self._queue))
 
     async def _batch_loop(self):
         """Background loop that triggers batch processing on timeout."""
@@ -195,17 +222,21 @@ class RequestBatcher:
                 await self._process_batch()
 
     async def _process_batch(self):
-        """Process all pending requests as a batch with deduplication."""
+        """Process up to max_batch_size pending requests as a batch, with deduplication."""
         # Use inference lock to prevent concurrent vLLM calls
         async with self._inference_lock:
             async with self._lock:
                 if not self._queue:
                     return
 
-                # Take all pending requests
-                batch = self._queue[:]
-                self._queue.clear()
-                PENDING_REQUESTS.set(0)
+                # Take at most max_batch_size requests; leave any excess
+                # queued for the next drain instead of unboundedly growing
+                # the batch (submit() re-triggers processing whenever the
+                # queue is at/above max_batch_size, so leftovers get picked
+                # up promptly rather than waiting for the next timeout tick).
+                batch = self._queue[:self.max_batch_size]
+                self._queue = self._queue[self.max_batch_size:]
+                PENDING_REQUESTS.set(len(self._queue))
 
             if not batch:
                 return
@@ -239,21 +270,16 @@ class RequestBatcher:
                 )
 
                 try:
-                    # Group requests by cache_key for deduplication
+                    # Group requests by cache_key for deduplication (same key
+                    # implies identical prompt + temperature + top_p + max_tokens).
                     unique_prompts: Dict[str, List[BatchRequest]] = {}
                     for req in batch:
                         if req.cache_key not in unique_prompts:
                             unique_prompts[req.cache_key] = []
                         unique_prompts[req.cache_key].append(req)
 
-                    # Only infer unique prompts
-                    prompts_to_infer = [reqs[0].prompt for reqs in unique_prompts.values()]
-                    temps_to_infer = [reqs[0].temperature for reqs in unique_prompts.values()]
-                    top_ps_to_infer = [reqs[0].top_p for reqs in unique_prompts.values()]
-                    max_tokens = max(req.max_tokens for req in batch)
-
-                    dedup_count = batch_size - len(prompts_to_infer)
-                    span.set_attribute("unique_prompts", len(prompts_to_infer))
+                    dedup_count = batch_size - len(unique_prompts)
+                    span.set_attribute("unique_prompts", len(unique_prompts))
                     span.set_attribute("deduplicated", dedup_count)
 
                     if dedup_count > 0:
@@ -264,58 +290,67 @@ class RequestBatcher:
                             "Deduplicated requests",
                             extra={"extra_data": {
                                 "deduplicated": dedup_count,
-                                "unique_prompts": len(prompts_to_infer)
+                                "unique_prompts": len(unique_prompts)
                             }}
                         )
                     else:
                         DEDUP_RATIO.set(0)
 
-                    UNIQUE_PROMPTS_PER_BATCH.observe(len(prompts_to_infer))
+                    UNIQUE_PROMPTS_PER_BATCH.observe(len(unique_prompts))
 
-                    # Process batch through engine
-                    batch_start = time.perf_counter()
-                    results = await self._run_batch_inference(
-                        prompts_to_infer, max_tokens, temps_to_infer[0], top_ps_to_infer[0]
-                    )
-                    batch_duration = time.perf_counter() - batch_start
+                    # A single backend.generate() call applies one shared
+                    # SamplingParams to every prompt it's given, so requests
+                    # with different (temperature, top_p, max_tokens) cannot
+                    # share a call — group deduplicated requests by their
+                    # params and dispatch one call per group.
+                    params_groups: Dict[tuple, List[str]] = {}
+                    for cache_key, reqs in unique_prompts.items():
+                        params_key = (reqs[0].temperature, reqs[0].top_p, reqs[0].max_tokens)
+                        params_groups.setdefault(params_key, []).append(cache_key)
 
-                    # Exemplar for metric-trace correlation
-                    trace_id = get_current_trace_id()
-                    exemplar = {"trace_id": trace_id} if trace_id else None
-                    BATCH_PROCESSING_TIME.observe(batch_duration, exemplar=exemplar)
-
-                    # Record inference metrics
                     total_tokens = 0
-                    for result in results:
-                        if result.get("ttft", 0) > 0:
-                            TTFT.observe(result["ttft"])
-                            self.total_ttft += result["ttft"]
-                        if result.get("tpot", 0) > 0:
-                            TPOT.observe(result["tpot"])
-                            self.total_tpot += result["tpot"]
-                            self.total_inference_samples += 1
-                        tokens = result.get("total_tokens", 0)
-                        TOKENS_GENERATED.inc(tokens)
-                        total_tokens += tokens
+                    for (temperature, top_p, max_tokens), cache_keys in params_groups.items():
+                        prompts_to_infer = [unique_prompts[k][0].prompt for k in cache_keys]
+
+                        group_start = time.perf_counter()
+                        results = await self._run_batch_inference(
+                            prompts_to_infer, max_tokens, temperature, top_p
+                        )
+                        group_duration = time.perf_counter() - group_start
+
+                        # Exemplar for metric-trace correlation
+                        trace_id = get_current_trace_id()
+                        exemplar = {"trace_id": trace_id} if trace_id else None
+                        BATCH_PROCESSING_TIME.observe(group_duration, exemplar=exemplar)
+
+                        for cache_key, result in zip(cache_keys, results):
+                            if result.get("ttft", 0) > 0:
+                                TTFT.observe(result["ttft"])
+                                self.total_ttft += result["ttft"]
+                            if result.get("tpot", 0) > 0:
+                                TPOT.observe(result["tpot"])
+                                self.total_tpot += result["tpot"]
+                                self.total_inference_samples += 1
+                            tokens = result.get("total_tokens", 0)
+                            TOKENS_GENERATED.inc(tokens)
+                            total_tokens += tokens
+
+                            # Store in cache and distribute to all requests
+                            # sharing this cache_key.
+                            await self.cache.put(cache_key, result)
+                            for req in unique_prompts[cache_key]:
+                                if not req.future.done():
+                                    req.future.set_result(result)
 
                     logger.info(
                         "Batch inference completed",
                         extra={"extra_data": {
                             "batch_id": self.total_batches,
-                            "duration_s": round(batch_duration, 3),
-                            "prompts": len(prompts_to_infer),
+                            "prompts": len(unique_prompts),
+                            "param_groups": len(params_groups),
                             "tokens": total_tokens
                         }}
                     )
-
-                    # Distribute results to waiting requests and cache them
-                    for (cache_key, reqs), result in zip(unique_prompts.items(), results):
-                        # Store in cache
-                        await self.cache.put(cache_key, result)
-                        # Distribute to all requests with this cache_key
-                        for req in reqs:
-                            if not req.future.done():
-                                req.future.set_result(result)
 
                 except Exception as e:
                     span.set_attribute("error", True)
