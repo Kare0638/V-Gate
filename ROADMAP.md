@@ -23,7 +23,7 @@ V-Gate is currently an OpenAI-style LLM gateway with:
 
 Current gaps:
 
-- OpenAI API compatibility is still shallow; streaming is missing.
+- OpenAI API compatibility is still shallow. Streaming (`stream: true`, SSE) now works end-to-end for the dry-run backend only; vLLM/SGLang backends raise a clear `NotImplementedError` until their async engine paths land (Phase 2).
 - Current batching is static micro-batching, not true continuous batching. New requests cannot join an already-running decode batch.
 - The runtime is still a single gateway with a single local backend, not real multi-worker serving.
 - Benchmark tooling exists, but systematic benchmark reports and analysis are missing.
@@ -268,6 +268,12 @@ Expected outcome:
 ---
 
 ### Phase 2: Streaming And Engine-Native Continuous Batching
+
+**Status: in progress — task 1-5 dry-run slice done, tasks 6-9 not started.** `stream: true` is supported end-to-end for the dry-run backend: `POST /v1/chat/completions` returns real SSE (`curl -N` shows incremental chunks) with OpenAI-style delta chunks (role chunk, content chunks, final `finish_reason: stop`, `data: [DONE]`). `InferenceBackend.stream_generate()` is now part of the protocol; `VLLMBackend`/`SGLangBackend` implement it as an explicit `NotImplementedError` (not a silent no-op) until their async engine paths land.
+
+Known, intentional limitation of this slice: the streaming path in `main.py` (`_stream_chat_completion`) calls `engine.backend.stream_generate()` directly and bypasses `RequestBatcher` entirely — no cache lookup, no batch-level dedup, no admission control for streamed requests yet. That integration is task 9 below, which is blocked on the AsyncLLMEngine work (tasks 6-7) since a per-request async engine is what makes "submit independent requests, not sealed Python batches" possible in the first place.
+
+Not yet done: client SDK streaming (task 4), streaming-specific metrics (task 5 - only basic completion logging exists so far), the vLLM/SGLang async engine backend paths (tasks 6-8), and redefining `RequestBatcher` (task 9).
 
 Priority: high.
 

@@ -13,10 +13,11 @@
 # limitations under the License.
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import asyncio
+import json
 import time
 import uuid
 
@@ -184,6 +185,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = 0.7
     top_p: float = 0.9
     max_tokens: int = 256
+    stream: bool = False
 
 
 class EmbeddingRequest(BaseModel):
@@ -205,12 +207,78 @@ async def health_check():
     return {"status": "ok", "version": APP_VERSION}
 
 
+async def _stream_chat_completion(prompt: str, request: ChatCompletionRequest):
+    """
+    SSE generator for streaming chat completions.
+
+    NOTE: this bypasses RequestBatcher entirely — it calls
+    engine.backend.stream_generate() directly, so streaming requests get no
+    cache lookup, no batch-level deduplication, and no admission control yet.
+    RequestBatcher is still GPU-batch-oriented and can't hand a partial
+    result back mid-generation. Folding streaming into batcher-provided
+    dedup/admission is ROADMAP.md Phase 2 task 9, not done here.
+    """
+    completion_id = "chatcmpl-" + str(uuid.uuid4())[:8]
+    created = int(time.time())
+
+    def _chunk(delta: dict, finish_reason: str = None) -> str:
+        payload = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": request.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        return f"data: {json.dumps(payload)}\n\n"
+
+    yield _chunk({"role": "assistant"})
+    try:
+        sampling_params = engine.backend.create_sampling_params(
+            temperature=request.temperature, top_p=request.top_p, max_tokens=request.max_tokens
+        )
+        num_tokens = 0
+        async for piece in engine.backend.stream_generate(prompt, sampling_params):
+            if piece.get("delta"):
+                yield _chunk({"content": piece["delta"]})
+            num_tokens = piece.get("num_tokens", num_tokens)
+        yield _chunk({}, finish_reason="stop")
+        app_logger.info(
+            "Streamed chat completion",
+            extra={"extra_data": {"completion_id": completion_id, "tokens": num_tokens}}
+        )
+    except Exception as e:
+        # The 200 OK + SSE headers are already flushed by this point, so an
+        # HTTP error status is no longer possible; surface the failure as an
+        # SSE error event instead (mirrors how OpenAI's API reports
+        # mid-stream failures).
+        app_logger.error(
+            "Streaming chat completion error",
+            extra={"extra_data": {
+                "completion_id": completion_id,
+                "error": str(e),
+                "error_type": type(e).__name__
+            }}
+        )
+        yield f"data: {json.dumps({'error': {'message': str(e), 'type': type(e).__name__}})}\n\n"
+    finally:
+        yield "data: [DONE]\n\n"
+
+
 @app.post("/v1/chat/completions", summary="Create Chat Completion")
 async def create_chat_completion(request: ChatCompletionRequest):
     """
     Generates a chat completion response from the specified model.
-    Requests are automatically batched for improved throughput.
+    Non-streaming requests are automatically batched for improved throughput.
+    Streaming requests (stream=true) bypass the batcher; see
+    _stream_chat_completion for why.
     """
+    if request.stream:
+        prompt = messages_to_prompt(request.messages)
+        return StreamingResponse(
+            _stream_chat_completion(prompt, request),
+            media_type="text/event-stream",
+        )
+
     try:
         # Convert messages to a single prompt string for the engine
         prompt = messages_to_prompt(request.messages)
