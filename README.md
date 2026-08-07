@@ -137,6 +137,21 @@ curl -X POST http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+### Streaming Chat Completions
+
+```bash
+curl -N -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen2.5-1.5B-Instruct-AWQ",
+    "messages": [{"role": "user", "content": "What is 2+2?"}],
+    "max_tokens": 100,
+    "stream": true
+  }'
+```
+
+Returns OpenAI-style SSE delta chunks. **Currently dry-run only** — the vLLM/SGLang backends raise a clear error until their async engine streaming paths land (see [ROADMAP.md](ROADMAP.md) Phase 2); the streaming path also bypasses the batcher/cache for now (no dedup or admission control yet).
+
 ### Prometheus Metrics
 ```bash
 curl http://localhost:8000/metrics

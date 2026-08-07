@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
 import time
-from typing import Any, Dict, List, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Dict, List, Protocol, runtime_checkable
 
 from vgate.config import ModelConfig
 
@@ -45,6 +46,18 @@ class InferenceBackend(Protocol):
         self, prompts: List[str], sampling_params: Any
     ) -> List[Dict[str, Any]]: ...
 
+    def stream_generate(
+        self, prompt: str, sampling_params: Any
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        Stream a single prompt's completion token-by-token.
+
+        Yields dicts shaped {"delta": str, "num_tokens": int} where
+        num_tokens is the cumulative token count so far; the last yielded
+        chunk's num_tokens is the total for the request.
+        """
+        ...
+
     def shutdown(self) -> None: ...
 
 
@@ -72,6 +85,17 @@ class DryRunBackend:
                 "metrics": {},
             })
         return results
+
+    async def stream_generate(
+        self, prompt: str, sampling_params: Any
+    ) -> AsyncIterator[Dict[str, Any]]:
+        max_tokens = sampling_params.get("max_tokens", 8) if isinstance(sampling_params, dict) else 8
+        words = f"[dry-run] echo: {prompt[:80]}".split()
+        num_words = min(len(words), max_tokens) or 1
+        for i in range(num_words):
+            await asyncio.sleep(0.02)
+            delta = words[i] + (" " if i < num_words - 1 else "")
+            yield {"delta": delta, "num_tokens": i + 1}
 
     def shutdown(self) -> None:
         pass

@@ -67,6 +67,31 @@ class TestDryRunBackend:
         backend = DryRunBackend()
         backend.shutdown()  # Should not raise
 
+    @pytest.mark.asyncio
+    async def test_stream_generate_yields_incremental_chunks(self):
+        backend = DryRunBackend()
+        params = backend.create_sampling_params(0.7, 0.9, 128)
+
+        chunks = [c async for c in backend.stream_generate("Hello world", params)]
+
+        assert len(chunks) > 1
+        assert all("delta" in c and "num_tokens" in c for c in chunks)
+        # num_tokens must be a strictly increasing running total
+        counts = [c["num_tokens"] for c in chunks]
+        assert counts == sorted(counts)
+        assert counts[-1] == len(chunks)
+        # Concatenating every delta reproduces the same text generate() returns
+        assert "".join(c["delta"] for c in chunks) == "[dry-run] echo: Hello world"
+
+    @pytest.mark.asyncio
+    async def test_stream_generate_respects_max_tokens(self):
+        backend = DryRunBackend()
+        params = backend.create_sampling_params(0.7, 0.9, 2)
+
+        chunks = [c async for c in backend.stream_generate("Hello world", params)]
+
+        assert len(chunks) == 2
+
 
 class TestBackendFactory:
     """Tests for the _create_backend factory function."""
@@ -182,6 +207,15 @@ class TestVLLMBackendNormalization:
         results = backend.generate(["test"], MagicMock())
         assert results[0]["metrics"] == {}
 
+    @pytest.mark.asyncio
+    async def test_stream_generate_not_implemented(self):
+        from vgate.backends.vllm_backend import VLLMBackend
+
+        backend = VLLMBackend()
+        with pytest.raises(NotImplementedError):
+            async for _ in backend.stream_generate("test", MagicMock()):
+                pass
+
 
 class TestSGLangBackendNormalization:
     """Test SGLangBackend output normalization with mocked SGLang internals."""
@@ -225,3 +259,12 @@ class TestSGLangBackendNormalization:
         # Should fallback to word-count estimation
         assert results[0]["num_tokens"] >= 1
         assert results[0]["token_ids"] == []
+
+    @pytest.mark.asyncio
+    async def test_stream_generate_not_implemented(self):
+        from vgate.backends.sglang_backend import SGLangBackend
+
+        backend = SGLangBackend()
+        with pytest.raises(NotImplementedError):
+            async for _ in backend.stream_generate("test", {}):
+                pass

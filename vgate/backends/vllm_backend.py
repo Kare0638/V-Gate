@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, List
+from typing import Any, AsyncIterator, Dict, List
 
 from vgate.config import ModelConfig
 
@@ -76,6 +76,18 @@ class VLLMBackend:
                 "metrics": metrics_dict,
             })
         return results
+
+    async def stream_generate(
+        self, prompt: str, sampling_params: Any
+    ) -> AsyncIterator[Dict[str, Any]]:
+        # The offline LLM() API used by generate() above has no per-token
+        # streaming interface; that requires AsyncLLMEngine (ROADMAP.md
+        # Phase 2, task 7), not yet wired in.
+        raise NotImplementedError(
+            "Streaming is not yet implemented for the vllm backend "
+            "(see ROADMAP.md Phase 2: AsyncLLMEngine backend path)."
+        )
+        yield  # pragma: no cover - unreachable, makes this an async generator
 
     def shutdown(self) -> None:
         self.llm = None

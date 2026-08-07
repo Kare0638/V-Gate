@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import time
-from typing import Any, Dict, List
+from typing import Any, AsyncIterator, Dict, List
 
 from vgate.config import ModelConfig
 
@@ -70,6 +70,18 @@ class SGLangBackend:
                 "metrics": {"wall_time": wall_time / len(prompts)},
             })
         return results
+
+    async def stream_generate(
+        self, prompt: str, sampling_params: Any
+    ) -> AsyncIterator[Dict[str, Any]]:
+        # sgl.Engine.generate() above is the offline batch API; streaming
+        # needs async_generate(..., stream=True) (ROADMAP.md Phase 2, task 8),
+        # not yet wired in.
+        raise NotImplementedError(
+            "Streaming is not yet implemented for the sglang backend "
+            "(see ROADMAP.md Phase 2: async_generate backend path)."
+        )
+        yield  # pragma: no cover - unreachable, makes this an async generator
 
     def shutdown(self) -> None:
         if self.engine is not None:
