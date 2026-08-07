@@ -27,7 +27,7 @@ Current gaps:
 - Current batching is static micro-batching, not true continuous batching. New requests cannot join an already-running decode batch.
 - The runtime is still a single gateway with a single local backend, not real multi-worker serving.
 - Benchmark tooling exists, but systematic benchmark reports and analysis are missing.
-- Cache is RAM-only. There is no persistent local disk cache layer, and cache value depends on process lifetime.
+- Cache is RAM-only. There is no persistent local disk cache layer, and cache value depends on process lifetime. This is an intentional, benchmark-gated decision (Phase 1.5), not an oversight — current traffic shows no L1 eviction pressure.
 - Backpressure, request timeout, circuit breaking, and worker failure handling are incomplete.
 - The embedding endpoint is currently a mock MVP implementation.
 - The v2 C++/CUDA work is documented as a proposal, not implemented runtime code.
@@ -210,6 +210,8 @@ Expected outcome:
 ---
 
 ### Phase 1.5: SQLite L2 Cache Decision Gate
+
+**Status: decided — deferred.** `cache.enabled` now works correctly (Phase 0), and both benchmark reports (`benchmarks/results/baseline.md`, `benchmarks/results/vllm_baseline.md`) are in. Across every scenario in both reports, cache size never exceeded single digits against a default `maxsize` of 1000 — no run came close to `ResultCache`'s L1 eviction threshold, so there is no measured working-set pressure to justify an L2. Per this phase's own acceptance criteria, L2 implementation stays deferred until a real workload (or a benchmark scenario deliberately designed to exceed `maxsize`) shows L1 eviction actually happening. The design below is kept as-is for when that evidence exists.
 
 Priority: medium, benchmark-gated design gate.
 
