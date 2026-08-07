@@ -150,7 +150,7 @@ curl -N -X POST http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-Returns OpenAI-style SSE delta chunks. **Currently dry-run only** — the vLLM/SGLang backends raise a clear error until their async engine streaming paths land (see [ROADMAP.md](ROADMAP.md) Phase 2); the streaming path also bypasses the batcher/cache for now (no dedup or admission control yet).
+Returns OpenAI-style SSE delta chunks. Works for the dry-run backend and real vLLM (`AsyncLLMEngine`, verified on GPU); SGLang still raises a clear error until its async engine streaming path lands (see [ROADMAP.md](ROADMAP.md) Phase 2). The streaming path also bypasses the batcher/cache for now (no dedup or admission control yet).
 
 ### Prometheus Metrics
 ```bash
