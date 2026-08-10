@@ -44,6 +44,14 @@ _NORMAL_LINES = [
     "data: [DONE]",
 ]
 
+_NO_DONE_LINES = [
+    'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m",'
+    '"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
+    'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m",'
+    '"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}',
+    # connection drops here — no "data: [DONE]" line follows
+]
+
 _ERROR_MID_STREAM_LINES = [
     'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m",'
     '"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
@@ -234,6 +242,68 @@ class TestSyncStream:
             list(client.chat.stream(model="m", messages=[{"role": "user", "content": "hi"}]))
         client.close()
 
+    def test_missing_done_raises_server_error(self, monkeypatch):
+        """A connection that ends without ever sending `data: [DONE]` must
+        not look like a clean completion — it should raise, not silently
+        stop yielding."""
+        client = VGate()
+        monkeypatch.setattr(
+            client._http, "stream", lambda *a, **kw: _FakeSyncStreamCM(lines=_NO_DONE_LINES)
+        )
+
+        chunks = []
+        with pytest.raises(ServerError, match=r"\[DONE\]"):
+            for chunk in client.chat.stream(model="m", messages=[{"role": "user", "content": "hi"}]):
+                chunks.append(chunk)
+
+        # The chunks that did arrive before the drop are still delivered.
+        assert len(chunks) == 2
+        client.close()
+
+    def test_context_manager_closes_connection_on_early_break(self, monkeypatch):
+        """Stopping iteration early (via `break` inside a `with` block) must
+        still close the underlying SSE connection deterministically."""
+        client = VGate()
+        holder = {}
+
+        def fake_stream(*a, **kw):
+            cm = _FakeSyncStreamCM(lines=_NORMAL_LINES)
+            holder["cm"] = cm
+            return cm
+
+        monkeypatch.setattr(client._http, "stream", fake_stream)
+
+        seen = []
+        with client.chat.stream(model="m", messages=[{"role": "user", "content": "hi"}]) as stream:
+            for chunk in stream:
+                seen.append(chunk)
+                if chunk.choices[0].delta.role == "assistant":
+                    break
+
+        assert len(seen) == 1
+        assert holder["cm"].exited is True
+        client.close()
+
+    def test_explicit_close_without_with_closes_connection(self, monkeypatch):
+        """Even without the context-manager form, calling .close() directly
+        on the returned stream must close the underlying connection."""
+        client = VGate()
+        holder = {}
+
+        def fake_stream(*a, **kw):
+            cm = _FakeSyncStreamCM(lines=_NORMAL_LINES)
+            holder["cm"] = cm
+            return cm
+
+        monkeypatch.setattr(client._http, "stream", fake_stream)
+
+        stream = client.chat.stream(model="m", messages=[{"role": "user", "content": "hi"}])
+        next(stream)
+        stream.close()
+
+        assert holder["cm"].exited is True
+        client.close()
+
 
 # ── Async ────────────────────────────────────────────────────────────────────
 
@@ -348,4 +418,68 @@ class TestAsyncStream:
         with pytest.raises(ConnectionError):
             async for _ in client.chat.stream(model="m", messages=[{"role": "user", "content": "hi"}]):
                 pass
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_missing_done_raises_server_error(self, monkeypatch):
+        """A connection that ends without ever sending `data: [DONE]` must
+        not look like a clean completion — it should raise, not silently
+        stop yielding."""
+        client = AsyncVGate()
+        monkeypatch.setattr(
+            client._http, "stream", lambda *a, **kw: _FakeAsyncStreamCM(lines=_NO_DONE_LINES)
+        )
+
+        chunks = []
+        with pytest.raises(ServerError, match=r"\[DONE\]"):
+            async for chunk in client.chat.stream(model="m", messages=[{"role": "user", "content": "hi"}]):
+                chunks.append(chunk)
+
+        assert len(chunks) == 2
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_context_manager_closes_connection_on_early_break(self, monkeypatch):
+        """Stopping iteration early (via `break` inside an `async with` block)
+        must still close the underlying SSE connection deterministically."""
+        client = AsyncVGate()
+        holder = {}
+
+        def fake_stream(*a, **kw):
+            cm = _FakeAsyncStreamCM(lines=_NORMAL_LINES)
+            holder["cm"] = cm
+            return cm
+
+        monkeypatch.setattr(client._http, "stream", fake_stream)
+
+        seen = []
+        async with client.chat.stream(model="m", messages=[{"role": "user", "content": "hi"}]) as stream:
+            async for chunk in stream:
+                seen.append(chunk)
+                if chunk.choices[0].delta.role == "assistant":
+                    break
+
+        assert len(seen) == 1
+        assert holder["cm"].exited is True
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_explicit_close_without_with_closes_connection(self, monkeypatch):
+        """Even without the context-manager form, calling .aclose() directly
+        on the returned stream must close the underlying connection."""
+        client = AsyncVGate()
+        holder = {}
+
+        def fake_stream(*a, **kw):
+            cm = _FakeAsyncStreamCM(lines=_NORMAL_LINES)
+            holder["cm"] = cm
+            return cm
+
+        monkeypatch.setattr(client._http, "stream", fake_stream)
+
+        stream = client.chat.stream(model="m", messages=[{"role": "user", "content": "hi"}])
+        await stream.__anext__()
+        await stream.aclose()
+
+        assert holder["cm"].exited is True
         await client.close()

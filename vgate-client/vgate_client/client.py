@@ -116,6 +116,59 @@ def _parse_sse_line(line: str):
     return ChatCompletionChunk.model_validate(data)
 
 
+class SyncChatStream:
+    """Iterable wrapper around a streaming chat completion.
+
+    Supports plain iteration (``for chunk in client.chat.stream(...)``)
+    exactly like a generator — full exhaustion closes the underlying SSE
+    connection as before. It also supports use as a context manager
+    (``with client.chat.stream(...) as stream:``) so a caller who stops
+    iterating early (e.g. ``break``) can still guarantee the connection is
+    closed deterministically, rather than relying on the generator's
+    ``.close()`` being called explicitly or on GC eventually reclaiming it.
+    """
+
+    def __init__(self, generator: Iterator[ChatCompletionChunk]):
+        self._generator = generator
+
+    def __iter__(self) -> Iterator[ChatCompletionChunk]:
+        return self
+
+    def __next__(self) -> ChatCompletionChunk:
+        return next(self._generator)
+
+    def close(self) -> None:
+        self._generator.close()
+
+    def __enter__(self) -> "SyncChatStream":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+
+class AsyncChatStream:
+    """Async counterpart of ``SyncChatStream``; see its docstring."""
+
+    def __init__(self, generator: AsyncIterator[ChatCompletionChunk]):
+        self._generator = generator
+
+    def __aiter__(self) -> AsyncIterator[ChatCompletionChunk]:
+        return self
+
+    async def __anext__(self) -> ChatCompletionChunk:
+        return await self._generator.__anext__()
+
+    async def aclose(self) -> None:
+        await self._generator.aclose()
+
+    async def __aenter__(self) -> "AsyncChatStream":
+        return self
+
+    async def __aexit__(self, *exc_info) -> None:
+        await self.aclose()
+
+
 def _check_stream_content_type(response: httpx.Response) -> None:
     content_type = response.headers.get("content-type", "")
     if "text/event-stream" not in content_type:
@@ -181,13 +234,17 @@ class _SyncChat:
         temperature: float = 0.7,
         top_p: float = 0.9,
         max_tokens: int = 256,
-    ) -> Iterator[ChatCompletionChunk]:
+    ) -> SyncChatStream:
         """Create a streaming chat completion.
 
-        Yields ``ChatCompletionChunk`` objects as they arrive over SSE. A
-        failure that happens after the stream has already started (mid-stream
-        error event, or the connection dropping) is not retried — retrying
-        would re-emit text the caller already received.
+        Returns a ``SyncChatStream`` yielding ``ChatCompletionChunk`` objects
+        as they arrive over SSE — iterate it directly, or use it as a context
+        manager (``with client.chat.stream(...) as stream:``) to guarantee
+        the connection closes even if you stop iterating early. A failure
+        that happens after the stream has already started (mid-stream error
+        event, connection dropping, or the stream ending without a `[DONE]`
+        event) is not retried — retrying would re-emit text the caller
+        already received.
         """
         req = ChatCompletionRequest(
             model=model,
@@ -197,7 +254,7 @@ class _SyncChat:
             max_tokens=max_tokens,
             stream=True,
         )
-        return self._client._stream_chat(req)
+        return SyncChatStream(self._client._stream_chat(req))
 
 
 class _SyncEmbeddings:
@@ -259,12 +316,15 @@ class _AsyncChat:
         temperature: float = 0.7,
         top_p: float = 0.9,
         max_tokens: int = 256,
-    ) -> AsyncIterator[ChatCompletionChunk]:
+    ) -> AsyncChatStream:
         """Create a streaming chat completion.
 
-        Not itself a coroutine — it returns an async generator immediately
+        Not itself a coroutine — it returns an ``AsyncChatStream`` immediately
         so ``async for chunk in client.chat.stream(...)`` works without an
-        extra ``await``, mirroring ``httpx.AsyncClient.stream()``.
+        extra ``await``, mirroring ``httpx.AsyncClient.stream()``. The
+        returned stream can also be used as an async context manager
+        (``async with client.chat.stream(...) as stream:``) to guarantee the
+        connection closes even if you stop iterating early.
         """
         req = ChatCompletionRequest(
             model=model,
@@ -274,7 +334,7 @@ class _AsyncChat:
             max_tokens=max_tokens,
             stream=True,
         )
-        return self._client._stream_chat(req)
+        return AsyncChatStream(self._client._stream_chat(req))
 
 
 class _AsyncEmbeddings:
@@ -378,12 +438,19 @@ class VGate:
                     response.read()
                     _raise_for_status(response)
                 _check_stream_content_type(response)
+                saw_done = False
                 for line in response.iter_lines():
                     parsed = _parse_sse_line(line)
                     if parsed is _STREAM_DONE:
-                        return
+                        saw_done = True
+                        break
                     if parsed is not None:
                         yield parsed
+                if not saw_done:
+                    raise ServerError(
+                        "Stream ended without a [DONE] event "
+                        "(connection closed early or the server crashed mid-stream)"
+                    )
         except httpx.ConnectError as exc:
             raise ConnectionError(f"Cannot connect to {self.base_url}: {exc}") from exc
 
@@ -501,12 +568,19 @@ class AsyncVGate:
                     await response.aread()
                     _raise_for_status(response)
                 _check_stream_content_type(response)
+                saw_done = False
                 async for line in response.aiter_lines():
                     parsed = _parse_sse_line(line)
                     if parsed is _STREAM_DONE:
-                        return
+                        saw_done = True
+                        break
                     if parsed is not None:
                         yield parsed
+                if not saw_done:
+                    raise ServerError(
+                        "Stream ended without a [DONE] event "
+                        "(connection closed early or the server crashed mid-stream)"
+                    )
         except httpx.ConnectError as exc:
             raise ConnectionError(f"Cannot connect to {self.base_url}: {exc}") from exc
 
