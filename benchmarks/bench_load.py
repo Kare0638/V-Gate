@@ -61,6 +61,21 @@ async def _get_json(session: aiohttp.ClientSession, url: str) -> Dict[str, Any]:
         return await resp.json()
 
 
+async def _get_text(session: aiohttp.ClientSession, url: str) -> str:
+    async with session.get(url) as resp:
+        return await resp.text()
+
+
+def _parse_counter_value(metrics_text: str, metric_name: str) -> float:
+    """Extract an unlabeled Prometheus counter's value from /metrics text
+    exposition output, e.g. a "vgate_stream_tokens_total 150.0" line."""
+    prefix = metric_name + " "
+    for line in metrics_text.splitlines():
+        if line.startswith(prefix):
+            return float(line.split()[1])
+    return 0.0
+
+
 async def _send_one(
     session: aiohttp.ClientSession,
     url: str,
@@ -94,12 +109,13 @@ async def _send_one_stream(
     headers: Optional[Dict[str, str]],
 ) -> Dict[str, Any]:
     """Like _send_one, but consumes an SSE stream instead of a single JSON
-    body. `tokens` counts content-delta events, not real token IDs — V-Gate's
-    SSE chunks don't carry a per-request final token count (no
-    `stream_options: {include_usage: true}` support yet), so for
-    multi-token-per-delta backends (real vLLM) this undercounts true
-    throughput. Good enough for relative comparisons; not a token-accurate
-    tokens/sec figure — see README caveats.
+    body. Returns `content_chunks` — the number of content-delta *events*,
+    not a token count. V-Gate's SSE chunks don't carry a per-request final
+    token count (no `stream_options: {include_usage: true}` support yet),
+    and a single delta can carry more than one real token, so this number
+    isn't comparable across backends/scheduling and must never be reported
+    as tokens/sec — see run_load_test, which instead diffs the server's own
+    vgate_stream_tokens_total counter for that.
     """
     payload = {
         "model": "vgate-bench",
@@ -114,7 +130,7 @@ async def _send_one_stream(
     try:
         async with session.post(url, json=payload, headers=headers) as resp:
             if resp.status != 200:
-                return {"latency_s": time.perf_counter() - start, "ok": False, "tokens": 0, "ttft_s": None}
+                return {"latency_s": time.perf_counter() - start, "ok": False, "content_chunks": 0, "ttft_s": None}
             async for raw_line in resp.content:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):
@@ -138,7 +154,7 @@ async def _send_one_stream(
     except Exception:
         ok = False
     latency = time.perf_counter() - start
-    return {"latency_s": latency, "ok": ok, "tokens": chunk_count, "ttft_s": ttft}
+    return {"latency_s": latency, "ok": ok, "content_chunks": chunk_count, "ttft_s": ttft}
 
 
 async def run_load_test(
@@ -161,7 +177,10 @@ async def run_load_test(
     RequestBatcher (see main.py's _stream_chat_completion), so the
     `batching`/`cache` sections reflect only what non-streaming traffic did
     during this run — for an all-streaming run they'll show no activity at
-    all, which is expected, not a bug.
+    all, which is expected, not a bug. Token counts for streaming come from
+    diffing the server's own vgate_stream_tokens_total counter (/metrics)
+    rather than counting SSE content-delta events client-side, since a
+    single delta can carry more than one real token.
     """
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
     chat_url = f"{base_url}/v1/chat/completions"
@@ -169,6 +188,10 @@ async def run_load_test(
 
     async with aiohttp.ClientSession() as session:
         stats_before = await _get_json(session, f"{base_url}/stats")
+        stream_tokens_before = (
+            _parse_counter_value(await _get_text(session, f"{base_url}/metrics"), "vgate_stream_tokens_total")
+            if stream else 0.0
+        )
 
         sem = asyncio.Semaphore(concurrency)
 
@@ -183,10 +206,19 @@ async def run_load_test(
         wall_time = time.perf_counter() - wall_start
 
         stats_after = await _get_json(session, f"{base_url}/stats")
+        stream_tokens_after = (
+            _parse_counter_value(await _get_text(session, f"{base_url}/metrics"), "vgate_stream_tokens_total")
+            if stream else 0.0
+        )
 
     latencies = [r["latency_s"] for r in results if r["ok"]]
     failures = sum(1 for r in results if not r["ok"])
-    total_tokens = sum(r["tokens"] for r in results)
+    if stream:
+        total_tokens = int(round(stream_tokens_after - stream_tokens_before))
+        total_content_chunks = sum(r["content_chunks"] for r in results)
+    else:
+        total_tokens = sum(r["tokens"] for r in results)
+        total_content_chunks = None
 
     before_b, after_b = stats_before["batcher"], stats_after["batcher"]
     before_c, after_c = stats_before["cache"], stats_after["cache"]
@@ -225,6 +257,7 @@ async def run_load_test(
             "total_tokens": total_tokens,
             "tokens_per_second": round(total_tokens / wall_time, 2) if wall_time > 0 else 0,
             "requests_per_second": round(total_requests / wall_time, 2) if wall_time > 0 else 0,
+            **({"content_chunks": total_content_chunks} if stream else {}),
         },
         "batching": {
             "requests": new_requests,
@@ -287,7 +320,13 @@ def format_markdown(result: Dict[str, Any], title: str = "V-Gate Load Benchmark"
             f"| Client-observed TTFT p95 (s) | {lat.get('ttft_p95_s', 0)} |",
         ]
     lines += [
-        f"| Tokens/sec{' (content chunks, not exact token count — see caveat)' if stream_mode else ''} | {thr['tokens_per_second']} |",
+        f"| Tokens/sec{' (server-reported, via vgate_stream_tokens_total)' if stream_mode else ''} | {thr['tokens_per_second']} |",
+    ]
+    if stream_mode and "content_chunks" in thr:
+        lines.append(
+            f"| SSE content-delta events (diagnostic only — not a token count) | {thr['content_chunks']} |"
+        )
+    lines += [
         f"| Requests/sec | {thr['requests_per_second']} |",
         f"| Avg batch size | {b['average_batch_size']} |",
         f"| Batches formed | {b['batches']} |",

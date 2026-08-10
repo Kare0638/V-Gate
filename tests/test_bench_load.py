@@ -104,3 +104,32 @@ class TestFormatMarkdown:
 
         assert "non-streaming" in md
         assert "Client-observed TTFT" not in md
+
+    def test_stream_mode_tokens_labeled_server_reported(self):
+        # Streaming tokens/sec must be visibly distinguished as coming from
+        # the server's own counter, not client-side chunk counting.
+        result = self._sample_result()
+        result["config"]["stream"] = True
+
+        md = format_markdown(result)
+
+        assert "server-reported" in md
+        assert "content chunks, not exact token count" not in md
+
+    def test_stream_mode_shows_content_chunks_diagnostic_separately(self):
+        result = self._sample_result()
+        result["config"]["stream"] = True
+        result["throughput"]["content_chunks"] = 42
+
+        md = format_markdown(result)
+
+        assert "SSE content-delta events" in md
+        assert "42" in md
+
+    def test_non_stream_mode_has_no_content_chunks_row(self):
+        result = self._sample_result()
+        result["config"]["stream"] = False
+
+        md = format_markdown(result)
+
+        assert "SSE content-delta events" not in md

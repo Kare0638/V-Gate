@@ -285,6 +285,96 @@ class TestStreamingMetrics:
         assert after_inference_errors_total == before_inference_errors_total
 
     @pytest.mark.asyncio
+    async def test_disconnect_right_after_role_chunk_counts_as_cancelled(self, monkeypatch):
+        """The role chunk yield must be inside the try/except so a disconnect
+        that happens before any content arrives is still recorded — it must
+        not fall outside all exception handling and vanish uncounted."""
+        import main as main_module
+
+        backend = _FakeStreamBackend(pieces=[
+            {"delta": "a", "num_tokens": 1},
+        ])
+        monkeypatch.setattr(main_module, "engine", _FakeStreamEngine(backend))
+
+        before_cancelled = STREAM_REQUESTS.labels(status="cancelled")._value.get()
+
+        request = main_module.ChatCompletionRequest(
+            model="m",
+            messages=[main_module.ChatMessage(role="user", content="hi")],
+            max_tokens=10,
+            stream=True,
+        )
+        gen = main_module._stream_chat_completion("prompt", request)
+        await gen.__anext__()  # role chunk only — nothing else consumed yet
+        await gen.aclose()  # disconnect before any content delta
+
+        assert STREAM_REQUESTS.labels(status="cancelled")._value.get() == before_cancelled + 1
+
+    @pytest.mark.asyncio
+    async def test_disconnect_during_error_event_yield_does_not_raise(self, monkeypatch):
+        """A client can disconnect exactly while the mid-stream error event is
+        being sent. GeneratorExit at that point doesn't match `except
+        Exception`, so it must not reach a `finally` that still tries to
+        yield — that's the same illegal-yield RuntimeError this whole
+        cancelled/error/completed split exists to avoid."""
+        import main as main_module
+
+        backend = _FakeStreamBackend(pieces=[], error=RuntimeError("backend exploded"))
+        monkeypatch.setattr(main_module, "engine", _FakeStreamEngine(backend))
+
+        before_error = STREAM_REQUESTS.labels(status="error")._value.get()
+        before_inference_errors = INFERENCE_ERRORS.labels(error_type="RuntimeError")._value.get()
+
+        request = main_module.ChatCompletionRequest(
+            model="m",
+            messages=[main_module.ChatMessage(role="user", content="hi")],
+            max_tokens=10,
+            stream=True,
+        )
+        gen = main_module._stream_chat_completion("prompt", request)
+        await gen.__anext__()  # role chunk
+        await gen.__anext__()  # the error event chunk itself
+        await gen.aclose()  # disconnect while that error event was in flight — must not raise
+
+        # The backend failure already happened before the disconnect, so
+        # it's still attributed to error/INFERENCE_ERRORS (a documented
+        # tie-break), not silently dropped or double-counted as cancelled.
+        assert STREAM_REQUESTS.labels(status="error")._value.get() == before_error + 1
+        assert (
+            INFERENCE_ERRORS.labels(error_type="RuntimeError")._value.get()
+            == before_inference_errors + 1
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_stream_still_counts_last_delivered_chunk_tokens(self, monkeypatch):
+        """A chunk that was already handed to the SSE transport before the
+        disconnect happened must count toward STREAM_TOKENS/TOKENS_GENERATED
+        even though the generator never resumes past that yield."""
+        import main as main_module
+
+        backend = _FakeStreamBackend(pieces=[
+            {"delta": "abc", "num_tokens": 3},
+        ])
+        monkeypatch.setattr(main_module, "engine", _FakeStreamEngine(backend))
+
+        before_stream_tokens = STREAM_TOKENS._value.get()
+        before_global_tokens = TOKENS_GENERATED._value.get()
+
+        request = main_module.ChatCompletionRequest(
+            model="m",
+            messages=[main_module.ChatMessage(role="user", content="hi")],
+            max_tokens=10,
+            stream=True,
+        )
+        gen = main_module._stream_chat_completion("prompt", request)
+        await gen.__anext__()  # role chunk
+        await gen.__anext__()  # the one content chunk (num_tokens=3)
+        await gen.aclose()  # disconnect right after it was sent
+
+        assert STREAM_TOKENS._value.get() == before_stream_tokens + 3
+        assert TOKENS_GENERATED._value.get() == before_global_tokens + 3
+
+    @pytest.mark.asyncio
     async def test_tpot_is_token_weighted_not_chunk_averaged(self, monkeypatch):
         """A single delta can carry more than one token (real vLLM chunks
         aren't always 1 token). TPOT must be decode_time / decode_tokens,
