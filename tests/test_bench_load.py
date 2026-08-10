@@ -82,3 +82,25 @@ class TestFormatMarkdown:
         result = self._sample_result()
         md = format_markdown(result)
         assert isinstance(md, str) and len(md) > 0
+
+    def test_stream_mode_adds_ttft_rows(self):
+        result = self._sample_result()
+        result["config"]["stream"] = True
+        result["latency"]["ttft_mean_s"] = 0.05
+        result["latency"]["ttft_p50_s"] = 0.045
+        result["latency"]["ttft_p95_s"] = 0.09
+
+        md = format_markdown(result)
+
+        assert "streaming (SSE)" in md
+        assert "Client-observed TTFT mean (s)" in md
+        assert "0.05" in md
+
+    def test_non_stream_mode_omits_ttft_rows(self):
+        result = self._sample_result()
+        result["config"]["stream"] = False
+
+        md = format_markdown(result)
+
+        assert "non-streaming" in md
+        assert "Client-observed TTFT" not in md

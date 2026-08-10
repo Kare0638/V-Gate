@@ -28,6 +28,8 @@ from vgate.batcher import RequestBatcher
 from vgate.logging_config import setup_logging, get_logger
 from vgate.metrics import (
     REQUEST_COUNT, REQUEST_LATENCY, REQUEST_IN_PROGRESS,
+    TOKENS_GENERATED, INFERENCE_ERRORS,
+    STREAM_TTFT, STREAM_TPOT, STREAM_DURATION, STREAM_TOKENS, STREAM_REQUESTS,
     init_app_info
 )
 from vgate.security import SecurityMiddleware
@@ -220,6 +222,7 @@ async def _stream_chat_completion(prompt: str, request: ChatCompletionRequest):
     """
     completion_id = "chatcmpl-" + str(uuid.uuid4())[:8]
     created = int(time.time())
+    started_at = time.monotonic()
 
     def _chunk(delta: dict, finish_reason: str = None) -> str:
         payload = {
@@ -231,22 +234,57 @@ async def _stream_chat_completion(prompt: str, request: ChatCompletionRequest):
         }
         return f"data: {json.dumps(payload)}\n\n"
 
+    # Token-weighted TPOT bookkeeping: a single delta can carry more than one
+    # token (see vllm_backend.py's stream_generate), so averaging the time
+    # between chunks would measure time-per-chunk, not time-per-token.
+    ttft_recorded = False
+    prev_num_tokens = 0
+    prev_delta_time = started_at
+    decode_time = 0.0
+    decode_tokens = 0
+    final_num_tokens = 0
+    status = "error"
+
     yield _chunk({"role": "assistant"})
     try:
         sampling_params = engine.backend.create_sampling_params(
             temperature=request.temperature, top_p=request.top_p, max_tokens=request.max_tokens
         )
-        num_tokens = 0
         async for piece in engine.backend.stream_generate(prompt, sampling_params):
-            if piece.get("delta"):
-                yield _chunk({"content": piece["delta"]})
-            num_tokens = piece.get("num_tokens", num_tokens)
+            delta = piece.get("delta")
+            num_tokens = piece.get("num_tokens", prev_num_tokens)
+            now = time.monotonic()
+            if delta:
+                if not ttft_recorded:
+                    STREAM_TTFT.observe(now - started_at)
+                    ttft_recorded = True
+                else:
+                    token_increment = num_tokens - prev_num_tokens
+                    interval = now - prev_delta_time
+                    if token_increment > 0:
+                        decode_time += interval
+                        decode_tokens += token_increment
+                prev_num_tokens = num_tokens
+                prev_delta_time = now
+                yield _chunk({"content": delta})
+            final_num_tokens = num_tokens
         yield _chunk({}, finish_reason="stop")
+        status = "completed"
+        if decode_tokens > 0:
+            STREAM_TPOT.observe(decode_time / decode_tokens)
+        STREAM_DURATION.observe(time.monotonic() - started_at)
         app_logger.info(
             "Streamed chat completion",
-            extra={"extra_data": {"completion_id": completion_id, "tokens": num_tokens}}
+            extra={"extra_data": {"completion_id": completion_id, "tokens": final_num_tokens}}
         )
+    except (GeneratorExit, asyncio.CancelledError):
+        # Client disconnected or the request was cancelled — not a backend
+        # failure, so it isn't counted as an inference error.
+        status = "cancelled"
+        raise
     except Exception as e:
+        status = "error"
+        INFERENCE_ERRORS.labels(error_type=type(e).__name__).inc()
         # The 200 OK + SSE headers are already flushed by this point, so an
         # HTTP error status is no longer possible; surface the failure as an
         # SSE error event instead (mirrors how OpenAI's API reports
@@ -261,7 +299,15 @@ async def _stream_chat_completion(prompt: str, request: ChatCompletionRequest):
         )
         yield f"data: {json.dumps({'error': {'message': str(e), 'type': type(e).__name__}})}\n\n"
     finally:
-        yield "data: [DONE]\n\n"
+        STREAM_REQUESTS.labels(status=status).inc()
+        if final_num_tokens > 0:
+            STREAM_TOKENS.inc(final_num_tokens)
+            TOKENS_GENERATED.inc(final_num_tokens)
+        # Yielding is illegal once GeneratorExit is being handled (the
+        # cancelled/disconnected path) — an async generator that yields
+        # after receiving GeneratorExit raises RuntimeError.
+        if status != "cancelled":
+            yield "data: [DONE]\n\n"
 
 
 @app.post("/v1/chat/completions", summary="Create Chat Completion")

@@ -27,13 +27,13 @@ Usage:
     #   VGATE_DRY_RUN=true python main.py
     python benchmarks/bench_load.py --concurrency 8 --requests 80
     python benchmarks/bench_load.py --prompt-file prompts.txt --output json
+    python benchmarks/bench_load.py --stream --concurrency 8 --requests 40
 """
 
 import argparse
 import asyncio
 import json
 import statistics
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -83,7 +83,62 @@ async def _send_one(
         body = {}
     latency = time.perf_counter() - start
     tokens = body.get("usage", {}).get("completion_tokens", 0) if ok else 0
-    return {"latency_s": latency, "ok": ok, "tokens": tokens}
+    return {"latency_s": latency, "ok": ok, "tokens": tokens, "ttft_s": None}
+
+
+async def _send_one_stream(
+    session: aiohttp.ClientSession,
+    url: str,
+    prompt: str,
+    max_tokens: int,
+    headers: Optional[Dict[str, str]],
+) -> Dict[str, Any]:
+    """Like _send_one, but consumes an SSE stream instead of a single JSON
+    body. `tokens` counts content-delta events, not real token IDs — V-Gate's
+    SSE chunks don't carry a per-request final token count (no
+    `stream_options: {include_usage: true}` support yet), so for
+    multi-token-per-delta backends (real vLLM) this undercounts true
+    throughput. Good enough for relative comparisons; not a token-accurate
+    tokens/sec figure — see README caveats.
+    """
+    payload = {
+        "model": "vgate-bench",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    start = time.perf_counter()
+    ttft: Optional[float] = None
+    chunk_count = 0
+    ok = False
+    try:
+        async with session.post(url, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                return {"latency_s": time.perf_counter() - start, "ok": False, "tokens": 0, "ttft_s": None}
+            async for raw_line in resp.content:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[len("data:"):].strip()
+                if data_str == "[DONE]":
+                    ok = True
+                    break
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if "error" in data:
+                    ok = False
+                    break
+                delta = data.get("choices", [{}])[0].get("delta", {})
+                if delta.get("content"):
+                    chunk_count += 1
+                    if ttft is None:
+                        ttft = time.perf_counter() - start
+    except Exception:
+        ok = False
+    latency = time.perf_counter() - start
+    return {"latency_s": latency, "ok": ok, "tokens": chunk_count, "ttft_s": ttft}
 
 
 async def run_load_test(
@@ -93,14 +148,24 @@ async def run_load_test(
     prompts: List[str],
     max_tokens: int = 64,
     api_key: Optional[str] = None,
+    stream: bool = False,
 ) -> Dict[str, Any]:
     """
     Fire `total_requests` chat completion requests at `concurrency` concurrent
     workers against a running server, then diff /stats before and after to
     attribute batching/cache behavior to this run.
+
+    With `stream=True`, each request is sent with `"stream": true` and
+    consumed as SSE instead of a single JSON response, and the result
+    includes client-observed TTFT percentiles. Streaming bypasses
+    RequestBatcher (see main.py's _stream_chat_completion), so the
+    `batching`/`cache` sections reflect only what non-streaming traffic did
+    during this run — for an all-streaming run they'll show no activity at
+    all, which is expected, not a bug.
     """
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
     chat_url = f"{base_url}/v1/chat/completions"
+    send_one = _send_one_stream if stream else _send_one
 
     async with aiohttp.ClientSession() as session:
         stats_before = await _get_json(session, f"{base_url}/stats")
@@ -109,7 +174,7 @@ async def run_load_test(
 
         async def _bounded(i: int) -> Dict[str, Any]:
             async with sem:
-                return await _send_one(
+                return await send_one(
                     session, chat_url, prompts[i % len(prompts)], max_tokens, headers
                 )
 
@@ -132,22 +197,30 @@ async def run_load_test(
     new_hits = after_c["hits"] - before_c["hits"]
     new_misses = after_c["misses"] - before_c["misses"]
 
+    latency_stats = {
+        "mean_s": round(statistics.mean(latencies), 4) if latencies else 0,
+        "p50_s": round(_percentile(latencies, 50), 4),
+        "p95_s": round(_percentile(latencies, 95), 4),
+        "p99_s": round(_percentile(latencies, 99), 4),
+        "max_s": round(max(latencies), 4) if latencies else 0,
+    }
+    if stream:
+        ttfts = [r["ttft_s"] for r in results if r["ok"] and r.get("ttft_s") is not None]
+        latency_stats["ttft_mean_s"] = round(statistics.mean(ttfts), 4) if ttfts else 0
+        latency_stats["ttft_p50_s"] = round(_percentile(ttfts, 50), 4)
+        latency_stats["ttft_p95_s"] = round(_percentile(ttfts, 95), 4)
+
     return {
         "config": {
             "concurrency": concurrency,
             "total_requests": total_requests,
             "unique_prompts": len(prompts),
             "max_tokens": max_tokens,
+            "stream": stream,
         },
         "wall_time_s": round(wall_time, 4),
         "failures": failures,
-        "latency": {
-            "mean_s": round(statistics.mean(latencies), 4) if latencies else 0,
-            "p50_s": round(_percentile(latencies, 50), 4),
-            "p95_s": round(_percentile(latencies, 95), 4),
-            "p99_s": round(_percentile(latencies, 99), 4),
-            "max_s": round(max(latencies), 4) if latencies else 0,
-        },
+        "latency": latency_stats,
         "throughput": {
             "total_tokens": total_tokens,
             "tokens_per_second": round(total_tokens / wall_time, 2) if wall_time > 0 else 0,
@@ -187,6 +260,7 @@ def load_prompts(prompt_file: Optional[str]) -> List[str]:
 def format_markdown(result: Dict[str, Any], title: str = "V-Gate Load Benchmark") -> str:
     c, lat, thr = result["config"], result["latency"], result["throughput"]
     b, ch = result["batching"], result["cache"]
+    stream_mode = c.get("stream", False)
     lines = [
         f"## {title}",
         "",
@@ -194,6 +268,7 @@ def format_markdown(result: Dict[str, Any], title: str = "V-Gate Load Benchmark"
         f"- Total requests: {c['total_requests']}",
         f"- Unique prompts: {c['unique_prompts']}",
         f"- Max tokens: {c['max_tokens']}",
+        f"- Mode: {'streaming (SSE)' if stream_mode else 'non-streaming'}",
         f"- Failures: {result['failures']}",
         f"- Wall time: {result['wall_time_s']}s",
         "",
@@ -204,14 +279,22 @@ def format_markdown(result: Dict[str, Any], title: str = "V-Gate Load Benchmark"
         f"| Latency p95 (s) | {lat['p95_s']} |",
         f"| Latency p99 (s) | {lat['p99_s']} |",
         f"| Latency max (s) | {lat['max_s']} |",
-        f"| Tokens/sec | {thr['tokens_per_second']} |",
+    ]
+    if stream_mode:
+        lines += [
+            f"| Client-observed TTFT mean (s) | {lat.get('ttft_mean_s', 0)} |",
+            f"| Client-observed TTFT p50 (s) | {lat.get('ttft_p50_s', 0)} |",
+            f"| Client-observed TTFT p95 (s) | {lat.get('ttft_p95_s', 0)} |",
+        ]
+    lines += [
+        f"| Tokens/sec{' (content chunks, not exact token count — see caveat)' if stream_mode else ''} | {thr['tokens_per_second']} |",
         f"| Requests/sec | {thr['requests_per_second']} |",
         f"| Avg batch size | {b['average_batch_size']} |",
         f"| Batches formed | {b['batches']} |",
         f"| Deduplicated requests | {b['deduplicated']} |",
         f"| Avg queue time (s) | {b['avg_queue_time_s']} |",
-        f"| Avg TTFT (s) | {b['avg_ttft_s']} |",
-        f"| Avg TPOT (s) | {b['avg_tpot_s']} |",
+        f"| Avg TTFT (s, batcher-reported, non-streaming only) | {b['avg_ttft_s']} |",
+        f"| Avg TPOT (s, batcher-reported, non-streaming only) | {b['avg_tpot_s']} |",
         f"| Cache hit rate (this run) | {ch['hit_rate']} |",
         f"| Cache hits / misses (this run) | {ch['hits']} / {ch['misses']} |",
         "",
@@ -228,6 +311,7 @@ async def _main_async(args: argparse.Namespace) -> Dict[str, Any]:
         prompts=prompts,
         max_tokens=args.max_tokens,
         api_key=args.api_key,
+        stream=args.stream,
     )
 
 
@@ -243,18 +327,14 @@ def main():
     parser.add_argument("--api-key", default=None, help="Bearer API key, if server security is enabled")
     parser.add_argument(
         "--stream", action="store_true",
-        help="Not implemented: V-Gate has no SSE streaming yet (see ROADMAP.md Phase 2)",
+        help=(
+            "Send stream=true and consume SSE. Reports client-observed TTFT "
+            "percentiles; bypasses RequestBatcher (see ROADMAP.md Phase 2), so "
+            "batching/cache stats reflect only concurrent non-streaming traffic."
+        ),
     )
     parser.add_argument("--output", choices=["json", "markdown"], default="markdown")
     args = parser.parse_args()
-
-    if args.stream:
-        print(
-            "--stream is not supported: V-Gate does not implement SSE streaming yet "
-            "(see ROADMAP.md Phase 2). Re-run without --stream.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
 
     result = asyncio.run(_main_async(args))
 

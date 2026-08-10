@@ -152,6 +152,8 @@ curl -N -X POST http://localhost:8000/v1/chat/completions \
 
 Returns OpenAI-style SSE delta chunks. Works for the dry-run backend and real vLLM (`AsyncLLMEngine`, verified on GPU); SGLang still raises a clear error until its async engine streaming path lands (see [ROADMAP.md](ROADMAP.md) Phase 2). The streaming path also bypasses the batcher/cache for now (no dedup or admission control yet).
 
+Streaming has its own `/metrics` series, separate from the batcher's non-streaming TTFT/TPOT since the two are measured differently (engine-reported vs. gateway-side wall clock): `vgate_stream_ttft_seconds`, `vgate_stream_tpot_seconds` (token-weighted — a single SSE delta can carry more than one token), `vgate_stream_duration_seconds`, `vgate_stream_tokens_total`, and `vgate_stream_requests_total{status="completed"|"error"|"cancelled"}`.
+
 ### Prometheus Metrics
 ```bash
 curl http://localhost:8000/metrics
@@ -272,7 +274,10 @@ PYTHONPATH=. python benchmarks/bench_compare.py --backends vllm sglang --output 
 # Start a server first, e.g.: VGATE_DRY_RUN=true python main.py
 PYTHONPATH=. python benchmarks/bench_load.py --concurrency 8 --requests 80
 PYTHONPATH=. python benchmarks/bench_load.py --prompt-file prompts.txt --output json
+PYTHONPATH=. python benchmarks/bench_load.py --stream --concurrency 8 --requests 40
 ```
+
+With `--stream`, each request is sent with `stream: true` and consumed as SSE; the report adds client-observed TTFT percentiles. The streaming path bypasses `RequestBatcher` (see above), so an all-streaming run's batching/cache stats will correctly show no activity — that reflects the current architecture, not a bug in the benchmark. Its `tokens/sec` counts SSE content-delta events, not exact token IDs (V-Gate doesn't send a final usage count over SSE yet), so it's good for relative comparisons but undercounts real throughput when a backend packs more than one token per delta.
 
 `benchmarks/run_report.py` orchestrates a full report: it spawns a fresh server subprocess per scenario (dry-run baseline, a batch-size sweep, and a cache/dedup-impact comparison) and writes the results to [`benchmarks/results/baseline.md`](benchmarks/results/baseline.md):
 
