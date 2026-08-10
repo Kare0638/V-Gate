@@ -16,8 +16,9 @@
 
 from __future__ import annotations
 
+import json
 import time
-from typing import Optional, Union
+from typing import AsyncIterator, Iterator, Optional, Union
 
 import httpx
 
@@ -30,6 +31,7 @@ from .exceptions import (
 )
 from .models import (
     ChatCompletion,
+    ChatCompletionChunk,
     ChatCompletionRequest,
     ChatMessage,
     EmbeddingRequest,
@@ -89,6 +91,41 @@ def _raise_for_status(response: httpx.Response) -> None:
     raise VGateError(detail, status_code=status, body=body)
 
 
+_STREAM_DONE = object()  # sentinel: the "data: [DONE]" line was reached
+
+
+def _parse_sse_line(line: str):
+    """Parse one SSE line.
+
+    Returns ``None`` for lines to skip (blank lines, comments, non-``data:``
+    fields), the ``_STREAM_DONE`` sentinel for ``data: [DONE]``, or a parsed
+    ``ChatCompletionChunk`` otherwise. Raises ``ServerError`` if the line
+    carries a mid-stream error event (see main.py's _stream_chat_completion,
+    which can emit `{"error": {...}}` after the 200 response is already
+    flushed).
+    """
+    if not line or not line.startswith("data:"):
+        return None
+    payload = line[len("data:"):].lstrip(" ")
+    if payload == "[DONE]":
+        return _STREAM_DONE
+    data = json.loads(payload)
+    if "error" in data:
+        err = data["error"]
+        raise ServerError(err.get("message", "stream error"), body=data)
+    return ChatCompletionChunk.model_validate(data)
+
+
+def _check_stream_content_type(response: httpx.Response) -> None:
+    content_type = response.headers.get("content-type", "")
+    if "text/event-stream" not in content_type:
+        raise VGateError(
+            f"Expected a text/event-stream response but got Content-Type: "
+            f"{content_type or '<missing>'}",
+            status_code=response.status_code,
+        )
+
+
 def _build_headers(api_key: Optional[str]) -> dict[str, str]:
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if api_key:
@@ -135,6 +172,32 @@ class _SyncChat:
         )
         data = self._client._request("POST", "/v1/chat/completions", json=req.model_dump())
         return ChatCompletion.model_validate(data)
+
+    def stream(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, str]],
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        max_tokens: int = 256,
+    ) -> Iterator[ChatCompletionChunk]:
+        """Create a streaming chat completion.
+
+        Yields ``ChatCompletionChunk`` objects as they arrive over SSE. A
+        failure that happens after the stream has already started (mid-stream
+        error event, or the connection dropping) is not retried — retrying
+        would re-emit text the caller already received.
+        """
+        req = ChatCompletionRequest(
+            model=model,
+            messages=[ChatMessage(**m) for m in messages],
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        return self._client._stream_chat(req)
 
 
 class _SyncEmbeddings:
@@ -187,6 +250,31 @@ class _AsyncChat:
         )
         data = await self._client._request("POST", "/v1/chat/completions", json=req.model_dump())
         return ChatCompletion.model_validate(data)
+
+    def stream(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, str]],
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        max_tokens: int = 256,
+    ) -> AsyncIterator[ChatCompletionChunk]:
+        """Create a streaming chat completion.
+
+        Not itself a coroutine — it returns an async generator immediately
+        so ``async for chunk in client.chat.stream(...)`` works without an
+        extra ``await``, mirroring ``httpx.AsyncClient.stream()``.
+        """
+        req = ChatCompletionRequest(
+            model=model,
+            messages=[ChatMessage(**m) for m in messages],
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        return self._client._stream_chat(req)
 
 
 class _AsyncEmbeddings:
@@ -278,6 +366,26 @@ class VGate:
 
         # Should not reach here, but just in case
         raise last_exc or VGateError("Request failed after retries")
+
+    def _stream_chat(self, req: ChatCompletionRequest) -> Iterator[ChatCompletionChunk]:
+        """Open an SSE stream and yield parsed chunks. No retry: once bytes
+        have been yielded to the caller, retrying would duplicate text."""
+        try:
+            with self._http.stream(
+                "POST", "/v1/chat/completions", json=req.model_dump()
+            ) as response:
+                if not response.is_success:
+                    response.read()
+                    _raise_for_status(response)
+                _check_stream_content_type(response)
+                for line in response.iter_lines():
+                    parsed = _parse_sse_line(line)
+                    if parsed is _STREAM_DONE:
+                        return
+                    if parsed is not None:
+                        yield parsed
+        except httpx.ConnectError as exc:
+            raise ConnectionError(f"Cannot connect to {self.base_url}: {exc}") from exc
 
     # -- convenience endpoints --------------------------------------------
 
@@ -381,6 +489,26 @@ class AsyncVGate:
             _raise_for_status(response)
 
         raise VGateError("Request failed after retries")
+
+    async def _stream_chat(self, req: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
+        """Open an SSE stream and yield parsed chunks. No retry: once bytes
+        have been yielded to the caller, retrying would duplicate text."""
+        try:
+            async with self._http.stream(
+                "POST", "/v1/chat/completions", json=req.model_dump()
+            ) as response:
+                if not response.is_success:
+                    await response.aread()
+                    _raise_for_status(response)
+                _check_stream_content_type(response)
+                async for line in response.aiter_lines():
+                    parsed = _parse_sse_line(line)
+                    if parsed is _STREAM_DONE:
+                        return
+                    if parsed is not None:
+                        yield parsed
+        except httpx.ConnectError as exc:
+            raise ConnectionError(f"Cannot connect to {self.base_url}: {exc}") from exc
 
     # -- convenience endpoints --------------------------------------------
 

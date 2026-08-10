@@ -212,6 +212,37 @@ async with AsyncVGate(base_url="http://localhost:8000", api_key="sk-...") as cli
     )
 ```
 
+Streaming is available on both clients as `chat.stream(...)`, yielding OpenAI-style `ChatCompletionChunk` objects (`chunk.choices[0].delta.content`):
+
+```python
+from vgate_client import VGate
+
+client = VGate(base_url="http://localhost:8000")
+for chunk in client.chat.stream(
+    model="Qwen/Qwen2.5-1.5B-Instruct-AWQ",
+    messages=[{"role": "user", "content": "What is 2+2?"}],
+    max_tokens=100,
+):
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="", flush=True)
+client.close()
+```
+
+```python
+from vgate_client import AsyncVGate
+
+async with AsyncVGate(base_url="http://localhost:8000") as client:
+    async for chunk in client.chat.stream(
+        model="Qwen/Qwen2.5-1.5B-Instruct-AWQ",
+        messages=[{"role": "user", "content": "What is 2+2?"}],
+        max_tokens=100,
+    ):
+        if chunk.choices[0].delta.content:
+            print(chunk.choices[0].delta.content, end="", flush=True)
+```
+
+A failure mid-stream (a `data: {"error": ...}` event from the server, or a dropped connection) raises immediately — `chat.stream()` never retries once tokens have already been yielded, since a retry would duplicate text the caller already received.
+
 ---
 
 ## Benchmark
