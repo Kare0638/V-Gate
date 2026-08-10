@@ -23,8 +23,8 @@ V-Gate is currently an OpenAI-style LLM gateway with:
 
 Current gaps:
 
-- OpenAI API compatibility is still shallow. Streaming (`stream: true`, SSE) now works end-to-end for the dry-run backend only; vLLM/SGLang backends raise a clear `NotImplementedError` until their async engine paths land (Phase 2).
-- Current batching is static micro-batching, not true continuous batching. New requests cannot join an already-running decode batch.
+- OpenAI API compatibility is still shallow. Streaming (`stream: true`, SSE) now works end-to-end for the dry-run backend and real vLLM (verified on GPU); SGLang still raises a clear `NotImplementedError` until its async engine path lands (Phase 2 task 8).
+- `RequestBatcher` still forms a static, sealed Python-side batch per window (queue drain, `max_batch_size`/`max_wait_time_ms`) before handing prompts to the backend — new requests still can't join an already-formed batch at that layer. Below that layer, `VLLMBackend` now submits each prompt as an independent `AsyncLLMEngine.generate()` call, so vLLM's own scheduler does get to interleave/continuously-batch them at the GPU level even though the Python-side batch above it is still static. Full task 9 (redefine `RequestBatcher` as dedup/admission/fan-out, not batch construction) is not done.
 - The runtime is still a single gateway with a single local backend, not real multi-worker serving.
 - Benchmark tooling exists, but systematic benchmark reports and analysis are missing.
 - Cache is RAM-only. There is no persistent local disk cache layer, and cache value depends on process lifetime. This is an intentional, benchmark-gated decision (Phase 1.5), not an oversight — current traffic shows no L1 eviction pressure.
@@ -269,11 +269,13 @@ Expected outcome:
 
 ### Phase 2: Streaming And Engine-Native Continuous Batching
 
-**Status: in progress — task 1-5 dry-run slice done, tasks 6-9 not started.** `stream: true` is supported end-to-end for the dry-run backend: `POST /v1/chat/completions` returns real SSE (`curl -N` shows incremental chunks) with OpenAI-style delta chunks (role chunk, content chunks, final `finish_reason: stop`, `data: [DONE]`). `InferenceBackend.stream_generate()` is now part of the protocol; `VLLMBackend`/`SGLangBackend` implement it as an explicit `NotImplementedError` (not a silent no-op) until their async engine paths land.
+**Status: in progress — tasks 1-3, 6 done; task 5 partial; tasks 4, 8, 9 not started.** `stream: true` is supported end-to-end for both the dry-run backend and real vLLM: `POST /v1/chat/completions` returns real SSE (`curl -N` shows incremental chunks, verified against a live GPU) with OpenAI-style delta chunks.
 
-Known, intentional limitation of this slice: the streaming path in `main.py` (`_stream_chat_completion`) calls `engine.backend.stream_generate()` directly and bypasses `RequestBatcher` entirely — no cache lookup, no batch-level dedup, no admission control for streamed requests yet. That integration is task 9 below, which is blocked on the AsyncLLMEngine work (tasks 6-7) since a per-request async engine is what makes "submit independent requests, not sealed Python batches" possible in the first place.
+`VLLMBackend` now runs on `AsyncLLMEngine` instead of the offline `LLM()` class (task 6, done) — a single engine instance backs both `generate()` (the batch-shaped call `RequestBatcher` still uses) and `stream_generate()`, avoiding a second model load / GPU-memory-budget conflict. `generate()` bridges from its calling worker thread to the engine's owning event loop via `asyncio.run_coroutine_threadsafe`. A side effect worth noting: even the non-streaming path now submits each prompt as an independent `engine.generate()` call rather than one sealed `LLM.generate(list, ...)` call, so it already gets real continuous batching from vLLM's own scheduler — ahead of the full `RequestBatcher` redefinition in task 9. `SGLangBackend.stream_generate()` still raises `NotImplementedError` (task 8 not started).
 
-Not yet done: client SDK streaming (task 4), streaming-specific metrics (task 5 - only basic completion logging exists so far), the vLLM/SGLang async engine backend paths (tasks 6-8), and redefining `RequestBatcher` (task 9).
+Known, intentional limitation: the streaming path in `main.py` (`_stream_chat_completion`) calls `engine.backend.stream_generate()` directly and bypasses `RequestBatcher` entirely — no cache lookup, no batch-level dedup, no admission control for streamed requests yet. That integration is task 9, not started.
+
+Not yet done: client SDK streaming (task 4), streaming-specific metrics beyond basic completion logging (task 5), the SGLang async backend path (task 8), and redefining `RequestBatcher` (task 9).
 
 Priority: high.
 

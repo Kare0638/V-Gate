@@ -16,6 +16,7 @@
 Tests for inference backend abstraction layer.
 """
 
+import asyncio
 import os
 from unittest.mock import MagicMock, patch
 
@@ -156,32 +157,52 @@ class TestModelConfigEngineType:
 
 
 class TestVLLMBackendNormalization:
-    """Test VLLMBackend output normalization with mocked vLLM internals."""
+    """
+    Test VLLMBackend output normalization with a mocked AsyncLLMEngine.
 
-    def test_generate_normalizes_output(self):
+    generate() blocks synchronously via run_coroutine_threadsafe against the
+    loop captured in backend._loop, so it must be called from a different
+    thread than that loop (exactly how RequestBatcher calls it, via
+    run_in_executor) — calling it directly from the test's own loop would
+    deadlock: the blocking future.result() would never yield control back
+    for that same loop to actually run the scheduled coroutine.
+    """
+
+    @staticmethod
+    def _make_output(text, token_ids, metrics=None, finished=True):
+        output = MagicMock()
+        output.finished = finished
+        output.outputs = [MagicMock()]
+        output.outputs[0].text = text
+        output.outputs[0].token_ids = token_ids
+        output.metrics = metrics
+        return output
+
+    @pytest.mark.asyncio
+    async def test_generate_normalizes_output(self):
         from vgate.backends.vllm_backend import VLLMBackend
 
         backend = VLLMBackend()
+        backend._loop = asyncio.get_running_loop()
 
-        # Create mock vLLM output
-        mock_output = MagicMock()
-        mock_output.outputs = [MagicMock()]
-        mock_output.outputs[0].text = "Generated text"
-        mock_output.outputs[0].token_ids = [1, 2, 3, 4, 5]
         # Field names/semantics match vllm.v1.metrics.stats.RequestStateStats:
         # first_token_latency is precomputed by vLLM; first_token_ts/last_token_ts
         # are monotonic engine-core timestamps (arrival_time is a separate
         # wall-clock frontend timestamp and is not used for these deltas).
-        mock_output.metrics = MagicMock()
-        mock_output.metrics.first_token_latency = 0.1
-        mock_output.metrics.first_token_ts = 1.1
-        mock_output.metrics.last_token_ts = 1.5
+        metrics = MagicMock(first_token_latency=0.1, first_token_ts=1.1, last_token_ts=1.5)
+        final_output = self._make_output("Generated text", [1, 2, 3, 4, 5], metrics=metrics)
 
-        mock_llm = MagicMock()
-        mock_llm.generate.return_value = [mock_output]
-        backend.llm = mock_llm
+        async def fake_generate(prompt, sampling_params, request_id):
+            yield final_output
 
-        results = backend.generate(["test prompt"], MagicMock())
+        mock_engine = MagicMock()
+        mock_engine.generate = fake_generate
+        backend.engine = mock_engine
+
+        results = await asyncio.get_running_loop().run_in_executor(
+            None, backend.generate, ["test prompt"], MagicMock()
+        )
+
         assert len(results) == 1
         assert results[0]["text"] == "Generated text"
         assert results[0]["num_tokens"] == 5
@@ -189,32 +210,80 @@ class TestVLLMBackendNormalization:
         assert abs(results[0]["metrics"]["ttft"] - 0.1) < 0.001
         assert abs(results[0]["metrics"]["gen_time"] - 0.4) < 0.001
 
-    def test_generate_without_metrics(self):
+    @pytest.mark.asyncio
+    async def test_generate_without_metrics(self):
         from vgate.backends.vllm_backend import VLLMBackend
 
         backend = VLLMBackend()
+        backend._loop = asyncio.get_running_loop()
 
-        mock_output = MagicMock()
-        mock_output.outputs = [MagicMock()]
-        mock_output.outputs[0].text = "No metrics text"
-        mock_output.outputs[0].token_ids = [1, 2, 3]
-        mock_output.metrics = None
+        final_output = self._make_output("No metrics text", [1, 2, 3], metrics=None)
 
-        mock_llm = MagicMock()
-        mock_llm.generate.return_value = [mock_output]
-        backend.llm = mock_llm
+        async def fake_generate(prompt, sampling_params, request_id):
+            yield final_output
 
-        results = backend.generate(["test"], MagicMock())
+        mock_engine = MagicMock()
+        mock_engine.generate = fake_generate
+        backend.engine = mock_engine
+
+        results = await asyncio.get_running_loop().run_in_executor(
+            None, backend.generate, ["test"], MagicMock()
+        )
         assert results[0]["metrics"] == {}
 
     @pytest.mark.asyncio
-    async def test_stream_generate_not_implemented(self):
+    async def test_generate_only_uses_finished_output(self):
+        """Intermediate (unfinished) decode-step outputs must be ignored;
+        only the finished one should produce the final text/token count."""
         from vgate.backends.vllm_backend import VLLMBackend
 
         backend = VLLMBackend()
-        with pytest.raises(NotImplementedError):
-            async for _ in backend.stream_generate("test", MagicMock()):
-                pass
+        backend._loop = asyncio.get_running_loop()
+
+        partial = self._make_output("Gen", [1], finished=False)
+        final_output = self._make_output("Generated text", [1, 2, 3, 4, 5], finished=True)
+
+        async def fake_generate(prompt, sampling_params, request_id):
+            yield partial
+            yield final_output
+
+        mock_engine = MagicMock()
+        mock_engine.generate = fake_generate
+        backend.engine = mock_engine
+
+        results = await asyncio.get_running_loop().run_in_executor(
+            None, backend.generate, ["test"], MagicMock()
+        )
+        assert results[0]["text"] == "Generated text"
+        assert results[0]["num_tokens"] == 5
+
+    @pytest.mark.asyncio
+    async def test_stream_generate_yields_incremental_deltas(self):
+        """stream_generate() must yield only the *new* text since the last
+        chunk (vLLM's outputs[0].text is cumulative), not the full text
+        repeated on every step."""
+        from vgate.backends.vllm_backend import VLLMBackend
+
+        backend = VLLMBackend()
+
+        steps = [
+            self._make_output("Hello", [1], finished=False),
+            self._make_output("Hello world", [1, 2], finished=False),
+            self._make_output("Hello world!", [1, 2, 3], finished=True),
+        ]
+
+        async def fake_generate(prompt, sampling_params, request_id):
+            for step in steps:
+                yield step
+
+        mock_engine = MagicMock()
+        mock_engine.generate = fake_generate
+        backend.engine = mock_engine
+
+        chunks = [c async for c in backend.stream_generate("prompt", MagicMock())]
+
+        assert [c["delta"] for c in chunks] == ["Hello", " world", "!"]
+        assert [c["num_tokens"] for c in chunks] == [1, 2, 3]
 
 
 class TestSGLangBackendNormalization:
