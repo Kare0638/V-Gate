@@ -35,6 +35,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = 0.7
     top_p: float = 0.9
     max_tokens: int = 256
+    stream: bool = False
 
 
 class EmbeddingRequest(BaseModel):
@@ -69,6 +70,25 @@ class ChatCompletion(BaseModel):
     model: str
     choices: list[Choice]
     usage: Usage = Field(default_factory=Usage)
+
+
+class ChatCompletionDelta(BaseModel):
+    role: Optional[str] = None
+    content: Optional[str] = None
+
+
+class ChatCompletionChunkChoice(BaseModel):
+    index: int
+    delta: ChatCompletionDelta
+    finish_reason: Optional[str] = None
+
+
+class ChatCompletionChunk(BaseModel):
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: list[ChatCompletionChunkChoice]
 
 
 class EmbeddingData(BaseModel):

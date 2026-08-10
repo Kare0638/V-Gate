@@ -269,13 +269,15 @@ Expected outcome:
 
 ### Phase 2: Streaming And Engine-Native Continuous Batching
 
-**Status: in progress — tasks 1-3, 6 done; task 5 partial; tasks 4, 8, 9 not started.** `stream: true` is supported end-to-end for both the dry-run backend and real vLLM: `POST /v1/chat/completions` returns real SSE (`curl -N` shows incremental chunks, verified against a live GPU) with OpenAI-style delta chunks.
+**Status: in progress — tasks 1-4, 6 done; task 5 partial; tasks 8, 9 not started.** `stream: true` is supported end-to-end for both the dry-run backend and real vLLM: `POST /v1/chat/completions` returns real SSE (`curl -N` shows incremental chunks, verified against a live GPU) with OpenAI-style delta chunks.
+
+Task 4 (client SDK streaming) is done: both `VGate.chat.stream(...)` and `AsyncVGate.chat.stream(...)` consume the server's SSE response and yield OpenAI-shaped `ChatCompletionChunk` objects (`chunk.choices[0].delta.content`), verified against a live dry-run server for both the sync and async paths. Mid-stream failures (a `data: {"error": ...}` event, or a dropped connection) raise immediately rather than being retried, since a retry after tokens have already been yielded would duplicate text.
 
 `VLLMBackend` now runs on `AsyncLLMEngine` instead of the offline `LLM()` class (task 6, done) — a single engine instance backs both `generate()` (the batch-shaped call `RequestBatcher` still uses) and `stream_generate()`, avoiding a second model load / GPU-memory-budget conflict. `generate()` bridges from its calling worker thread to the engine's owning event loop via `asyncio.run_coroutine_threadsafe`. A side effect worth noting: even the non-streaming path now submits each prompt as an independent `engine.generate()` call rather than one sealed `LLM.generate(list, ...)` call, so it already gets real continuous batching from vLLM's own scheduler — ahead of the full `RequestBatcher` redefinition in task 9. `SGLangBackend.stream_generate()` still raises `NotImplementedError` (task 8 not started).
 
 Known, intentional limitation: the streaming path in `main.py` (`_stream_chat_completion`) calls `engine.backend.stream_generate()` directly and bypasses `RequestBatcher` entirely — no cache lookup, no batch-level dedup, no admission control for streamed requests yet. That integration is task 9, not started.
 
-Not yet done: client SDK streaming (task 4), streaming-specific metrics beyond basic completion logging (task 5), the SGLang async backend path (task 8), and redefining `RequestBatcher` (task 9).
+Not yet done: streaming-specific metrics beyond basic completion logging (task 5), the SGLang async backend path (task 8), and redefining `RequestBatcher` (task 9).
 
 Priority: high.
 

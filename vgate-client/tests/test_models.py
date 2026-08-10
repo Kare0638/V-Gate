@@ -16,6 +16,7 @@
 
 from vgate_client.models import (
     ChatCompletion,
+    ChatCompletionChunk,
     ChatCompletionRequest,
     ChatMessage,
     EmbeddingRequest,
@@ -36,6 +37,7 @@ class TestChatCompletionRequest:
         assert req.temperature == 0.7
         assert req.top_p == 0.9
         assert req.max_tokens == 256
+        assert req.stream is False
 
     def test_custom_params(self):
         req = ChatCompletionRequest(
@@ -73,6 +75,41 @@ class TestChatCompletion:
             choices=[],
         )
         assert resp.usage.prompt_tokens == 0
+
+
+class TestChatCompletionChunk:
+    def test_parse_role_chunk(self):
+        chunk = ChatCompletionChunk.model_validate({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 1700000000,
+            "model": "m",
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        })
+        assert chunk.choices[0].delta.role == "assistant"
+        assert chunk.choices[0].delta.content is None
+        assert chunk.choices[0].finish_reason is None
+
+    def test_parse_content_chunk(self):
+        chunk = ChatCompletionChunk.model_validate({
+            "id": "chatcmpl-1",
+            "created": 1700000000,
+            "model": "m",
+            "choices": [{"index": 0, "delta": {"content": "Hi"}, "finish_reason": None}],
+        })
+        assert chunk.choices[0].delta.content == "Hi"
+        assert chunk.object == "chat.completion.chunk"
+
+    def test_parse_finish_chunk(self):
+        chunk = ChatCompletionChunk.model_validate({
+            "id": "chatcmpl-1",
+            "created": 1700000000,
+            "model": "m",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        })
+        assert chunk.choices[0].finish_reason == "stop"
+        assert chunk.choices[0].delta.content is None
+        assert chunk.choices[0].delta.role is None
 
 
 class TestEmbeddingResponse:

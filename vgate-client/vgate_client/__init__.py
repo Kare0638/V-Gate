@@ -45,6 +45,9 @@ from .exceptions import (
 )
 from .models import (
     ChatCompletion,
+    ChatCompletionChunk,
+    ChatCompletionChunkChoice,
+    ChatCompletionDelta,
     ChatMessage,
     Choice,
     EmbeddingData,
@@ -63,6 +66,9 @@ __all__ = [
     "AsyncVGate",
     # Response models
     "ChatCompletion",
+    "ChatCompletionChunk",
+    "ChatCompletionChunkChoice",
+    "ChatCompletionDelta",
     "Choice",
     "ResponseMessage",
     "EmbeddingResponse",

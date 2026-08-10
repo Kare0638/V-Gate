@@ -16,8 +16,9 @@
 
 from __future__ import annotations
 
+import json
 import time
-from typing import Optional, Union
+from typing import AsyncIterator, Iterator, Optional, Union
 
 import httpx
 
@@ -30,6 +31,7 @@ from .exceptions import (
 )
 from .models import (
     ChatCompletion,
+    ChatCompletionChunk,
     ChatCompletionRequest,
     ChatMessage,
     EmbeddingRequest,
@@ -89,6 +91,94 @@ def _raise_for_status(response: httpx.Response) -> None:
     raise VGateError(detail, status_code=status, body=body)
 
 
+_STREAM_DONE = object()  # sentinel: the "data: [DONE]" line was reached
+
+
+def _parse_sse_line(line: str):
+    """Parse one SSE line.
+
+    Returns ``None`` for lines to skip (blank lines, comments, non-``data:``
+    fields), the ``_STREAM_DONE`` sentinel for ``data: [DONE]``, or a parsed
+    ``ChatCompletionChunk`` otherwise. Raises ``ServerError`` if the line
+    carries a mid-stream error event (see main.py's _stream_chat_completion,
+    which can emit `{"error": {...}}` after the 200 response is already
+    flushed).
+    """
+    if not line or not line.startswith("data:"):
+        return None
+    payload = line[len("data:"):].lstrip(" ")
+    if payload == "[DONE]":
+        return _STREAM_DONE
+    data = json.loads(payload)
+    if "error" in data:
+        err = data["error"]
+        raise ServerError(err.get("message", "stream error"), body=data)
+    return ChatCompletionChunk.model_validate(data)
+
+
+class SyncChatStream:
+    """Iterable wrapper around a streaming chat completion.
+
+    Supports plain iteration (``for chunk in client.chat.stream(...)``)
+    exactly like a generator — full exhaustion closes the underlying SSE
+    connection as before. It also supports use as a context manager
+    (``with client.chat.stream(...) as stream:``) so a caller who stops
+    iterating early (e.g. ``break``) can still guarantee the connection is
+    closed deterministically, rather than relying on the generator's
+    ``.close()`` being called explicitly or on GC eventually reclaiming it.
+    """
+
+    def __init__(self, generator: Iterator[ChatCompletionChunk]):
+        self._generator = generator
+
+    def __iter__(self) -> Iterator[ChatCompletionChunk]:
+        return self
+
+    def __next__(self) -> ChatCompletionChunk:
+        return next(self._generator)
+
+    def close(self) -> None:
+        self._generator.close()
+
+    def __enter__(self) -> "SyncChatStream":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+
+class AsyncChatStream:
+    """Async counterpart of ``SyncChatStream``; see its docstring."""
+
+    def __init__(self, generator: AsyncIterator[ChatCompletionChunk]):
+        self._generator = generator
+
+    def __aiter__(self) -> AsyncIterator[ChatCompletionChunk]:
+        return self
+
+    async def __anext__(self) -> ChatCompletionChunk:
+        return await self._generator.__anext__()
+
+    async def aclose(self) -> None:
+        await self._generator.aclose()
+
+    async def __aenter__(self) -> "AsyncChatStream":
+        return self
+
+    async def __aexit__(self, *exc_info) -> None:
+        await self.aclose()
+
+
+def _check_stream_content_type(response: httpx.Response) -> None:
+    content_type = response.headers.get("content-type", "")
+    if "text/event-stream" not in content_type:
+        raise VGateError(
+            f"Expected a text/event-stream response but got Content-Type: "
+            f"{content_type or '<missing>'}",
+            status_code=response.status_code,
+        )
+
+
 def _build_headers(api_key: Optional[str]) -> dict[str, str]:
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if api_key:
@@ -135,6 +225,36 @@ class _SyncChat:
         )
         data = self._client._request("POST", "/v1/chat/completions", json=req.model_dump())
         return ChatCompletion.model_validate(data)
+
+    def stream(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, str]],
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        max_tokens: int = 256,
+    ) -> SyncChatStream:
+        """Create a streaming chat completion.
+
+        Returns a ``SyncChatStream`` yielding ``ChatCompletionChunk`` objects
+        as they arrive over SSE — iterate it directly, or use it as a context
+        manager (``with client.chat.stream(...) as stream:``) to guarantee
+        the connection closes even if you stop iterating early. A failure
+        that happens after the stream has already started (mid-stream error
+        event, connection dropping, or the stream ending without a `[DONE]`
+        event) is not retried — retrying would re-emit text the caller
+        already received.
+        """
+        req = ChatCompletionRequest(
+            model=model,
+            messages=[ChatMessage(**m) for m in messages],
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        return SyncChatStream(self._client._stream_chat(req))
 
 
 class _SyncEmbeddings:
@@ -187,6 +307,34 @@ class _AsyncChat:
         )
         data = await self._client._request("POST", "/v1/chat/completions", json=req.model_dump())
         return ChatCompletion.model_validate(data)
+
+    def stream(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, str]],
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        max_tokens: int = 256,
+    ) -> AsyncChatStream:
+        """Create a streaming chat completion.
+
+        Not itself a coroutine — it returns an ``AsyncChatStream`` immediately
+        so ``async for chunk in client.chat.stream(...)`` works without an
+        extra ``await``, mirroring ``httpx.AsyncClient.stream()``. The
+        returned stream can also be used as an async context manager
+        (``async with client.chat.stream(...) as stream:``) to guarantee the
+        connection closes even if you stop iterating early.
+        """
+        req = ChatCompletionRequest(
+            model=model,
+            messages=[ChatMessage(**m) for m in messages],
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        return AsyncChatStream(self._client._stream_chat(req))
 
 
 class _AsyncEmbeddings:
@@ -278,6 +426,33 @@ class VGate:
 
         # Should not reach here, but just in case
         raise last_exc or VGateError("Request failed after retries")
+
+    def _stream_chat(self, req: ChatCompletionRequest) -> Iterator[ChatCompletionChunk]:
+        """Open an SSE stream and yield parsed chunks. No retry: once bytes
+        have been yielded to the caller, retrying would duplicate text."""
+        try:
+            with self._http.stream(
+                "POST", "/v1/chat/completions", json=req.model_dump()
+            ) as response:
+                if not response.is_success:
+                    response.read()
+                    _raise_for_status(response)
+                _check_stream_content_type(response)
+                saw_done = False
+                for line in response.iter_lines():
+                    parsed = _parse_sse_line(line)
+                    if parsed is _STREAM_DONE:
+                        saw_done = True
+                        break
+                    if parsed is not None:
+                        yield parsed
+                if not saw_done:
+                    raise ServerError(
+                        "Stream ended without a [DONE] event "
+                        "(connection closed early or the server crashed mid-stream)"
+                    )
+        except httpx.ConnectError as exc:
+            raise ConnectionError(f"Cannot connect to {self.base_url}: {exc}") from exc
 
     # -- convenience endpoints --------------------------------------------
 
@@ -381,6 +556,33 @@ class AsyncVGate:
             _raise_for_status(response)
 
         raise VGateError("Request failed after retries")
+
+    async def _stream_chat(self, req: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
+        """Open an SSE stream and yield parsed chunks. No retry: once bytes
+        have been yielded to the caller, retrying would duplicate text."""
+        try:
+            async with self._http.stream(
+                "POST", "/v1/chat/completions", json=req.model_dump()
+            ) as response:
+                if not response.is_success:
+                    await response.aread()
+                    _raise_for_status(response)
+                _check_stream_content_type(response)
+                saw_done = False
+                async for line in response.aiter_lines():
+                    parsed = _parse_sse_line(line)
+                    if parsed is _STREAM_DONE:
+                        saw_done = True
+                        break
+                    if parsed is not None:
+                        yield parsed
+                if not saw_done:
+                    raise ServerError(
+                        "Stream ended without a [DONE] event "
+                        "(connection closed early or the server crashed mid-stream)"
+                    )
+        except httpx.ConnectError as exc:
+            raise ConnectionError(f"Cannot connect to {self.base_url}: {exc}") from exc
 
     # -- convenience endpoints --------------------------------------------
 
