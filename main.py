@@ -28,6 +28,8 @@ from vgate.batcher import RequestBatcher
 from vgate.logging_config import setup_logging, get_logger
 from vgate.metrics import (
     REQUEST_COUNT, REQUEST_LATENCY, REQUEST_IN_PROGRESS,
+    TOKENS_GENERATED, INFERENCE_ERRORS,
+    STREAM_TTFT, STREAM_TPOT, STREAM_DURATION, STREAM_TOKENS, STREAM_REQUESTS,
     init_app_info
 )
 from vgate.security import SecurityMiddleware
@@ -220,6 +222,7 @@ async def _stream_chat_completion(prompt: str, request: ChatCompletionRequest):
     """
     completion_id = "chatcmpl-" + str(uuid.uuid4())[:8]
     created = int(time.time())
+    started_at = time.monotonic()
 
     def _chunk(delta: dict, finish_reason: str = None) -> str:
         payload = {
@@ -231,26 +234,71 @@ async def _stream_chat_completion(prompt: str, request: ChatCompletionRequest):
         }
         return f"data: {json.dumps(payload)}\n\n"
 
-    yield _chunk({"role": "assistant"})
+    # Token-weighted TPOT bookkeeping: a single delta can carry more than one
+    # token (see vllm_backend.py's stream_generate), so averaging the time
+    # between chunks would measure time-per-chunk, not time-per-token.
+    ttft_recorded = False
+    prev_num_tokens = 0
+    prev_delta_time = started_at
+    decode_time = 0.0
+    decode_tokens = 0
+    final_num_tokens = 0
+    # Pessimistic default: covers a disconnect before/during the very first
+    # (role) yield, which is now inside this try block so it's caught below
+    # instead of propagating uncaught with nothing recorded.
+    status = "cancelled"
+
     try:
+        yield _chunk({"role": "assistant"})
         sampling_params = engine.backend.create_sampling_params(
             temperature=request.temperature, top_p=request.top_p, max_tokens=request.max_tokens
         )
-        num_tokens = 0
         async for piece in engine.backend.stream_generate(prompt, sampling_params):
-            if piece.get("delta"):
-                yield _chunk({"content": piece["delta"]})
-            num_tokens = piece.get("num_tokens", num_tokens)
+            delta = piece.get("delta")
+            num_tokens = piece.get("num_tokens", prev_num_tokens)
+            now = time.monotonic()
+            # Set before the yield below: if a disconnect interrupts that
+            # yield, the chunk was still sent to the client, so its tokens
+            # must already be reflected in final_num_tokens by then.
+            final_num_tokens = num_tokens
+            if delta:
+                if not ttft_recorded:
+                    STREAM_TTFT.observe(now - started_at)
+                    ttft_recorded = True
+                else:
+                    token_increment = num_tokens - prev_num_tokens
+                    interval = now - prev_delta_time
+                    if token_increment > 0:
+                        decode_time += interval
+                        decode_tokens += token_increment
+                prev_num_tokens = num_tokens
+                prev_delta_time = now
+                yield _chunk({"content": delta})
         yield _chunk({}, finish_reason="stop")
+        status = "completed"
+        if decode_tokens > 0:
+            STREAM_TPOT.observe(decode_time / decode_tokens)
+        STREAM_DURATION.observe(time.monotonic() - started_at)
         app_logger.info(
             "Streamed chat completion",
-            extra={"extra_data": {"completion_id": completion_id, "tokens": num_tokens}}
+            extra={"extra_data": {"completion_id": completion_id, "tokens": final_num_tokens}}
         )
+    except (GeneratorExit, asyncio.CancelledError):
+        # Client disconnected or the request was cancelled — not a backend
+        # failure, so it isn't counted as an inference error.
+        status = "cancelled"
+        raise
     except Exception as e:
+        status = "error"
+        INFERENCE_ERRORS.labels(error_type=type(e).__name__).inc()
         # The 200 OK + SSE headers are already flushed by this point, so an
         # HTTP error status is no longer possible; surface the failure as an
         # SSE error event instead (mirrors how OpenAI's API reports
-        # mid-stream failures).
+        # mid-stream failures). If the client disconnects while this very
+        # yield is in flight, GeneratorExit propagates past this except
+        # clause (it doesn't match Exception) straight to finally below —
+        # status stays "error" rather than "cancelled", an acceptable
+        # tie-break since a real backend failure already happened first.
         app_logger.error(
             "Streaming chat completion error",
             extra={"extra_data": {
@@ -261,6 +309,19 @@ async def _stream_chat_completion(prompt: str, request: ChatCompletionRequest):
         )
         yield f"data: {json.dumps({'error': {'message': str(e), 'type': type(e).__name__}})}\n\n"
     finally:
+        # Never yield here: yielding while a GeneratorExit raised by any of
+        # the yields above is still propagating (i.e. status == "cancelled",
+        # or a disconnect during the error-event yield) raises "RuntimeError:
+        # async generator ignored GeneratorExit". Metrics only.
+        STREAM_REQUESTS.labels(status=status).inc()
+        if final_num_tokens > 0:
+            STREAM_TOKENS.inc(final_num_tokens)
+            TOKENS_GENERATED.inc(final_num_tokens)
+
+    # Only reached when the try block above completed without an exception
+    # still propagating (i.e. not on the cancelled path, and not if a
+    # disconnect interrupted the error-event yield above).
+    if status != "cancelled":
         yield "data: [DONE]\n\n"
 
 
