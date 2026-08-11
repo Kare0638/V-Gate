@@ -5,38 +5,108 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
 
-**V-Gate** is a high-performance AI model serving gateway with pluggable inference backends. It currently supports [vLLM](https://github.com/vllm-project/vllm) and [SGLang](https://github.com/sgl-project/sglang), while exposing a unified OpenAI-compatible API with enterprise-grade features including dynamic micro-batching, result caching, observability, and security.
+**V-Gate** is an AI infrastructure project for real-time model serving and, in its next stage, distributed multimedia data processing. Today it provides an OpenAI-shaped Chat Completions subset with streaming, dynamic micro-batching, result caching, observability, security, benchmarking, and container/Kubernetes deployment artifacts. The [vLLM](https://github.com/vllm-project/vllm) path has been exercised against a live GPU; the [SGLang](https://github.com/sgl-project/sglang) path is currently a unit-tested non-streaming adapter and has not yet been validated against a live SGLang engine.
 
-Optimized for memory-constrained environments (e.g., RTX 3060/4060).
+The project is evolving from a single-node inference gateway into a two-plane platform:
+
+- an **online serving plane** for low-latency inference (currently text generation, with multimodal requests planned);
+- an **asynchronous batch compute plane** for Daft multimedia pipelines running locally with the native runner or distributed through Ray.
+
+The text-serving baseline of the online plane is implemented. Multimodal requests and the batch compute plane are planned engineering milestones and are not available in the current release. Live-GPU validation has been performed on one NVIDIA GeForce RTX 3060 Laptop GPU with 6GB VRAM; no RTX 4060 or multi-GPU validation is claimed.
+
+## Validated Evidence
+
+The evidence below is a measured snapshot of the serving plane, not evidence for the planned multimedia batch plane. The vLLM run predates parts of the current async path and is retained as a directional baseline pending a refreshed repeat-run report.
+
+| Path | Evidence | Scope |
+|------|----------|-------|
+| **vLLM live GPU** | [`Qwen/Qwen2.5-1.5B-Instruct-AWQ`](benchmarks/results/vllm_baseline.md) via vLLM 0.26 on an RTX 3060 Laptop GPU: **294.09 generated tokens/s**, **6.47 requests/s**, **1.5264s p95 latency** | 40 requests at concurrency 8, from one small benchmark run; a directional baseline, not a capacity claim |
+| **SGLang adapter** | Non-streaming adapter behavior is covered by [`tests/test_backends.py`](tests/test_backends.py) | Unit tests use stubs; no live-engine or live-GPU SGLang benchmark is claimed |
 
 ---
 
 ## Features
 
-| Feature | Description |
-|---------|-------------|
-| **OpenAI-Compatible API** | OpenAI-style API surface (`/v1/chat/completions`, `/v1/embeddings`) |
-| **Dynamic Micro-Batching** | Aggregate queued requests into static backend batches for improved throughput |
-| **Result Caching** | LRU cache with batch-level deduplication |
-| **Multi-Backend Inference** | Switch backend with `model.engine_type` (`vllm` / `sglang`) |
-| **Built-in Benchmarking** | Compare backends with CLI tool and `/v1/benchmark` API |
-| **Prometheus Metrics** | Full observability with `/metrics` endpoint |
-| **Structured Logging** | JSON-formatted logs for production debugging |
-| **API Key Authentication** | Bearer token validation with per-key rate limits |
-| **Rate Limiting** | Sliding window algorithm to prevent abuse |
-| **Configuration as Code** | YAML configuration with environment variable overrides |
-| **Docker Ready** | Multi-stage build with GPU and CPU targets |
-| **Python Client SDK** | `pip install` ready client with sync/async support |
+| Feature | Status | Description |
+|---------|--------|-------------|
+| **OpenAI-Shaped Chat API** | Partial | Chat Completions request/response subset (`/v1/chat/completions`); not claimed as full drop-in OpenAI compatibility |
+| **Embeddings Endpoint** | Partial | `/v1/embeddings` currently returns a mock 1536-dimensional vector for API/client testing |
+| **Streaming Inference** | Partial | SSE streaming for dry-run and real vLLM; SGLang streaming is not implemented yet |
+| **Dynamic Micro-Batching** | Implemented | Aggregate queued non-streaming requests into static gateway batches |
+| **Engine-Native Scheduling** | Partial | vLLM uses `AsyncLLMEngine`; the gateway batcher has not yet been redefined as unified admission control |
+| **Result Caching** | Implemented | In-memory LRU cache with batch-level deduplication for non-streaming requests |
+| **Backend Adapters** | Partial | Select vLLM or SGLang with `model.engine_type`; vLLM is live-GPU validated, while SGLang is currently unit-tested and non-streaming |
+| **Built-in Benchmarking** | Implemented | Concurrent load tools, report generation, and `/v1/benchmark` |
+| **Observability** | Implemented | Prometheus metrics, structured logs, and optional OpenTelemetry tracing |
+| **Security** | Implemented | Bearer API keys and per-key sliding-window rate limits |
+| **Configuration as Code** | Implemented | YAML configuration with environment-variable overrides |
+| **Container Deployment** | Implemented | Docker CPU/GPU targets, Compose stack, and baseline Kubernetes manifests |
+| **Python Client SDK** | Implemented | Sync/async clients with deterministic streaming cleanup |
+| **Multimedia Job API** | Planned | Submit, inspect, and cancel asynchronous multimedia jobs |
+| **Ray Jobs Integration** | Planned | Let the independent job worker submit and reconcile batch entrypoints on an external Ray cluster |
+| **Daft Pipelines** | Planned | Native local execution and a Daft Ray Runner for distributed video processing and Parquet output |
 
-Note: `/v1/embeddings` currently returns a mock 1536-dimensional embedding for MVP/testing workflows. A real embedding backend is planned but not implemented yet.
+---
+
+## Architecture
+
+V-Gate keeps latency-sensitive online inference separate from asynchronous data processing. Solid arrows below represent the current serving path; dashed arrows represent the planned batch compute path.
+
+```mermaid
+flowchart LR
+    Client[Client / SDK] --> API[V-Gate API]
+
+    API --> Serving[Online Serving Plane]
+    Serving --> NonStream[Non-streaming Path]
+    Serving --> Stream[Direct SSE Path / vLLM or dry-run]
+    NonStream --> Batcher[Batching / Cache]
+    Batcher --> VLLM[vLLM]
+    Batcher --> SGLang[SGLang]
+    Stream --> VLLM
+
+    API -. planned .-> Jobs[Multimedia Job Controller]
+    Jobs -. queued job .-> Worker[Job Worker]
+    Worker -. local .-> Native[Daft Pipeline / Native Runner]
+    Worker -. distributed submit .-> RayJobs[Ray Jobs API]
+    RayJobs -. launch .-> RayDaft[Daft Pipeline / Ray Runner]
+    Native -. CPU operations .-> CPU[Decode / Sample / Transform]
+    Native -. GPU operation .-> GPU["Daft @daft.cls GPU UDF"]
+    RayDaft -. CPU operations .-> CPU
+    RayDaft -. GPU operation .-> GPU
+    GPU -. planned .-> Adapter[Batch Multimodal Adapter]
+    Adapter -. model execution .-> BatchVLLM[vLLM Multimodal Engine]
+    Native -. output .-> Store[Object Storage / Parquet]
+    RayDaft -. output .-> Store
+
+    Serving --> Obs[Metrics / Logs / Traces]
+    Jobs -. planned .-> Obs
+```
+
+The planned batch path will live in this repository but run through a separate job-worker process. Local jobs will use Daft's native runner; distributed jobs will be submitted through the Ray Jobs API and run the same pipeline with Daft's Ray Runner. The FastAPI gateway will not start a Ray cluster, and Daft will not sit on the latency-sensitive chat/streaming path.
+
+### Target Multimedia Workflow
+
+The first end-to-end batch workload is intentionally narrow and measurable:
+
+```text
+video manifest or object-store URI
+  -> job worker
+  -> local: Daft native runner | distributed: Ray Jobs -> Daft Ray Runner
+  -> Daft CPU operations: decode, key-frame sampling, preprocessing
+  -> stateful @daft.cls GPU UDF
+  -> planned batch-only multimodal adapter -> vLLM inference
+  -> aggregation, job metadata, and Parquet/JSON output
+```
+
+Planned acceptance evidence includes local-vs-Ray and 1-vs-N CPU-worker benchmarks, task retry/cancellation tests, injected worker failures, and per-stage queue time, latency, retry, and CPU/GPU-time metrics. Real-GPU batch evidence is planned on rented 2x A100 hardware rather than the 6GB development device; GPU scaling claims will stop at a measured 1-vs-2 comparison and will not be extrapolated to larger clusters.
 
 ---
 
 ## Documentation
 
-- [Roadmap](ROADMAP.md): staged engineering plan from the current gateway to reliable distributed inference serving.
-- [Documentation index](docs/README.md): public docs and status conventions.
-- [Advanced roadmap](docs/design/ADVANCED_ROADMAP.md): superseded by ROADMAP.md; kept for historical reference on reliability, scaling, and governance ideas.
+- [Roadmap](ROADMAP.md): detailed roadmap for the **online serving track** — correctness, continuous batching, reliability, multi-worker routing, Kubernetes, and performance work, with per-phase acceptance criteria. Its `Phase 0-8` numbering is internal to that track and is not a cross-track priority order; the [Roadmap](#roadmap) section below is the authoritative ordering across both planes.
+- [Batch compute plane design](docs/design/BATCH_PLANE.md): design proposal and ordered task breakdown for the Priority 1 multimedia batch compute plane, including the Daft native/Ray runner split, job-worker boundary, and persistent job-store design.
+- [Documentation conventions](docs/README.md): meaning of the Implemented / Partial / Planned / Design proposal status labels used across these docs.
 - [V2 architecture proposal](docs/design/V2_ARCHITECTURE_PROPOSAL.md): design proposal for future C++/CUDA data-plane work.
 - [Containerization test report](docs/reports/CONTAINERIZATION_TEST_REPORT.md): Docker validation notes.
 
@@ -46,7 +116,7 @@ Note: `/v1/embeddings` currently returns a mock 1536-dimensional embedding for M
 
 ### Option 1: Docker (Recommended)
 
-**GPU Mode (Production)**
+**Real GPU Mode**
 ```bash
 # Build and run with GPU support
 docker compose up vgate
@@ -287,7 +357,7 @@ PYTHONPATH=. python benchmarks/run_report.py --requests 60 --concurrency 8
 
 [`benchmarks/results/baseline.md`](benchmarks/results/baseline.md) is a **dry-run baseline** (no GPU) — the mock backend uses a synthetic per-call delay (`VGATE_DRYRUN_SIMULATED_LATENCY_MS`) so batching has something real to amortize, but it does not measure actual model throughput.
 
-[`benchmarks/results/vllm_baseline.md`](benchmarks/results/vllm_baseline.md) is a **real GPU baseline**: `Qwen/Qwen2.5-1.5B-Instruct-AWQ` on an RTX 3060 Laptop GPU (6GB VRAM) via vLLM 0.26. Producing it surfaced two real bugs (now fixed): vLLM disables pinned memory by default under WSL2 even on kernels that support it (crashes at startup unless `VLLM_WSL2_ENABLE_PIN_MEMORY=1`), and `VLLMBackend` was reading vLLM metrics fields that had been renamed upstream combined with an `LLM()` default that disables stats collection — so TTFT/TPOT were silently always 0 for the real backend before this fix. See the report for the full data and a known `max_batch_size` batching-cap gap it also surfaced.
+[`benchmarks/results/vllm_baseline.md`](benchmarks/results/vllm_baseline.md) is a **real GPU baseline**: `Qwen/Qwen2.5-1.5B-Instruct-AWQ` on an RTX 3060 Laptop GPU (6GB VRAM) via vLLM 0.26. Producing it surfaced three integration gaps that are now fixed: vLLM disabled pinned memory by default under WSL2 even on a kernel that supported it; `VLLMBackend` read metrics fields that had been renamed upstream while an `LLM()` default disabled stats collection, causing silent zero TTFT/TPOT values; and `RequestBatcher` treated `max_batch_size` only as a trigger and drained the entire queue. The checked-in report preserves the original run and its sample-size caveats; the batching cap described there is a historical gap, not the current behavior.
 
 ---
 
@@ -380,10 +450,12 @@ VGATE_MODEL__ENGINE_TYPE=sglang python main.py
 
 ## Docker Images
 
-| Image | Base | Size | Use Case |
-|-------|------|------|----------|
-| `vgate:latest` | `vllm/vllm-openai:latest` | ~9GB | Production GPU inference |
-| `vgate:cpu` | `python:3.12-slim` | ~220MB | CI/CD, testing, dry-run |
+| Image | Base | Use Case |
+|-------|------|----------|
+| `vgate:latest` | `vllm/vllm-openai:latest` | Real GPU inference |
+| `vgate:cpu` | `python:3.12-slim` | CI/CD, testing, dry-run |
+
+The current GPU Dockerfile follows the upstream `latest` tag, while the checked-in GPU baseline used vLLM 0.26. A rebuild is therefore not guaranteed to reproduce that historical report; benchmarked release images must pin an exact tag or digest and record it in the generated report.
 
 ### Build Commands
 
@@ -413,9 +485,9 @@ docker build --target vgate-cpu -t vgate:cpu .
 | `vgate_cache_hits_total` | Counter | Cache hits |
 | `vgate_cache_misses_total` | Counter | Cache misses |
 
-### Grafana Dashboard
+### Grafana Setup
 
-After starting the monitoring stack, import the V-Gate dashboard in Grafana:
+After starting the monitoring stack, configure Grafana to visualize V-Gate metrics:
 1. Navigate to http://localhost:3000
 2. Login with `admin/admin`
 3. Add Prometheus data source: `http://prometheus:9090`
@@ -449,50 +521,77 @@ curl -H "Authorization: Bearer sk-vgate-prod-xxxxx" \
 
 ```
 V-Gate/
-├── main.py                 # FastAPI application entry point
-├── config.yaml             # Default configuration
-├── Dockerfile              # Multi-stage Docker build
-├── docker-compose.yml      # Service orchestration
-├── requirements.txt        # Python dependencies
-├── ROADMAP.md              # Public engineering roadmap
-├── benchmarks/
-│   ├── benchmark.py         # Single-engine benchmark entry
-│   └── bench_compare.py     # Multi-backend benchmark comparison CLI
-├── docs/
-│   ├── README.md            # Documentation index
-│   ├── design/              # Architecture and roadmap proposals
-│   └── reports/             # Validation and test reports
+├── main.py                     # FastAPI application entry point
+├── demo.py                     # Minimal end-to-end usage demo
+├── config.yaml                 # Default configuration
+├── Dockerfile                  # Multi-stage Docker build (GPU/CPU targets)
+├── docker-compose.yml          # Service orchestration
+├── requirements.txt            # Python dependencies
+├── ROADMAP.md                  # Detailed serving-track roadmap
+├── DEVLOG.md                   # Development log
+├── .github/workflows/
+│   └── tests.yml               # CI: dry-run server suite + client SDK suite
 ├── vgate/
 │   ├── __init__.py
-│   ├── engine.py           # Backend factory + engine wrapper
-│   ├── batcher.py          # Request batching logic
-│   ├── backends/
-│   │   ├── base.py         # Inference backend protocol + dry-run backend
-│   │   ├── vllm_backend.py # vLLM backend adapter
-│   │   └── sglang_backend.py # SGLang backend adapter
-│   ├── cache.py            # LRU result cache
-│   ├── config.py           # Configuration management
-│   ├── logging_config.py   # Structured logging
-│   ├── metrics.py          # Prometheus metrics
-│   └── security.py         # Authentication & rate limiting
+│   ├── engine.py               # Backend factory + engine wrapper
+│   ├── batcher.py              # Request batching, dedup, and queue metrics
+│   ├── cache.py                # LRU result cache
+│   ├── config.py               # Configuration management
+│   ├── logging_config.py       # Structured logging
+│   ├── metrics.py              # Prometheus metrics
+│   ├── security.py             # Authentication & rate limiting
+│   ├── tracing.py              # OpenTelemetry tracing setup
+│   └── backends/
+│       ├── base.py             # Inference backend protocol + dry-run backend
+│       ├── vllm_backend.py     # vLLM adapter (AsyncLLMEngine)
+│       └── sglang_backend.py   # SGLang adapter (non-streaming)
 ├── vgate-client/               # Python Client SDK
 │   ├── pyproject.toml
 │   ├── vgate_client/
 │   │   ├── __init__.py
-│   │   ├── client.py           # Sync & async clients
+│   │   ├── client.py           # Sync & async clients (incl. streaming)
 │   │   ├── models.py           # Request/response models
 │   │   └── exceptions.py       # Error classes
 │   └── tests/
+├── benchmarks/
+│   ├── benchmark.py            # Single-engine benchmark entry
+│   ├── bench_compare.py        # Multi-backend benchmark comparison CLI
+│   ├── bench_load.py           # Concurrent HTTP load generator (+ --stream)
+│   ├── run_report.py           # Multi-scenario report orchestrator
+│   ├── _run_scenario_cli.py    # Per-scenario subprocess driver
+│   ├── _aggregate_results.py   # Result aggregation helpers
+│   └── results/
+│       ├── baseline.md         # Dry-run baseline report
+│       └── vllm_baseline.md    # Real GPU (RTX 3060) baseline report
+├── k8s/
+│   ├── base/                   # namespace, deployment, service, HPA, PVC,
+│   │                           #   configmap, secret, servicemonitor
+│   └── overlays/
+│       ├── cpu/                # CPU / dry-run overlay
+│       └── gpu/                # GPU overlay (+ HPA patch)
 ├── monitoring/
-│   └── prometheus.yml      # Prometheus configuration
+│   └── prometheus.yml          # Prometheus configuration
+├── scripts/
+│   └── test_concurrent.py      # Ad-hoc concurrency smoke script
+├── docs/
+│   ├── README.md               # Documentation index
+│   ├── design/                 # Architecture and roadmap proposals
+│   └── reports/                # Validation and test reports
 └── tests/
+    ├── conftest.py             # Shared fixtures + OTel/SGLang stubs
     ├── test_backends.py
-    ├── test_benchmark.py
     ├── test_batcher.py
+    ├── test_batching.py
+    ├── test_bench_load.py
+    ├── test_benchmark.py
     ├── test_cache.py
+    ├── test_cache_log.py
+    ├── test_chat_completions.py
     ├── test_config.py
     ├── test_observability.py
-    └── test_security.py
+    ├── test_security.py
+    ├── test_streaming.py
+    └── test_tracing.py
 ```
 
 ---
@@ -535,21 +634,49 @@ ruff check .
 
 ## Roadmap
 
-- [x] **Phase 1**: Core MVP - Unified API Gateway
-- [x] **Phase 2**: Performance Optimization
-  - [x] 2.1 Dynamic Micro-Batching
-  - [x] 2.2 Result Caching
-  - [ ] 2.3 Multi-Worker Load Balancing
-- [x] **Phase 3**: Production-Grade Features
-  - [x] 3.1 Observability (Logging + Metrics)
-  - [x] 3.2 Configuration as Code
-  - [x] 3.3 Security & Access Control
-- [x] **Phase 4**: Ecosystem & Deployment
-  - [x] 4.1 Containerization (Docker)
-  - [x] 4.2 Python Client SDK
-  - [x] 4.3 Kubernetes manifests
+### Current Serving Baseline
 
-See [ROADMAP.md](ROADMAP.md) for the next engineering milestones, including streaming with engine-native continuous batching, benchmark-gated sqlite L2 cache, backpressure, multi-worker routing, and low-level performance work.
+- [x] OpenAI-shaped Chat Completions subset and backend abstraction
+- [x] vLLM `AsyncLLMEngine` integration and real SSE streaming
+- [x] Unit-tested SGLang non-streaming backend adapter (live-engine validation pending)
+- [x] Dynamic micro-batching, request deduplication, and RAM result cache
+- [x] Prometheus metrics, structured logging, and OpenTelemetry integration
+- [x] Concurrent load tools and checked-in dry-run/real-GPU benchmark reports
+- [x] Docker, baseline Kubernetes manifests, CI, and sync/async Python SDK
+
+The priority order below is authoritative across both planes. The batch compute plane is sequenced first because it is architecturally independent of the serving-side work: a separate job worker runs Daft locally or submits the pipeline through Ray Jobs, so it does not depend on splitting the gateway into gateway + inference workers (Priority 2). [ROADMAP.md](ROADMAP.md) holds the detailed acceptance criteria for the Priority 2/3 serving items; its internal `Phase` numbering does not imply execution order relative to Priority 1. [docs/design/BATCH_PLANE.md](docs/design/BATCH_PLANE.md) expands Priority 1 into acceptance criteria and implementation details.
+
+### Priority 1: Multimedia Batch Compute Plane
+
+- [ ] Run a technical spike to pin the batch compatibility matrix, validate Daft's native/Ray runner behavior, and select a multimodal model on the rented benchmark hardware
+- [ ] Build a Daft-native vertical slice: manifest ingestion, validation, frame sampling, fake captioning, and Parquet output
+- [ ] Add a persistent SQLite Job API and independent job worker with submit/status/cancel lifecycle and idempotent job IDs
+- [ ] Submit the same pipeline through Ray Jobs with Daft's Ray Runner and explicit CPU/GPU resource requirements
+- [ ] Add a stateful `@daft.cls(gpus=1)` UDF backed by a batch-only vLLM multimodal adapter, with a batch-size sweep and a 1-vs-2 GPU measurement
+- [ ] Add retry, cancellation, checkpointing, dead-letter output, failure injection, and local-vs-Ray / 1-vs-N CPU-worker benchmarks with per-stage CPU/GPU-time metrics
+
+### Priority 2: Serving Reliability
+
+- [ ] Unify streaming and non-streaming admission control
+- [ ] Add bounded queues, deadlines, stable overload responses, and backend abort on cancellation
+- [ ] Split gateway and inference workers; add discovery, health-aware routing, circuit breakers, and recovery
+- [ ] Compare 1-worker and N-worker throughput, tail latency, and behavior under injected failures
+
+### Priority 3: Heterogeneous Kubernetes Deployment
+
+- [ ] Deploy the gateway/job API, job worker, Ray head, CPU workers, and GPU workers as separate components
+- [ ] Replace the single-host SQLite job store with a networked store before splitting the control plane across pods
+- [ ] Add GPU node placement and independent CPU/GPU worker scaling
+- [ ] Scale on pending resource demand and queue/inflight signals instead of CPU utilization alone
+- [ ] Add worker-down, overload, and tail-latency alerts plus an operational runbook
+
+### Optional Follow-ups
+
+- [ ] Evaluate vLLM-Omni as an isolated backend for heterogeneous image/audio/video outputs
+- [ ] Add model/operator version management and canary rollout only after the core execution path is stable
+- [ ] Pursue C++/CUDA optimization only when profiling identifies a measured bottleneck
+
+See [ROADMAP.md](ROADMAP.md) for the detailed serving milestones and acceptance criteria. Planned items above describe intended work and must not be read as current functionality.
 
 ---
 
@@ -558,7 +685,7 @@ See [ROADMAP.md](ROADMAP.md) for the next engineering milestones, including stre
 1. **License**: This project is licensed under the Apache License 2.0.
 2. **Model Terms**: V-Gate is an inference server. Users must separately adhere to the license terms of the underlying models (e.g., Qwen, LLaMA).
 3. **Content Responsibility**: The author of V-Gate is NOT responsible for any content generated using this software. Users are fully responsible for the outputs and must ensure compliance with local safety laws and ethical guidelines.
-4. **No Warranty**: This software is provided "as is", optimized for RTX 3060; use on other hardware is at your own risk.
+4. **No Warranty**: This software is provided "as is". Live-GPU validation is currently limited to an RTX 3060 Laptop GPU with 6GB VRAM; other hardware has not been validated.
 
 See the [LICENSE](LICENSE) file for full license text.
 
