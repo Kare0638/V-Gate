@@ -1,6 +1,6 @@
 # V-Gate Online Serving Roadmap
 
-> **Scope:** this document covers the **online serving plane** only. V-Gate is now positioned as a two-plane AI infrastructure project — an online serving plane and an asynchronous multimedia batch compute plane (Ray/Daft). The batch plane is specified in [README.md](README.md) and is not tracked here yet.
+> **Scope:** this document covers the **online serving plane** only. V-Gate is now positioned as a two-plane AI infrastructure project — an online serving plane and an asynchronous multimedia batch compute plane (Ray/Daft). The batch plane has its own [design and task breakdown](docs/design/BATCH_PLANE.md).
 >
 > **Priority:** the `Phase 0-8` numbering below is internal to the serving track and does **not** express priority relative to the batch plane. [README.md](README.md)'s Roadmap section holds the authoritative ordering across both planes, where the batch compute plane is Priority 1 and the remaining serving work (Phase 2 task 9, Phase 3, Phase 4) is Priority 2.
 >
@@ -30,7 +30,7 @@ Current gaps:
 - OpenAI API compatibility is still shallow. Streaming (`stream: true`, SSE) now works end-to-end for the dry-run backend and real vLLM (verified on GPU); SGLang still raises a clear `NotImplementedError` until its async engine path lands (Phase 2 task 8).
 - `RequestBatcher` still forms a static, sealed Python-side batch per window (queue drain, `max_batch_size`/`max_wait_time_ms`) before handing prompts to the backend — new requests still can't join an already-formed batch at that layer. Below that layer, `VLLMBackend` now submits each prompt as an independent `AsyncLLMEngine.generate()` call, so vLLM's own scheduler does get to interleave/continuously-batch them at the GPU level even though the Python-side batch above it is still static. Full task 9 (redefine `RequestBatcher` as dedup/admission/fan-out, not batch construction) is not done.
 - The runtime is still a single gateway with a single local backend, not real multi-worker serving.
-- Benchmark tooling exists, but systematic benchmark reports and analysis are missing.
+- Dry-run and single-GPU vLLM reports are checked in, but they predate parts of the current async serving path. A refreshed streaming baseline, repeat-run variance analysis, and 1-vs-N-worker evidence are still missing.
 - Cache is RAM-only. There is no persistent local disk cache layer, and cache value depends on process lifetime. This is an intentional, benchmark-gated decision (Phase 1.5), not an oversight — current traffic shows no L1 eviction pressure.
 - Backpressure, request timeout, circuit breaking, and worker failure handling are incomplete.
 - The embedding endpoint is currently a mock MVP implementation.
@@ -114,7 +114,7 @@ Completion criteria:
 
 ## 3. Recommended Implementation Order
 
-This ordering applies **within the serving track**. It is not the project's execution order: per [README.md](README.md), the multimedia batch compute plane is Priority 1 and runs ahead of the remaining serving phases, because it deploys as separate processes and draws its worker pool and task scheduling from Ray rather than from the gateway/worker split in Phase 4.
+This ordering applies **within the serving track**. It is not the project's execution order: per [README.md](README.md), the multimedia batch compute plane is Priority 1 and runs ahead of the remaining serving phases. It has a separate job worker and uses Ray Jobs plus Daft's native/Ray runners, so it does not depend on the online gateway/worker split in Phase 4. See the [batch-plane design](docs/design/BATCH_PLANE.md) for its own dependency order.
 
 ### Phase 0: Credibility Fixes
 
@@ -624,7 +624,7 @@ Expected outcome:
 
 ## 4. Suggested Timeline
 
-This week-by-week plan was written for the serving track before the two-plane repositioning, and its later weeks are therefore stale as a calendar: Weeks 1-3 are done, but Week 4 onward now sits behind the Priority 1 batch compute plane in [README.md](README.md). Read it as relative effort and dependency order within the serving track, not as the project schedule.
+This week-by-week plan was written for the serving track before the two-plane repositioning, and its later weeks are therefore stale as a calendar: Weeks 1-3 are done, but Week 4 onward now sits behind the Priority 1 [batch compute plane](docs/design/BATCH_PLANE.md). Read it as relative effort and dependency order within the serving track, not as the project schedule.
 
 ### Week 1: Credibility Fixes
 
@@ -806,7 +806,7 @@ Reason: these tasks are expensive and do not solve the current system's most imp
 
 ## 8. Final Direction
 
-If this roadmap is followed (for the serving plane — the batch compute plane in [README.md](README.md) proceeds in parallel and currently holds Priority 1):
+If this roadmap is followed (for the serving plane — the [batch compute plane](docs/design/BATCH_PLANE.md) currently holds project Priority 1 and is scheduled ahead of the remaining serving phases):
 
 - Phase 0-1 produce a credible single-node AI gateway.
 - Phase 1.5 produces a measured sqlite L2 cache decision, not necessarily an implementation.
