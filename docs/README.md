@@ -1,20 +1,13 @@
 # V-Gate Documentation
 
-This directory contains public engineering documentation for V-Gate.
-
-## Core Documents
-
-- [Project roadmap](../ROADMAP.md): staged engineering plan from the current single-node gateway toward reliable and distributed inference serving.
-- [Advanced roadmap](design/ADVANCED_ROADMAP.md): superseded by [ROADMAP.md](../ROADMAP.md); kept for historical reference only.
-- [V2 architecture proposal](design/V2_ARCHITECTURE_PROPOSAL.md): design proposal for a Python control plane with C++/CUDA data-plane components.
-- [Containerization test report](reports/CONTAINERIZATION_TEST_REPORT.md): Docker and containerization validation notes.
+This directory holds long-form design proposals and validation reports. The [project README](../README.md) is the entry point and links to every document worth reading; the [online serving roadmap](../ROADMAP.md) holds the staged engineering plan for the serving plane.
 
 ## Status Conventions
 
-Public design documents use these meanings:
+Documents in this repository use these status labels:
 
 - **Implemented**: present in the current codebase and covered by tests or runnable configuration.
-- **In progress**: partially implemented or actively being integrated.
+- **Partial**: implemented for some backends or paths but not all; the gaps are stated explicitly.
 - **Planned**: intended roadmap item without a complete implementation.
 - **Design proposal**: exploratory architecture that should not be read as current runtime behavior.
 
