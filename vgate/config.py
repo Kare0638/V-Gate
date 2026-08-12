@@ -53,6 +53,13 @@ class WorkerConfig(BaseModel):
     # when the first request arrives.
     timeout_seconds: float = 120.0
     connect_timeout_seconds: float = 5.0
+    # Health probing. Thresholds above 1 keep a single blip from taking a
+    # worker out of rotation, and require sustained recovery before it is
+    # trusted again.
+    health_check_interval_seconds: float = 5.0
+    health_check_timeout_seconds: float = 2.0
+    failure_threshold: int = 2
+    success_threshold: int = 2
     # Sent as `Authorization: Bearer <api_key>` to the worker. Needed when the
     # worker runs with security.enabled, since /internal/generate is not an
     # exempt path.

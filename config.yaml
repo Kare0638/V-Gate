@@ -23,19 +23,33 @@ server:
 # Remote inference workers, read by the gateway role / 远程推理 worker
 #
 # Leave `endpoints` empty to keep inference in the gateway process (the
-# single-process default). Listing an endpoint moves inference to a separate
-# worker, and the gateway stops loading a model entirely.
+# single-process default). Listing endpoints moves inference to separate
+# worker processes, and the gateway stops loading a model entirely.
 #
-# Streaming is not supported through a worker yet: stream=true returns 501.
-# Exactly one endpoint is supported for now; routing across several workers
-# needs a registry and health checks, which are not implemented yet.
+# Requests are routed round-robin across healthy workers. A worker that
+# refuses a connection is retried on another worker; a worker that times out
+# is not, because it may already be generating and retrying would double the
+# GPU cost of one request.
+#
+# Streaming is not supported through workers yet: stream=true returns 501.
 worker:
   endpoints: []
-  # endpoints: ["http://127.0.0.1:8001"]
+  # endpoints: ["http://127.0.0.1:8001", "http://127.0.0.1:8002"]
   timeout_seconds: 120.0
   connect_timeout_seconds: 5.0
-  # Sent as `Authorization: Bearer <key>` to the worker. Required when the
-  # worker runs with security.enabled, since /internal/generate is not exempt.
+
+  # Background probing of /health. Runs independently of request traffic, so
+  # a recovered worker rejoins even while the gateway is idle.
+  health_check_interval_seconds: 5.0
+  health_check_timeout_seconds: 2.0
+  # Consecutive failures before a worker leaves rotation, and consecutive
+  # successes before it returns. Above 1 so a single blip does not flap it.
+  failure_threshold: 2
+  success_threshold: 2
+
+  # Sent as `Authorization: Bearer <key>` to the worker, on both generate
+  # calls and health probes. Required when the worker runs with
+  # security.enabled, since /internal/generate is not exempt.
   # api_key: "sk-vgate-worker-xxxxx"
 
 # Model configuration / 模型配置

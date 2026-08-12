@@ -9,7 +9,7 @@
 
 The gateway tier is implemented — an OpenAI-shaped Chat Completions subset with streaming, dynamic micro-batching, result caching, observability, security, benchmarking, and container/Kubernetes deployment artifacts. The [vLLM](https://github.com/vllm-project/vllm) path has been exercised against a live GPU; the [SGLang](https://github.com/sgl-project/sglang) path is currently a unit-tested non-streaming adapter and has not yet been validated against a live SGLang engine.
 
-**The worker tier runs, but there is only one of it.** Inference can now be moved out of the gateway into a separate worker process (`role: worker`), and the gateway forwards to it over HTTP while keeping batching, caching, and admission control. What is still missing is everything that makes it *multi*-worker: a registry, health checks, routing strategies, and circuit breaking — tracked as [Phase 4](ROADMAP.md#phase-4-multi-worker-serving). Streaming through a worker is also not supported yet and returns 501. Multimodal requests are a separate planned milestone. Live-GPU validation has been performed on one NVIDIA GeForce RTX 3060 Laptop GPU with 6GB VRAM; no RTX 4060 or multi-GPU validation is claimed.
+**Multi-worker serving runs, but has not been benchmarked.** Inference happens in separate `role: worker` processes; the gateway routes across them round-robin, probes their health in the background, removes failing workers from rotation, and lets them rejoin once they recover. A killed worker does not fail requests — traffic shifts to the survivors, and `503` with `Retry-After` is returned only when every worker is down. What is missing is the evidence: no 1-vs-N throughput or tail-latency measurement exists yet, and routing is round-robin only (least-inflight and EWMA are [Phase 4](ROADMAP.md#phase-4-multi-worker-serving)). Streaming through a worker returns 501. Multimodal requests are a separate planned milestone. Live-GPU validation has been performed on one NVIDIA GeForce RTX 3060 Laptop GPU with 6GB VRAM; no RTX 4060 or multi-GPU validation is claimed.
 
 ## Validated Evidence
 
@@ -39,10 +39,10 @@ The evidence below is a measured snapshot of the current serving path. The vLLM 
 | **Configuration as Code** | Implemented | YAML configuration with environment-variable overrides |
 | **Container Deployment** | Implemented | Docker CPU/GPU targets, Compose stack, and baseline Kubernetes manifests |
 | **Python Client SDK** | Implemented | Sync/async clients with deterministic streaming cleanup |
-| **Gateway/Worker Split** | Partial | Inference runs in a separate `role: worker` process reached over HTTP; one worker only, and streaming through a worker returns 501 |
-| **Worker Registry & Health** | Planned | Worker registration, health checks, and failure isolation |
-| **Latency-Aware Routing** | Planned | Round-robin, least-inflight, and EWMA-latency routing strategies |
-| **Circuit Breaking & Recovery** | Planned | Trip on unhealthy workers, drain, and rejoin on recovery |
+| **Gateway/Worker Split** | Partial | Inference runs in separate `role: worker` processes reached over HTTP; streaming through a worker returns 501 |
+| **Worker Registry & Health** | Implemented | Static registry with background `/health` probing, threshold-based removal, and automatic rejoin on recovery |
+| **Latency-Aware Routing** | Partial | Round-robin across healthy workers; least-inflight and EWMA are not implemented |
+| **Circuit Breaking & Recovery** | Partial | Failing workers leave rotation and rejoin after sustained health; connection failures retry on another worker |
 
 ---
 
@@ -66,20 +66,20 @@ flowchart LR
     Local --> VLLM[vLLM]
     Local --> SGLang[SGLang]
 
-    Batcher --> Remote[RemoteBackend / HTTP]
+    Batcher --> Remote[RemoteBackend]
+    Remote --> Registry[Registry: round-robin over healthy]
+    Registry --> W1[Worker 1]
+    Registry --> W2[Worker N]
+    HC[Health checker] -. probes /health .-> W1
+    HC -. probes /health .-> W2
+    HC --> Registry
 
-    subgraph WK[Worker process]
-        Remote --> WAPI["/internal/generate"]
-        WAPI --> WEngine[Engine: vLLM or SGLang]
-    end
+    W1 --> WEngine[Engine: vLLM or SGLang]
 
-    Remote -. not implemented .-> Router[Router: round-robin / least-inflight / EWMA]
-    Router -. not implemented .-> Registry[Worker registry + health checks]
-    Registry -. not implemented .-> W2[Workers 2..N]
-    Router -. not implemented .-> CB[Circuit breaker / recovery]
+    Registry -. not implemented .-> LI[least-inflight / EWMA routing]
 
     GW --> Obs[Metrics / Logs / Traces]
-    WK --> Obs
+    W1 --> Obs
 ```
 
 The boundary: the gateway owns admission control, deduplication, caching, and observability; a worker owns one engine instance and nothing else. Because `RemoteBackend` implements the same `InferenceBackend` protocol as the local engines, the batcher does not know whether inference is local or remote — adding the worker hop required no change to it.
@@ -174,13 +174,30 @@ Or with Compose:
 docker compose --profile split up
 ```
 
-Current limits of split mode:
+Multiple workers, with failover:
 
-- **One worker.** Configuring more than one endpoint is rejected at startup rather than silently ignored; routing across workers needs the registry and health checks that come next.
+```bash
+# Two workers
+VGATE_ROLE=worker VGATE_SERVER__PORT=8001 VGATE_DRY_RUN=true python main.py
+VGATE_ROLE=worker VGATE_SERVER__PORT=8002 VGATE_DRY_RUN=true python main.py
+
+# Gateway routing across both
+VGATE_ROLE=gateway VGATE_SERVER__PORT=8000 \
+  VGATE_WORKER__ENDPOINTS='["http://127.0.0.1:8001","http://127.0.0.1:8002"]' python main.py
+
+# Per-worker health is visible on /stats
+curl -s http://localhost:8000/stats | jq .workers
+```
+
+Behavior of split mode:
+
+- **Round-robin across healthy workers.** Least-inflight and EWMA routing are not implemented.
+- **Failover works without dropping requests.** Killing a worker removes it from rotation; traffic continues on the survivors. Only when *every* worker is down do requests get `503` with `Retry-After`.
+- **Retries are limited to connection failures.** A worker that refuses a connection never received the request, so another worker takes it. A worker that times out may already be generating, so that is *not* retried — one client request must not cost two GPU generations.
+- **Recovery is automatic.** A background probe polls `/health` independently of traffic, so a restarted worker rejoins even while the gateway is idle.
 - **No streaming.** `stream: true` returns `501` before any SSE bytes are sent, instead of a `200` followed by an in-band error.
-- **No health checking.** If the worker is down, requests fail with `500` and a `worker unreachable` detail. The gateway itself stays up, and cached responses continue to be served.
 - The worker exposes only `/internal/generate`, `/health`, and `/metrics`; client-facing routes return `404` in the worker role.
-- With `security.enabled`, set `worker.api_key` on the gateway — `/internal/generate` is not an exempt path, so it requires the same bearer token as any other route.
+- With `security.enabled`, set `worker.api_key` on the gateway — `/internal/generate` is not an exempt path, so it requires the same bearer token as any other route (health probes send it too).
 
 ### Option 3: Isolated SGLang Environment (Recommended)
 

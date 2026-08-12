@@ -32,6 +32,7 @@ from vgate.backends.remote_backend import RemoteBackend, RemoteInferenceError
 from vgate.batcher import RequestBatcher
 from vgate.config import VGateConfig, WorkerConfig
 from vgate.engine import _create_backend
+from vgate.worker_registry import NoHealthyWorkersError, WorkerRegistry
 from vgate import worker_api
 
 
@@ -79,11 +80,13 @@ def test_remote_backend_satisfies_protocol():
     backend.shutdown()
 
 
-def test_remote_backend_rejects_multiple_endpoints():
-    # Multi-worker routing is not implemented yet; failing loudly beats
-    # silently using only the first endpoint.
-    with pytest.raises(ValueError, match="one worker endpoint"):
-        RemoteBackend(WorkerConfig(endpoints=["http://a:8001", "http://b:8001"]))
+def test_remote_backend_accepts_multiple_endpoints():
+    backend = RemoteBackend(WorkerConfig(endpoints=["http://a:8001", "http://b:8001"]))
+    try:
+        assert backend.registry.endpoints() == ["http://a:8001", "http://b:8001"]
+        assert backend.registry.healthy_endpoints() == ["http://a:8001", "http://b:8001"]
+    finally:
+        backend.shutdown()
 
 
 def test_remote_backend_requires_an_endpoint():
@@ -177,12 +180,14 @@ def test_remote_backend_forwards_generate_to_worker():
     assert results[0]["num_tokens"] == 8
 
 
-def test_remote_backend_raises_when_worker_unreachable():
+def test_remote_backend_raises_when_only_worker_unreachable():
+    # With every worker exhausted the error is NoHealthyWorkersError, which the
+    # gateway maps to 503 rather than 500.
     backend = RemoteBackend(
         WorkerConfig(endpoints=["http://127.0.0.1:1"], connect_timeout_seconds=0.1)
     )
     try:
-        with pytest.raises(RemoteInferenceError, match="unreachable"):
+        with pytest.raises(NoHealthyWorkersError):
             backend.generate(["ping"], {"temperature": 0.7, "top_p": 0.9, "max_tokens": 4})
     finally:
         backend.shutdown()
@@ -308,8 +313,11 @@ async def test_remote_backend_streaming_raises_not_implemented():
 # --------------------------------------------------------------------------
 
 class _Engine:
-    def __init__(self, backend):
+    """Stand-in for VGateEngine, matching the attributes main.py reads."""
+
+    def __init__(self, backend, is_remote: bool = False):
         self.backend = backend
+        self.is_remote = is_remote
 
 
 def test_batcher_serializes_local_backends():
