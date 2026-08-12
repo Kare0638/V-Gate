@@ -21,6 +21,12 @@ from vgate.config import ModelConfig
 class SGLangBackend:
     """Inference backend using SGLang."""
 
+    # Deliberately not declaring supports_concurrent_calls. generate() calls
+    # the synchronous sgl.Engine directly, and this adapter has never been
+    # exercised against a live engine, so its concurrency behavior is
+    # unverified. Calls stay serialized until that is measured rather than
+    # assumed -- see ROADMAP Phase 2 task 8.
+
     def __init__(self):
         self.engine = None
 

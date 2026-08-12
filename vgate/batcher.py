@@ -15,6 +15,7 @@
 import asyncio
 import functools
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from vgate.cache import ResultCache
@@ -25,11 +26,33 @@ from vgate.metrics import (
     BATCH_SIZE, BATCH_PROCESSING_TIME, BATCH_QUEUE_TIME,
     PENDING_REQUESTS, TOTAL_BATCHES, TTFT, TPOT,
     TOKENS_GENERATED, INFERENCE_ERRORS, UNIQUE_PROMPTS_PER_BATCH,
-    DEDUPLICATED_REQUESTS, DEDUP_RATIO, INFLIGHT_INFERENCES
+    DEDUPLICATED_REQUESTS, DEDUP_RATIO, INFLIGHT_INFERENCES,
+    ABANDONED_INFERENCES
 )
 
 logger = get_logger("vgate.batcher")
 tracer = get_tracer("vgate.batcher")
+
+
+@dataclass
+class _Inflight:
+    """
+    One in-flight inference and the callers waiting on it.
+
+    `waiters` and `started` exist to decide what to do when every caller has
+    walked away (all timed out or disconnected):
+
+    - Not started yet: it is still queued for an admission permit, nothing has
+      been spent, and nobody wants the answer. Cancel it, so abandoned work
+      does not occupy a permit that a live request could use.
+    - Already started: the backend call is running in a thread and cannot be
+      interrupted anyway, and its result still populates the cache. Let it
+      finish rather than pay for it and throw the answer away.
+    """
+
+    task: Optional[asyncio.Task] = None
+    waiters: int = 0
+    started: bool = False
 
 
 class RequestBatcher:
@@ -97,9 +120,10 @@ class RequestBatcher:
         # Bounds concurrent backend calls. Holders are the requests actually
         # running inference; deduplicated followers do not consume a permit.
         self._semaphore = asyncio.Semaphore(self.max_concurrent_inferences)
-        # cache_key -> the task computing it. Any later request for the same
-        # key attaches to this task instead of starting a second inference.
-        self._inflight: Dict[str, asyncio.Task] = {}
+        # cache_key -> the in-flight entry computing it. Any later request for
+        # the same key attaches to that entry instead of starting a second
+        # inference.
+        self._inflight: Dict[str, "_Inflight"] = {}
         self._lock = asyncio.Lock()
         self._running = False
 
@@ -147,7 +171,7 @@ class RequestBatcher:
         """
         self._running = False
         async with self._lock:
-            pending = list(self._inflight.values())
+            pending = [e.task for e in self._inflight.values() if e.task is not None]
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         logger.info("Batcher stopped")
@@ -206,16 +230,18 @@ class RequestBatcher:
             self.total_requests += 1
 
             async with self._lock:
-                task = self._inflight.get(cache_key)
-                coalesced = task is not None
-                if task is None:
-                    task = asyncio.create_task(
-                        self._execute(cache_key, prompt, temperature, top_p, max_tokens)
+                entry = self._inflight.get(cache_key)
+                coalesced = entry is not None
+                if entry is None:
+                    entry = _Inflight()
+                    self._inflight[cache_key] = entry
+                    entry.task = asyncio.create_task(
+                        self._execute(entry, cache_key, prompt, temperature, top_p, max_tokens)
                     )
-                    self._inflight[cache_key] = task
-                    task.add_done_callback(
+                    entry.task.add_done_callback(
                         functools.partial(self._retire, cache_key)
                     )
+                entry.waiters += 1
 
             span.set_attribute("deduplicated", coalesced)
             if coalesced:
@@ -232,20 +258,45 @@ class RequestBatcher:
 
             # shield: one waiter timing out or disconnecting must not cancel
             # an inference that other waiters are still expecting.
-            if timeout is not None:
-                return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-            return await asyncio.shield(task)
+            try:
+                if timeout is not None:
+                    return await asyncio.wait_for(
+                        asyncio.shield(entry.task), timeout=timeout
+                    )
+                return await asyncio.shield(entry.task)
+            finally:
+                await self._release_waiter(entry, cache_key)
+
+    async def _release_waiter(self, entry: "_Inflight", cache_key: str) -> None:
+        """
+        Drop one waiter, and reclaim the inference if it was the last.
+
+        Only work that has not started yet is cancelled -- see _Inflight.
+        """
+        async with self._lock:
+            entry.waiters -= 1
+            if entry.waiters > 0 or entry.started or entry.task.done():
+                return
+            abandoned = entry.task
+
+        abandoned.cancel()
+        ABANDONED_INFERENCES.inc()
+        logger.info(
+            "Cancelled abandoned request before admission",
+            extra={"extra_data": {"cache_key": cache_key[:8]}}
+        )
 
     def _retire(self, cache_key: str, task: asyncio.Task) -> None:
-        """Drop a finished task from the in-flight map. Runs as a done-callback."""
+        """Drop a finished entry from the in-flight map. Runs as a done-callback."""
         current = self._inflight.get(cache_key)
-        if current is task:
+        if current is not None and current.task is task:
             # Mutating a dict from a done-callback is safe: callbacks run on
             # the event loop thread, same as everything that reads it.
             self._inflight.pop(cache_key, None)
 
     async def _execute(
         self,
+        entry: "_Inflight",
         cache_key: str,
         prompt: str,
         temperature: float,
@@ -261,6 +312,9 @@ class RequestBatcher:
         counted_as_waiting = True
         try:
             async with self._semaphore:
+                # Past this point the work is committed: cancelling would not
+                # stop the thread-pool call, and the result is worth caching.
+                entry.started = True
                 self._waiting -= 1
                 counted_as_waiting = False
                 PENDING_REQUESTS.set(self._waiting)

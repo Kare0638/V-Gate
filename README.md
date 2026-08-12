@@ -483,7 +483,20 @@ What survived from the old batcher, because it was never really about batching:
 - **Deduplication**, now stronger — identical concurrent requests coalesce onto one inference for as long as it is in flight, not merely if they landed in the same window.
 - **Admission control**, which is what `max_batch_size` now expresses.
 
-`max_wait_time_ms` is accepted and ignored; there is no window to wait for. The startup log reports the value it is ignoring. With an in-process engine (not safe to call concurrently) the effective concurrency is forced to 1 regardless of `max_batch_size`; the setting takes effect when the gateway forwards to remote workers.
+`max_wait_time_ms` is accepted and ignored; there is no window to wait for. The startup log reports the value it is ignoring.
+
+Concurrency is capped by what the backend declares. `VLLMBackend` and `RemoteBackend` allow concurrent calls — `AsyncLLMEngine` exists to serve them, and serializing it would leave the GPU decoding one sequence at a time with continuous batching switched off. `SGLangBackend` does not declare it, because that adapter has never been run against a live engine, so its calls stay serialized until that is measured rather than assumed.
+
+### What happens to a request whose caller gave up
+
+A `timeout` on the client side, or a disconnect, does not automatically kill the inference — other callers may be coalesced onto the same one. The rule depends on whether the work has been admitted:
+
+| State | On last caller leaving | Why |
+|---|---|---|
+| Queued, not yet admitted | **Cancelled** | Nothing has been spent, and it would otherwise hold an admission permit a live request could use |
+| Already running | **Runs to completion** | The backend call is in a thread and cannot be interrupted anyway; its result populates the cache, so finishing is cheaper than discarding it |
+
+Reclamation counts waiters rather than firing on the first departure, so one caller timing out never cancels work another is still waiting for. Cancellations are counted in `vgate_abandoned_inferences_total`.
 
 ### Environment Variables
 

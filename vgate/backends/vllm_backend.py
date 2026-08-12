@@ -47,6 +47,13 @@ class VLLMBackend:
     redefinition in ROADMAP.md Phase 2 task 9.
     """
 
+    # AsyncLLMEngine exists to serve concurrent requests: generate() bridges
+    # into its loop and submits every prompt with asyncio.gather, and the
+    # engine interleaves them via continuous batching. Serializing calls to
+    # this backend would switch that off and leave the GPU decoding one
+    # sequence at a time.
+    supports_concurrent_calls = True
+
     def __init__(self):
         self.engine = None
         self._loop: asyncio.AbstractEventLoop | None = None

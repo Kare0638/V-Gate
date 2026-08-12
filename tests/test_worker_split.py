@@ -320,9 +320,19 @@ class _Engine:
         self.is_remote = is_remote
 
 
-def test_batcher_serializes_local_backends():
-    batcher = RequestBatcher(engine=_Engine(DryRunBackend()))
+def test_batcher_serializes_backends_that_do_not_declare_concurrency():
+    """Serialization is opt-out, so an undeclared backend stays protected."""
+
+    class _Undeclared:
+        def create_sampling_params(self, temperature, top_p, max_tokens):
+            return {}
+
+        def generate(self, prompts, sampling_params):
+            return []
+
+    batcher = RequestBatcher(engine=_Engine(_Undeclared()))
     assert batcher._serialize_inference is True
+    assert batcher.max_concurrent_inferences == 1
 
 
 def test_batcher_does_not_serialize_concurrent_safe_backends():
@@ -330,10 +340,21 @@ def test_batcher_does_not_serialize_concurrent_safe_backends():
     # adding workers would not increase throughput.
     backend = RemoteBackend(WorkerConfig(endpoints=["http://w:8001"]))
     try:
-        batcher = RequestBatcher(engine=_Engine(backend))
+        batcher = RequestBatcher(engine=_Engine(backend), max_batch_size=8)
         assert batcher._serialize_inference is False
+        assert batcher.max_concurrent_inferences == 8
     finally:
         backend.shutdown()
+
+
+def test_dry_run_backend_is_concurrency_safe():
+    """
+    DryRunBackend is stateless, so serializing it would make dry-run
+    benchmarks measure an artificial bottleneck the real backends lack.
+    """
+    batcher = RequestBatcher(engine=_Engine(DryRunBackend()), max_batch_size=4)
+    assert batcher._serialize_inference is False
+    assert batcher.max_concurrent_inferences == 4
 
 
 @pytest.mark.asyncio

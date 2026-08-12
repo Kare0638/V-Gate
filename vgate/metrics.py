@@ -113,6 +113,12 @@ INFLIGHT_INFERENCES = _safe_metric(
     "Number of inferences currently executing on a backend"
 )
 
+ABANDONED_INFERENCES = _safe_metric(
+    Counter,
+    "vgate_abandoned_inferences_total",
+    "Queued inferences cancelled because every waiting caller left before admission"
+)
+
 TOTAL_BATCHES = _safe_metric(
     Counter,
     "vgate_batches_total",

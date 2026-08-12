@@ -64,6 +64,11 @@ class InferenceBackend(Protocol):
 class DryRunBackend:
     """Mock backend that returns placeholder responses without GPU."""
 
+    # Stateless: each call only reads its arguments, so concurrent calls are
+    # safe. Declaring it keeps dry-run benchmarks from measuring an artificial
+    # serialization that the real backends do not have.
+    supports_concurrent_calls = True
+
     def load_model(self, model_config: ModelConfig) -> None:
         pass
 

@@ -26,6 +26,7 @@ import time
 import pytest
 
 from vgate.batcher import RequestBatcher
+from vgate.cache import ResultCache
 
 
 class _RecordingBackend:
@@ -228,6 +229,84 @@ async def test_failed_inference_is_not_cached():
         await b.stop()
 
     assert len(backend.calls) == 2, "the retry must actually reach the backend"
+
+
+# --------------------------------------------------------------------------
+# Abandoned-request reclamation
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_abandoned_request_is_cancelled_before_admission():
+    """
+    A request nobody is waiting for any more, and that has not been admitted,
+    must not keep occupying an admission permit.
+    """
+    backend = _RecordingBackend(delay=0.15)
+    # One permit: the second request cannot start until the first finishes.
+    b = await _batcher(backend, max_batch_size=1)
+    try:
+        holder = asyncio.create_task(b.submit("holder", max_tokens=4))
+        await asyncio.sleep(0.02)  # let the holder take the only permit
+
+        # Queued behind the holder, then abandoned before it can start.
+        with pytest.raises(asyncio.TimeoutError):
+            await b.submit("queued", max_tokens=4, timeout=0.03)
+
+        await holder
+    finally:
+        await b.stop()
+
+    dispatched = [p for prompts, _ in backend.calls for p in prompts]
+    assert "queued" not in dispatched, "abandoned queued work should not run"
+    assert b._inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_started_inference_survives_abandonment():
+    """
+    Once admitted, the work is committed: the thread-pool call cannot be
+    interrupted anyway, and its result still populates the cache. Cancelling
+    would pay for it and discard the answer.
+    """
+    backend = _RecordingBackend(delay=0.12)
+    b = await _batcher(backend, max_batch_size=4)
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await b.submit("committed", max_tokens=4, timeout=0.03)
+
+        await b.stop()  # drain
+
+        # It ran to completion, and the result the caller gave up on is cached.
+        assert [p for prompts, _ in backend.calls for p in prompts] == ["committed"]
+        cached = await b.cache.get(ResultCache.make_key("committed", 0.7, 0.9, 4))
+        assert cached is not None
+    finally:
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_one_waiter_leaving_does_not_reclaim_shared_work():
+    """Reclamation must count waiters, not fire on the first departure."""
+    backend = _RecordingBackend(delay=0.15)
+    b = await _batcher(backend, max_batch_size=1)
+    try:
+        holder = asyncio.create_task(b.submit("holder", max_tokens=4))
+        await asyncio.sleep(0.02)
+
+        # Two waiters on the same queued request; one leaves, one stays.
+        stays = asyncio.create_task(b.submit("shared", max_tokens=4))
+        await asyncio.sleep(0.01)
+        with pytest.raises(asyncio.TimeoutError):
+            await b.submit("shared", max_tokens=4, timeout=0.02)
+
+        await holder
+        result = await stays
+        assert result["text"] == "out:shared"
+    finally:
+        await b.stop()
+
+    dispatched = [p for prompts, _ in backend.calls for p in prompts]
+    assert "shared" in dispatched, "work still had a waiter and must not be cancelled"
 
 
 # --------------------------------------------------------------------------
