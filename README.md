@@ -29,8 +29,8 @@ The evidence below is a measured snapshot of the current serving path. The vLLM 
 | **OpenAI-Shaped Chat API** | Partial | Chat Completions request/response subset (`/v1/chat/completions`); not claimed as full drop-in OpenAI compatibility |
 | **Embeddings Endpoint** | Partial | `/v1/embeddings` currently returns a mock 1536-dimensional vector for API/client testing |
 | **Streaming Inference** | Partial | SSE streaming for dry-run and real vLLM; SGLang streaming is not implemented yet |
-| **Dynamic Micro-Batching** | Implemented | Aggregate queued non-streaming requests into static gateway batches |
-| **Engine-Native Scheduling** | Partial | vLLM uses `AsyncLLMEngine`; the gateway batcher has not yet been redefined as unified admission control |
+| **Admission Control & Dedup** | Implemented | Bounds concurrent inferences and coalesces identical in-flight requests onto one; the gateway no longer builds batches — engines do that internally |
+| **Engine-Native Scheduling** | Implemented | Batching is left to the engine's own continuous batching; the gateway does admission control and deduplication instead of building windows |
 | **Result Caching** | Implemented | In-memory LRU cache with batch-level deduplication for non-streaming requests |
 | **Backend Adapters** | Partial | Select vLLM or SGLang with `model.engine_type`; vLLM is live-GPU validated, while SGLang is currently unit-tested and non-streaming |
 | **Built-in Benchmarking** | Implemented | Concurrent load tools, report generation, and `/v1/benchmark` |
@@ -420,8 +420,8 @@ model:
   engine_type: "vllm"  # "vllm" or "sglang"
 
 batch:
-  max_batch_size: 8
-  max_wait_time_ms: 50.0
+  max_batch_size: 8       # max concurrent inferences (see note below)
+  max_wait_time_ms: 50.0  # deprecated, ignored
 
 cache:
   enabled: true
@@ -464,6 +464,26 @@ VGATE_MODEL__ENGINE_TYPE=vllm python main.py
 # Switch to SGLang backend
 VGATE_MODEL__ENGINE_TYPE=sglang python main.py
 ```
+
+### A note on `batch.max_batch_size`
+
+Its meaning changed, and an existing config file will keep loading while behaving differently — so it is worth stating plainly.
+
+**Before**: the gateway collected requests into a window (`max_batch_size` requests, or `max_wait_time_ms` elapsed) and handed the whole window to one backend call.
+
+**Now**: the gateway does not build batches. Each request calls the backend on its own, and `max_batch_size` bounds how many may do so at once.
+
+Two reasons for the change:
+
+1. **vLLM and SGLang already batch, and do it better.** They can admit a new request into a batch that is already decoding; a sealed Python-side window cannot. The gateway-side window was competing with the engine's own scheduler rather than helping it.
+2. **A sealed batch is routed as a unit.** Every request in it lands on the same worker regardless of that worker's load, which makes load-aware routing impossible. Routing needs one decision per request.
+
+What survived from the old batcher, because it was never really about batching:
+
+- **Deduplication**, now stronger — identical concurrent requests coalesce onto one inference for as long as it is in flight, not merely if they landed in the same window.
+- **Admission control**, which is what `max_batch_size` now expresses.
+
+`max_wait_time_ms` is accepted and ignored; there is no window to wait for. The startup log reports the value it is ignoring. With an in-process engine (not safe to call concurrently) the effective concurrency is forced to 1 regardless of `max_batch_size`; the setting takes effect when the gateway forwards to remote workers.
 
 ### Environment Variables
 
@@ -696,7 +716,7 @@ Prerequisites for distributing anything: a single node must fail predictably bef
 - [x] Add gateway-to-worker bearer authentication for a private cluster
 - [~] Add routing strategies — round-robin is implemented; least-inflight and EWMA latency are not
 - [~] Add worker circuit breakers, draining, and recovery on rejoin — failing workers leave rotation and rejoin after sustained health; there is no in-flight draining
-- [ ] Redefine `RequestBatcher` as dedup/admission/fan-out so routing decisions are per request rather than per batch
+- [x] Redefine `RequestBatcher` as dedup/admission/fan-out so routing decisions are per request rather than per batch
 - [ ] Measure 1-worker vs N-worker throughput, tail latency, and behavior under injected worker failure
 
 `[~]` marks partial items. Routing is currently decided once per batch, not per request, which is why least-inflight is not implemented yet: it would be choosing between workers on a signal it cannot act on at that granularity.

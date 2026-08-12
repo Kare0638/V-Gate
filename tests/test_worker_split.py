@@ -337,8 +337,14 @@ def test_batcher_does_not_serialize_concurrent_safe_backends():
 
 
 @pytest.mark.asyncio
-async def test_concurrent_batches_overlap_with_remote_backend():
-    """Two batches should be in flight at once when the backend allows it."""
+async def test_concurrent_inferences_overlap_with_remote_backend():
+    """
+    Several inferences should overlap when the backend allows concurrency.
+
+    max_batch_size is the admission limit now, so it has to be above 1 for
+    anything to overlap -- under the old batching model it sized the window
+    instead, and separate windows could overlap regardless of its value.
+    """
     concurrent = 0
     peak = 0
 
@@ -357,11 +363,78 @@ async def test_concurrent_batches_overlap_with_remote_backend():
             concurrent -= 1
             return [{"text": p, "token_ids": [], "num_tokens": 1, "metrics": {}} for p in prompts]
 
-    batcher = RequestBatcher(engine=_Engine(_SlowConcurrentBackend()), max_batch_size=1)
+    batcher = RequestBatcher(engine=_Engine(_SlowConcurrentBackend()), max_batch_size=4)
     await batcher.start()
     try:
         await asyncio.gather(*(batcher.submit(f"p{i}", max_tokens=4) for i in range(4)))
     finally:
         await batcher.stop()
 
-    assert peak > 1, f"expected overlapping batches, peak concurrency was {peak}"
+    assert peak > 1, f"expected overlapping inferences, peak concurrency was {peak}"
+
+
+@pytest.mark.asyncio
+async def test_admission_limit_caps_concurrency():
+    """max_batch_size must actually bound concurrent backend calls."""
+    concurrent = 0
+    peak = 0
+
+    class _CountingBackend:
+        supports_concurrent_calls = True
+
+        def create_sampling_params(self, temperature, top_p, max_tokens):
+            return {"temperature": temperature, "top_p": top_p, "max_tokens": max_tokens}
+
+        def generate(self, prompts, sampling_params):
+            nonlocal concurrent, peak
+            concurrent += 1
+            peak = max(peak, concurrent)
+            import time as _t
+            _t.sleep(0.03)
+            concurrent -= 1
+            return [{"text": p, "token_ids": [], "num_tokens": 1, "metrics": {}} for p in prompts]
+
+    batcher = RequestBatcher(engine=_Engine(_CountingBackend()), max_batch_size=2)
+    await batcher.start()
+    try:
+        await asyncio.gather(*(batcher.submit(f"q{i}", max_tokens=4) for i in range(8)))
+    finally:
+        await batcher.stop()
+
+    assert peak <= 2, f"admission limit of 2 was exceeded: peak was {peak}"
+
+
+@pytest.mark.asyncio
+async def test_local_backend_is_serialized_to_one_inference():
+    """
+    A backend that does not declare concurrency safety must never see two
+    calls at once, regardless of max_batch_size.
+
+    Under the old model a separate lock enforced this. With fan-out the
+    admission limit carries it, so this asserts the constraint survived the
+    rewrite rather than the mechanism that used to provide it.
+    """
+    concurrent = 0
+    peak = 0
+
+    class _UnsafeBackend:  # no supports_concurrent_calls -> serialized
+        def create_sampling_params(self, temperature, top_p, max_tokens):
+            return {"temperature": temperature, "top_p": top_p, "max_tokens": max_tokens}
+
+        def generate(self, prompts, sampling_params):
+            nonlocal concurrent, peak
+            concurrent += 1
+            peak = max(peak, concurrent)
+            import time as _t
+            _t.sleep(0.02)
+            concurrent -= 1
+            return [{"text": p, "token_ids": [], "num_tokens": 1, "metrics": {}} for p in prompts]
+
+    batcher = RequestBatcher(engine=_Engine(_UnsafeBackend()), max_batch_size=8)
+    await batcher.start()
+    try:
+        await asyncio.gather(*(batcher.submit(f"r{i}", max_tokens=4) for i in range(6)))
+    finally:
+        await batcher.stop()
+
+    assert peak == 1, f"unsafe backend saw {peak} concurrent calls"

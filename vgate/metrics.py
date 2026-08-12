@@ -104,7 +104,13 @@ BATCH_QUEUE_TIME = _safe_metric(
 PENDING_REQUESTS = _safe_metric(
     Gauge,
     "vgate_pending_requests",
-    "Number of requests waiting in the batch queue"
+    "Number of requests waiting for an admission permit"
+)
+
+INFLIGHT_INFERENCES = _safe_metric(
+    Gauge,
+    "vgate_inflight_inferences",
+    "Number of inferences currently executing on a backend"
 )
 
 TOTAL_BATCHES = _safe_metric(

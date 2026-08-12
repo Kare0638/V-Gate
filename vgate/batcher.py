@@ -13,46 +13,49 @@
 # limitations under the License.
 
 import asyncio
+import functools
 import time
-from contextlib import nullcontext
-from typing import Any, Dict, List, Optional
-from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
 
 from vgate.cache import ResultCache
-from vgate.config import get_config, CacheConfig as ConfigCacheConfig
+from vgate.config import get_config
 from vgate.logging_config import get_logger
 from vgate.tracing import get_tracer, get_current_trace_id
 from vgate.metrics import (
     BATCH_SIZE, BATCH_PROCESSING_TIME, BATCH_QUEUE_TIME,
     PENDING_REQUESTS, TOTAL_BATCHES, TTFT, TPOT,
     TOKENS_GENERATED, INFERENCE_ERRORS, UNIQUE_PROMPTS_PER_BATCH,
-    DEDUPLICATED_REQUESTS, DEDUP_RATIO
+    DEDUPLICATED_REQUESTS, DEDUP_RATIO, INFLIGHT_INFERENCES
 )
 
 logger = get_logger("vgate.batcher")
 tracer = get_tracer("vgate.batcher")
 
 
-@dataclass
-class BatchRequest:
-    """A single request waiting to be batched."""
-    prompt: str
-    max_tokens: int
-    temperature: float = 0.7
-    top_p: float = 0.9
-    cache_key: str = ""
-    future: asyncio.Future = field(default_factory=lambda: asyncio.get_event_loop().create_future())
-    created_at: float = field(default_factory=time.monotonic)  # monotonic: used only for queue-time deltas
-
-
 class RequestBatcher:
     """
-    Dynamic request batcher that aggregates concurrent requests
-    and processes them in batches for improved GPU utilization.
+    Admission control, in-flight deduplication, and fan-out to the backend.
 
-    Batching triggers when either condition is met:
-    - Batch size reaches max_batch_size
-    - Wait time exceeds max_wait_time_ms
+    Despite the name, this no longer builds batches. It used to collect
+    requests into a window and hand the whole window to one backend call,
+    which made sense when the backend was an in-process engine that benefited
+    from receiving several prompts at once. Two things made that wrong:
+
+    - vLLM and SGLang do continuous batching internally, and do it better --
+      they can admit a new request into a batch that is already decoding,
+      which a sealed Python-side window cannot.
+    - With remote workers, a sealed batch is routed as a unit, so every
+      request in it lands on the same worker regardless of load. Load-aware
+      routing needs a decision per request, not per window.
+
+    So the three things worth keeping were separated from batch construction:
+
+    - **Deduplication**: concurrent identical requests share one inference.
+      This is now stronger than before, because coalescing is not limited to
+      requests that happened to land in the same window.
+    - **Admission control**: `max_batch_size` bounds concurrent inferences.
+    - **Fan-out**: each admitted request calls the backend on its own, so a
+      router sees one decision per request.
     """
 
     def __init__(
@@ -62,31 +65,42 @@ class RequestBatcher:
         max_wait_time_ms: Optional[float] = None,
     ):
         """
-        Initialize the request batcher.
-
         Args:
             engine: The VGateEngine instance.
-            max_batch_size: Max requests per batch. Uses config default if None.
-            max_wait_time_ms: Max wait time before processing. Uses config default if None.
+            max_batch_size: Maximum concurrent inferences. Retains its
+                configuration key, but now bounds concurrency rather than
+                window size -- there is no window to size.
+            max_wait_time_ms: Accepted and ignored. Kept so existing configs
+                and callers keep working; a deprecation warning is logged
+                when it is set to a non-default value.
         """
         config = get_config()
         self.engine = engine
-        self.max_batch_size = max_batch_size if max_batch_size is not None else config.batch.max_batch_size
-        self.max_wait_time_ms = max_wait_time_ms if max_wait_time_ms is not None else config.batch.max_wait_time_ms
+        self.max_batch_size = (
+            max_batch_size if max_batch_size is not None else config.batch.max_batch_size
+        )
+        self.max_wait_time_ms = (
+            max_wait_time_ms if max_wait_time_ms is not None else config.batch.max_wait_time_ms
+        )
         self.cache = ResultCache()
 
-        self._queue: List[BatchRequest] = []
-        self._lock = asyncio.Lock()
-        self._inference_lock = asyncio.Lock()  # Prevent concurrent vLLM calls
-        # In-process engines are not safe to call concurrently, so batches are
-        # serialized through _inference_lock. A backend that forwards over the
-        # network has no such constraint, and holding the lock there would
-        # serialize every worker call — making additional workers useless.
-        # Backends opt out by declaring supports_concurrent_calls; the default
-        # stays locked, so local backends are unaffected.
+        # In-process engines are not safe to call concurrently. Under the old
+        # batching model a separate lock enforced that; with fan-out, every
+        # request calls the backend on its own, so the constraint is expressed
+        # as the admission limit itself -- one mechanism instead of two.
+        # Backends opt into concurrency via supports_concurrent_calls; the
+        # default is serial, so local backends stay protected.
         backend = getattr(engine, "backend", None)
         self._serialize_inference = not getattr(backend, "supports_concurrent_calls", False)
-        self._batch_task: asyncio.Task = None
+        self.max_concurrent_inferences = 1 if self._serialize_inference else self.max_batch_size
+
+        # Bounds concurrent backend calls. Holders are the requests actually
+        # running inference; deduplicated followers do not consume a permit.
+        self._semaphore = asyncio.Semaphore(self.max_concurrent_inferences)
+        # cache_key -> the task computing it. Any later request for the same
+        # key attaches to this task instead of starting a second inference.
+        self._inflight: Dict[str, asyncio.Task] = {}
+        self._lock = asyncio.Lock()
         self._running = False
 
         # Metrics
@@ -99,36 +113,43 @@ class RequestBatcher:
         self.total_ttft = 0.0
         self.total_tpot = 0.0
         self.total_inference_samples = 0
+        self._waiting = 0
 
     async def start(self):
-        """Start the background batching task."""
+        """
+        Mark the batcher running.
+
+        There is no background loop any more: a request drives its own
+        inference instead of waiting for a timer to seal a window.
+        """
         if self._running:
             return
         self._running = True
-        self._batch_task = asyncio.create_task(self._batch_loop())
         logger.info(
             "Batcher started",
             extra={"extra_data": {
-                "max_batch_size": self.max_batch_size,
-                "max_wait_time_ms": self.max_wait_time_ms
+                "max_concurrent_inferences": self.max_concurrent_inferences,
+                "serialized_backend": self._serialize_inference,
+                "mode": "dedup+admission+fanout",
+                # Surfaced rather than warned about: the key is still accepted
+                # so existing configs load, but it no longer does anything.
+                "max_wait_time_ms_ignored": self.max_wait_time_ms,
             }}
         )
 
     async def stop(self):
-        """Stop the batching task and process remaining requests."""
+        """
+        Stop accepting work and let in-flight inferences finish.
+
+        Cancelling them would leave their waiters with unresolved futures, and
+        their results are already paid for -- draining also populates the
+        cache, so the work is not wasted.
+        """
         self._running = False
-        if self._batch_task:
-            self._batch_task.cancel()
-            try:
-                await self._batch_task
-            except asyncio.CancelledError:
-                pass
-        # Process any remaining requests. _process_batch only drains up to
-        # max_batch_size per call, so loop until the queue is fully empty —
-        # otherwise a queue longer than max_batch_size would strand requests
-        # with unresolved futures on shutdown.
-        while self._queue:
-            await self._process_batch()
+        async with self._lock:
+            pending = list(self._inflight.values())
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         logger.info("Batcher stopped")
 
     async def submit(
@@ -140,9 +161,10 @@ class RequestBatcher:
         timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
-        Submit a request for batched processing.
-        Returns the result when the batch is processed.
-        Checks cache first and returns cached result if available.
+        Submit a request, returning its result.
+
+        Checks the cache, coalesces onto an identical in-flight request if one
+        exists, and otherwise runs the inference under the concurrency limit.
 
         Args:
             prompt: The input prompt.
@@ -150,15 +172,15 @@ class RequestBatcher:
             temperature: Sampling temperature. Uses config default if None.
             top_p: Top-p sampling. Uses config default if None.
             timeout: Max seconds to wait for a result. Raises
-                asyncio.TimeoutError and removes the request from the queue
-                if it hasn't been picked up by a batch yet. No timeout if None.
+                asyncio.TimeoutError when it elapses. The underlying
+                inference is not cancelled -- other waiters may still need
+                it, and its result still populates the cache.
 
         Raises:
             asyncio.TimeoutError: if `timeout` elapses before a result is ready.
             asyncio.CancelledError: if the calling task is cancelled while waiting.
         """
         with tracer.start_as_current_span("batcher.submit") as span:
-            # Apply defaults from config
             config = get_config()
             if max_tokens is None:
                 max_tokens = config.inference.max_tokens
@@ -171,7 +193,6 @@ class RequestBatcher:
 
             cache_key = ResultCache.make_key(prompt, temperature, top_p, max_tokens)
 
-            # Check cache first
             cached = await self.cache.get(cache_key)
             if cached:
                 span.set_attribute("cache_hit", True)
@@ -182,280 +203,188 @@ class RequestBatcher:
                 return cached
 
             span.set_attribute("cache_hit", False)
-
-            request = BatchRequest(
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                cache_key=cache_key,
-                future=asyncio.get_event_loop().create_future(),
-                created_at=time.monotonic(),
-            )
+            self.total_requests += 1
 
             async with self._lock:
-                self._queue.append(request)
-                self.total_requests += 1
-                queue_size = len(self._queue)
-                PENDING_REQUESTS.set(queue_size)
+                task = self._inflight.get(cache_key)
+                coalesced = task is not None
+                if task is None:
+                    task = asyncio.create_task(
+                        self._execute(cache_key, prompt, temperature, top_p, max_tokens)
+                    )
+                    self._inflight[cache_key] = task
+                    task.add_done_callback(
+                        functools.partial(self._retire, cache_key)
+                    )
 
-            # If batch is full, signal immediate processing
-            if queue_size >= self.max_batch_size:
-                asyncio.create_task(self._process_batch())
-
-            # Wait for result
-            try:
-                if timeout is not None:
-                    result = await asyncio.wait_for(request.future, timeout=timeout)
-                else:
-                    result = await request.future
-                return result
-            finally:
-                # Best-effort cleanup: if this request timed out, was
-                # cancelled, or errored before a batch picked it up, remove
-                # it from the queue instead of leaving a dead entry that
-                # would still occupy a batch slot later. No-op if it was
-                # already dequeued for processing.
-                async with self._lock:
-                    before = len(self._queue)
-                    self._queue = [r for r in self._queue if r is not request]
-                    if len(self._queue) != before:
-                        PENDING_REQUESTS.set(len(self._queue))
-
-    async def _batch_loop(self):
-        """Background loop that triggers batch processing on timeout."""
-        while self._running:
-            await asyncio.sleep(self.max_wait_time_ms / 1000.0)
-
-            if self._queue:
-                await self._process_batch()
-
-    async def _process_batch(self):
-        """Process up to max_batch_size pending requests as a batch, with deduplication."""
-        # Serialize batches only when the backend requires it (see __init__).
-        # nullcontext supports async use on Python 3.10+.
-        inference_guard = self._inference_lock if self._serialize_inference else nullcontext()
-        async with inference_guard:
-            async with self._lock:
-                if not self._queue:
-                    return
-
-                # Take at most max_batch_size requests; leave any excess
-                # queued for the next drain instead of unboundedly growing
-                # the batch (submit() re-triggers processing whenever the
-                # queue is at/above max_batch_size, so leftovers get picked
-                # up promptly rather than waiting for the next timeout tick).
-                batch = self._queue[:self.max_batch_size]
-                self._queue = self._queue[self.max_batch_size:]
-                PENDING_REQUESTS.set(len(self._queue))
-
-            if not batch:
-                return
-
-            batch_size = len(batch)
-            self.total_batches += 1
-            self.total_batch_size += batch_size
-
-            with tracer.start_as_current_span("batcher.process_batch") as span:
-                # Record batch metrics
-                TOTAL_BATCHES.inc()
-                BATCH_SIZE.observe(batch_size)
-
-                span.set_attribute("batch_id", self.total_batches)
-                span.set_attribute("batch_size", batch_size)
-
-                # Calculate queue wait times (monotonic: immune to wall-clock adjustments)
-                current_time = time.monotonic()
-                for req in batch:
-                    queue_time = current_time - req.created_at
-                    BATCH_QUEUE_TIME.observe(queue_time)
-                    self.total_queue_time += queue_time
-                    self.total_queue_samples += 1
-
-                logger.info(
-                    "Processing batch",
-                    extra={"extra_data": {
-                        "batch_id": self.total_batches,
-                        "batch_size": batch_size
-                    }}
+            span.set_attribute("deduplicated", coalesced)
+            if coalesced:
+                self.total_deduplicated += 1
+                DEDUPLICATED_REQUESTS.inc()
+                DEDUP_RATIO.set(
+                    self.total_deduplicated / self.total_requests
+                    if self.total_requests else 0
+                )
+                logger.debug(
+                    "Coalesced onto in-flight request",
+                    extra={"extra_data": {"cache_key": cache_key[:8]}}
                 )
 
-                try:
-                    # Group requests by cache_key for deduplication (same key
-                    # implies identical prompt + temperature + top_p + max_tokens).
-                    unique_prompts: Dict[str, List[BatchRequest]] = {}
-                    for req in batch:
-                        if req.cache_key not in unique_prompts:
-                            unique_prompts[req.cache_key] = []
-                        unique_prompts[req.cache_key].append(req)
+            # shield: one waiter timing out or disconnecting must not cancel
+            # an inference that other waiters are still expecting.
+            if timeout is not None:
+                return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+            return await asyncio.shield(task)
 
-                    dedup_count = batch_size - len(unique_prompts)
-                    span.set_attribute("unique_prompts", len(unique_prompts))
-                    span.set_attribute("deduplicated", dedup_count)
+    def _retire(self, cache_key: str, task: asyncio.Task) -> None:
+        """Drop a finished task from the in-flight map. Runs as a done-callback."""
+        current = self._inflight.get(cache_key)
+        if current is task:
+            # Mutating a dict from a done-callback is safe: callbacks run on
+            # the event loop thread, same as everything that reads it.
+            self._inflight.pop(cache_key, None)
 
-                    if dedup_count > 0:
-                        self.total_deduplicated += dedup_count
-                        DEDUPLICATED_REQUESTS.inc(dedup_count)
-                        DEDUP_RATIO.set(dedup_count / batch_size)
-                        logger.info(
-                            "Deduplicated requests",
-                            extra={"extra_data": {
-                                "deduplicated": dedup_count,
-                                "unique_prompts": len(unique_prompts)
-                            }}
-                        )
-                    else:
-                        DEDUP_RATIO.set(0)
-
-                    UNIQUE_PROMPTS_PER_BATCH.observe(len(unique_prompts))
-
-                    # A single backend.generate() call applies one shared
-                    # SamplingParams to every prompt it's given, so requests
-                    # with different (temperature, top_p, max_tokens) cannot
-                    # share a call — group deduplicated requests by their
-                    # params and dispatch one call per group.
-                    params_groups: Dict[tuple, List[str]] = {}
-                    for cache_key, reqs in unique_prompts.items():
-                        params_key = (reqs[0].temperature, reqs[0].top_p, reqs[0].max_tokens)
-                        params_groups.setdefault(params_key, []).append(cache_key)
-
-                    total_tokens = 0
-                    for (temperature, top_p, max_tokens), cache_keys in params_groups.items():
-                        prompts_to_infer = [unique_prompts[k][0].prompt for k in cache_keys]
-
-                        group_start = time.perf_counter()
-                        results = await self._run_batch_inference(
-                            prompts_to_infer, max_tokens, temperature, top_p
-                        )
-                        group_duration = time.perf_counter() - group_start
-
-                        # Exemplar for metric-trace correlation
-                        trace_id = get_current_trace_id()
-                        exemplar = {"trace_id": trace_id} if trace_id else None
-                        BATCH_PROCESSING_TIME.observe(group_duration, exemplar=exemplar)
-
-                        for cache_key, result in zip(cache_keys, results):
-                            if result.get("ttft", 0) > 0:
-                                TTFT.observe(result["ttft"])
-                                self.total_ttft += result["ttft"]
-                            if result.get("tpot", 0) > 0:
-                                TPOT.observe(result["tpot"])
-                                self.total_tpot += result["tpot"]
-                                self.total_inference_samples += 1
-                            tokens = result.get("total_tokens", 0)
-                            TOKENS_GENERATED.inc(tokens)
-                            total_tokens += tokens
-
-                            # Store in cache and distribute to all requests
-                            # sharing this cache_key.
-                            await self.cache.put(cache_key, result)
-                            for req in unique_prompts[cache_key]:
-                                if not req.future.done():
-                                    req.future.set_result(result)
-
-                    logger.info(
-                        "Batch inference completed",
-                        extra={"extra_data": {
-                            "batch_id": self.total_batches,
-                            "prompts": len(unique_prompts),
-                            "param_groups": len(params_groups),
-                            "tokens": total_tokens
-                        }}
-                    )
-
-                except Exception as e:
-                    span.set_attribute("error", True)
-                    # On error, fail all requests in batch
-                    INFERENCE_ERRORS.labels(error_type=type(e).__name__).inc()
-                    logger.error(
-                        "Batch processing error",
-                        extra={"extra_data": {
-                            "batch_id": self.total_batches,
-                            "error": str(e),
-                            "error_type": type(e).__name__
-                        }}
-                    )
-                    for req in batch:
-                        if not req.future.done():
-                            req.future.set_exception(e)
-
-    async def _run_batch_inference(
+    async def _execute(
         self,
-        prompts: List[str],
+        cache_key: str,
+        prompt: str,
+        temperature: float,
+        top_p: float,
+        max_tokens: int,
+    ) -> Dict[str, Any]:
+        """Wait for an admission permit, run one inference, and cache it."""
+        queued_at = time.monotonic()
+        self._waiting += 1
+        PENDING_REQUESTS.set(self._waiting)
+        # Tracks whether this request is still counted as waiting, so a
+        # cancellation while blocked on the semaphore does not leak the count.
+        counted_as_waiting = True
+        try:
+            async with self._semaphore:
+                self._waiting -= 1
+                counted_as_waiting = False
+                PENDING_REQUESTS.set(self._waiting)
+
+                queue_time = time.monotonic() - queued_at
+                BATCH_QUEUE_TIME.observe(queue_time)
+                self.total_queue_time += queue_time
+                self.total_queue_samples += 1
+
+                INFLIGHT_INFERENCES.inc()
+                try:
+                    result = await self._run_inference(
+                        prompt, max_tokens, temperature, top_p
+                    )
+                finally:
+                    INFLIGHT_INFERENCES.dec()
+        finally:
+            if counted_as_waiting:
+                self._waiting -= 1
+                PENDING_REQUESTS.set(self._waiting)
+
+        await self.cache.put(cache_key, result)
+        return result
+
+    async def _run_inference(
+        self,
+        prompt: str,
         max_tokens: int,
         temperature: float = 0.7,
         top_p: float = 0.9,
-    ) -> List[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """
-        Run batched inference through the engine.
-        This runs in a thread pool to avoid blocking the event loop.
-        OTel context is captured and re-attached in the thread.
+        Run one inference off the event loop.
+
+        backend.generate() is synchronous per the InferenceBackend protocol,
+        so it goes to a thread. OTel context is captured and re-attached
+        across that boundary.
         """
         from opentelemetry import context as otel_context
 
         loop = asyncio.get_event_loop()
-
-        # Capture OTel context before crossing thread boundary
         ctx = otel_context.get_current()
 
         def _inference_with_context():
-            # Re-attach OTel context in the thread pool thread
             token = otel_context.attach(ctx)
             try:
                 with tracer.start_as_current_span("batcher.inference") as span:
-                    span.set_attribute("num_prompts", len(prompts))
-                    results = self._sync_batch_inference(
-                        prompts, max_tokens, temperature, top_p
-                    )
-                    total_tokens = sum(r.get("total_tokens", 0) for r in results)
-                    span.set_attribute("total_tokens_generated", total_tokens)
-                    return results
+                    span.set_attribute("num_prompts", 1)
+                    result = self._sync_inference(prompt, max_tokens, temperature, top_p)
+                    span.set_attribute("total_tokens_generated", result.get("total_tokens", 0))
+                    return result
             finally:
                 otel_context.detach(token)
 
-        results = await loop.run_in_executor(None, _inference_with_context)
-        return results
+        started = time.perf_counter()
+        try:
+            result = await loop.run_in_executor(None, _inference_with_context)
+        except Exception as e:
+            INFERENCE_ERRORS.labels(error_type=type(e).__name__).inc()
+            logger.error(
+                "Inference error",
+                extra={"extra_data": {"error": str(e), "error_type": type(e).__name__}}
+            )
+            raise
+        duration = time.perf_counter() - started
 
-    def _sync_batch_inference(
+        trace_id = get_current_trace_id()
+        exemplar = {"trace_id": trace_id} if trace_id else None
+        BATCH_PROCESSING_TIME.observe(duration, exemplar=exemplar)
+
+        # One backend call per request now. These two keep their meaning --
+        # "prompts handed to one backend call" -- the distribution is simply
+        # degenerate while fan-out is one prompt per call.
+        self.total_batches += 1
+        self.total_batch_size += 1
+        TOTAL_BATCHES.inc()
+        BATCH_SIZE.observe(1)
+        UNIQUE_PROMPTS_PER_BATCH.observe(1)
+
+        if result.get("ttft", 0) > 0:
+            TTFT.observe(result["ttft"])
+            self.total_ttft += result["ttft"]
+        if result.get("tpot", 0) > 0:
+            TPOT.observe(result["tpot"])
+            self.total_tpot += result["tpot"]
+            self.total_inference_samples += 1
+        TOKENS_GENERATED.inc(result.get("total_tokens", 0))
+
+        return result
+
+    def _sync_inference(
         self,
-        prompts: List[str],
+        prompt: str,
         max_tokens: int,
         temperature: float = 0.7,
         top_p: float = 0.9,
-    ) -> List[Dict[str, Any]]:
-        """Synchronous batch inference - runs in thread pool."""
+    ) -> Dict[str, Any]:
+        """Synchronous single-prompt inference - runs in the thread pool."""
         backend = self.engine.backend
         sampling_params = backend.create_sampling_params(
             temperature=temperature, top_p=top_p, max_tokens=max_tokens
         )
 
         start_time = time.perf_counter()
-        backend_results = backend.generate(prompts, sampling_params)
-        end_time = time.perf_counter()
+        backend_results = backend.generate([prompt], sampling_params)
+        total_time = time.perf_counter() - start_time
 
-        total_time = end_time - start_time
+        br = backend_results[0]
+        num_tokens = br["num_tokens"]
+        metrics = br.get("metrics", {})
 
-        results = []
-        for br in backend_results:
-            num_tokens = br["num_tokens"]
-            metrics = br.get("metrics", {})
+        ttft = metrics.get("ttft", 0.0)
+        gen_time = metrics.get("gen_time", total_time)
+        tpot = (gen_time / num_tokens) if num_tokens > 0 else 0
 
-            ttft = metrics.get("ttft", 0.0)
-            gen_time = metrics.get("gen_time", total_time / len(prompts))
-
-            tpot = (gen_time / num_tokens) if num_tokens > 0 else 0
-
-            results.append({
-                "text": br["text"],
-                "ttft": ttft,
-                "tpot": tpot,
-                "total_tokens": num_tokens,
-            })
-
-        return results
+        return {
+            "text": br["text"],
+            "ttft": ttft,
+            "tpot": tpot,
+            "total_tokens": num_tokens,
+        }
 
     def get_metrics(self) -> Dict[str, Any]:
-        """Return batching metrics including cache stats."""
+        """Return admission/dedup metrics including cache stats."""
         avg_batch_size = (self.total_batch_size / self.total_batches) if self.total_batches > 0 else 0
         avg_queue_time = (
             self.total_queue_time / self.total_queue_samples if self.total_queue_samples > 0 else 0
@@ -470,7 +399,8 @@ class RequestBatcher:
             "total_requests": self.total_requests,
             "total_batches": self.total_batches,
             "average_batch_size": round(avg_batch_size, 2),
-            "pending_requests": len(self._queue),
+            "pending_requests": self._waiting,
+            "inflight_inferences": len(self._inflight),
             "total_deduplicated": self.total_deduplicated,
             "avg_queue_time_s": round(avg_queue_time, 4),
             "avg_ttft_s": round(avg_ttft, 4),

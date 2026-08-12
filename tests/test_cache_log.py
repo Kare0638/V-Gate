@@ -77,13 +77,15 @@ async def test_cache_hit_emits_debug_log(caplog, monkeypatch):
 
     await batcher.start()
     try:
-        async def _fake_run_batch_inference(prompts, max_tokens, temperature=0.7, top_p=0.9):
-            return [
-                {"text": f"Response to: {p[:30]}", "ttft": 0.0, "tpot": 0.001, "total_tokens": 10}
-                for p in prompts
-            ]
+        async def _fake_run_inference(prompt, max_tokens, temperature=0.7, top_p=0.9):
+            return {
+                "text": f"Response to: {prompt[:30]}",
+                "ttft": 0.0,
+                "tpot": 0.001,
+                "total_tokens": 10,
+            }
 
-        monkeypatch.setattr(batcher, "_run_batch_inference", _fake_run_batch_inference)
+        monkeypatch.setattr(batcher, "_run_inference", _fake_run_inference)
 
         with caplog.at_level(logging.DEBUG, logger="vgate.batcher"):
             await batcher.submit("Hello world", max_tokens=50, temperature=0.7, top_p=0.9)

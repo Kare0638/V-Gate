@@ -64,7 +64,26 @@ model:
 
 # Request batching / 请求批处理
 batch:
+  # Maximum concurrent inferences (admission control).
+  #
+  # NOTE: the meaning of this key changed. It used to size a batching window
+  # -- how many requests were collected before one backend call. The gateway
+  # no longer builds batches: each request calls the backend on its own, so
+  # a routing decision happens per request, and vLLM/SGLang do the actual
+  # batching internally (which they do better, since they can admit a request
+  # into a batch that is already decoding).
+  #
+  # The key is unchanged so existing configs keep loading, and the value
+  # still bounds how much work reaches the backend at once.
+  #
+  # With a backend that is not safe to call concurrently (the in-process
+  # vLLM/SGLang engines), the effective limit is forced to 1 regardless of
+  # this value. It takes effect when the gateway forwards to remote workers.
   max_batch_size: 8
+
+  # DEPRECATED and ignored. There is no batching window to wait for. Still
+  # accepted so existing configs do not fail to load; the startup log reports
+  # the value it is ignoring.
   max_wait_time_ms: 50.0
 
 # Result cache / 结果缓存
