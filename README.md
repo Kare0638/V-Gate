@@ -691,12 +691,15 @@ Prerequisites for distributing anything: a single node must fail predictably bef
 
 ### Priority 2: Distributed Inference Serving
 
-- [ ] Split the gateway from inference workers behind a worker API
-- [ ] Add a worker registry with health checks and failure isolation
-- [ ] Add routing strategies: round-robin, least-inflight, and EWMA latency
-- [ ] Add worker circuit breakers, draining, and recovery on rejoin
-- [ ] Add gateway-to-worker authentication for a private cluster
+- [x] Split the gateway from inference workers behind an internal HTTP API
+- [x] Add a worker registry with background health checks and failure isolation
+- [x] Add gateway-to-worker bearer authentication for a private cluster
+- [~] Add routing strategies — round-robin is implemented; least-inflight and EWMA latency are not
+- [~] Add worker circuit breakers, draining, and recovery on rejoin — failing workers leave rotation and rejoin after sustained health; there is no in-flight draining
+- [ ] Redefine `RequestBatcher` as dedup/admission/fan-out so routing decisions are per request rather than per batch
 - [ ] Measure 1-worker vs N-worker throughput, tail latency, and behavior under injected worker failure
+
+`[~]` marks partial items. Routing is currently decided once per batch, not per request, which is why least-inflight is not implemented yet: it would be choosing between workers on a signal it cannot act on at that granularity.
 
 ### Priority 3: Heterogeneous Kubernetes Deployment
 
