@@ -241,6 +241,50 @@ DEDUP_RATIO = _safe_metric(
 )
 
 
+# =============================================================================
+# Worker Routing Metrics
+# =============================================================================
+#
+# `worker` is the configured endpoint, which is bounded by config and does not
+# grow with traffic. No request-scoped value (prompt, request id, error text)
+# is used as a label.
+
+WORKER_HEALTHY = _safe_metric(
+    Gauge,
+    "vgate_worker_healthy",
+    "Whether a worker is currently in rotation (1) or removed (0)",
+    labelnames=["worker"]
+)
+
+WORKER_STATE_CHANGES = _safe_metric(
+    Counter,
+    "vgate_worker_state_changes_total",
+    "Worker health transitions",
+    labelnames=["worker", "transition"]
+)
+
+WORKER_REQUESTS = _safe_metric(
+    Counter,
+    "vgate_worker_requests_total",
+    "Requests dispatched to a worker by outcome",
+    labelnames=["worker", "outcome"]
+)
+
+WORKER_RETRIES = _safe_metric(
+    Counter,
+    "vgate_worker_retries_total",
+    "Requests retried on another worker after a connection failure",
+    labelnames=["worker"]
+)
+
+WORKER_LATENCY = _safe_metric(
+    Histogram,
+    "vgate_worker_latency_seconds",
+    "Time spent in a worker generate call",
+    labelnames=["worker"]
+)
+
+
 def init_app_info(version: str = "0.3.0", model: str = "unknown"):
     """Initialize application info metric."""
     APP_INFO.info({

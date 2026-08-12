@@ -46,13 +46,13 @@ services:
       - cpu
 
   # ---------------------------------------------------------------------------
-  # Split mode — gateway and inference worker as separate processes
+  # Split mode — gateway and inference workers as separate processes
   # docker compose --profile split up
   #
   # The gateway holds no model: it owns admission, batching, caching, and
-  # observability, and forwards inference to the worker over HTTP. Runs on the
-  # CPU image with a dry-run worker so the topology can be exercised without a
-  # GPU. Streaming is not supported through a worker yet and returns 501.
+  # observability, and routes inference to workers over HTTP. Runs on the CPU
+  # image with dry-run workers so the topology can be exercised without a GPU.
+  # Streaming is not supported through a worker yet and returns 501.
   # ---------------------------------------------------------------------------
   vgate-gateway:
     build:
@@ -64,14 +64,19 @@ services:
     environment:
       - VGATE_ROLE=gateway
       - VGATE_CONFIG_PATH=/app/config.yaml
-      - VGATE_WORKER__ENDPOINTS=["http://vgate-worker:8000"]
+      # Both workers are listed explicitly. Compose's `--scale` gives replicas
+      # a shared DNS name rather than individual ones, which a static registry
+      # cannot address one by one.
+      - VGATE_WORKER__ENDPOINTS=["http://vgate-worker-1:8000","http://vgate-worker-2:8000"]
     depends_on:
-      vgate-worker:
+      vgate-worker-1:
+        condition: service_healthy
+      vgate-worker-2:
         condition: service_healthy
     profiles:
       - split
 
-  vgate-worker:
+  vgate-worker-1: &vgate-worker
     build:
       context: .
       target: vgate-cpu
@@ -80,7 +85,7 @@ services:
       - VGATE_ROLE=worker
       - VGATE_DRY_RUN=true
       - VGATE_CONFIG_PATH=/app/config.yaml
-    # Deliberately no published port: the worker is reachable only from the
+    # Deliberately no published port: workers are reachable only from the
     # gateway on the compose network, not from the host.
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -88,6 +93,13 @@ services:
       timeout: 3s
       retries: 10
       start_period: 10s
+    profiles:
+      - split
+
+  # Identical to worker-1. Stop it (`docker compose stop vgate-worker-2`) to
+  # watch the gateway remove it from rotation and keep serving.
+  vgate-worker-2:
+    <<: *vgate-worker
     profiles:
       - split
 

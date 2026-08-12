@@ -34,6 +34,8 @@ from vgate.metrics import (
 )
 from vgate.security import SecurityMiddleware
 from vgate.tracing import init_tracing, shutdown_tracing, get_current_trace_id
+from vgate.health_checker import WorkerHealthChecker
+from vgate.worker_registry import NoHealthyWorkersError
 from vgate import worker_api
 
 # Prometheus client for metrics endpoint
@@ -56,12 +58,13 @@ IS_WORKER = config.role == "worker"
 # Lazy initialization - will be set in lifespan
 engine = None
 batcher = None
+health_checker = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager for startup/shutdown."""
-    global engine, batcher
+    global engine, batcher, health_checker
 
     # Initialize tracing before other components
     init_tracing(config)
@@ -100,6 +103,17 @@ async def lifespan(app: FastAPI):
     # Initialize the RequestBatcher (uses config defaults)
     batcher = RequestBatcher(engine=engine)
 
+    # Probe workers in the background so recovery is noticed on an idle
+    # gateway too, not only when a request happens to retry a dead worker.
+    if engine.is_remote:
+        health_checker = WorkerHealthChecker(
+            registry=engine.backend.registry,
+            interval_seconds=config.worker.health_check_interval_seconds,
+            timeout_seconds=config.worker.health_check_timeout_seconds,
+            api_key=config.worker.api_key,
+        )
+        await health_checker.start()
+
     # Startup: start the batcher
     await batcher.start()
     app_logger.info(
@@ -128,6 +142,12 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown: stop the batcher
     await batcher.stop()
+    if health_checker is not None:
+        await health_checker.stop()
+    # getattr: shutdown must not raise on an unexpected engine object, or the
+    # real reason the process is going down gets masked by an AttributeError.
+    if getattr(engine, "is_remote", False):
+        engine.backend.shutdown()
     shutdown_tracing()
     app_logger.info("V-Gate stopped")
 
@@ -444,6 +464,20 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 "total_tokens": response.get("total_tokens", 0) + response.get("prompt_tokens", 0),
             },
         }
+    except NoHealthyWorkersError as e:
+        # Every worker is out of rotation. This is capacity unavailable, not a
+        # bad request or a gateway bug, so it is a 503 with Retry-After rather
+        # than a 500 — the distinction is what tells a client to back off and
+        # retry instead of treating the request as poison.
+        app_logger.error(
+            "No healthy workers",
+            extra={"extra_data": {"error": str(e)}}
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=str(e),
+            headers={"Retry-After": "5"},
+        )
     except Exception as e:
         app_logger.error(
             "Chat completion error",
@@ -504,7 +538,7 @@ async def get_stats():
     Useful for monitoring and debugging.
     """
     metrics = batcher.get_metrics()
-    return {
+    stats = {
         "batcher": {
             "total_requests": metrics["total_requests"],
             "total_batches": metrics["total_batches"],
@@ -537,6 +571,13 @@ async def get_stats():
         },
         "version": APP_VERSION,
     }
+
+    # Only present when inference is remote; an in-process gateway has no
+    # workers to report on.
+    if engine is not None and engine.is_remote:
+        stats["workers"] = engine.backend.registry.snapshot()
+
+    return stats
 
 
 class BenchmarkRequest(BaseModel):
