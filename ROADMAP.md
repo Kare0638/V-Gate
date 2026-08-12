@@ -34,7 +34,7 @@ Current gaps:
 - Cache is RAM-only. There is no persistent local disk cache layer, and cache value depends on process lifetime. This is an intentional, benchmark-gated decision (Phase 1.5), not an oversight — current traffic shows no L1 eviction pressure.
 - Backpressure, request timeout, circuit breaking, and worker failure handling are incomplete.
 - The embedding endpoint is currently a mock MVP implementation.
-- The v2 C++/CUDA work is documented as a proposal, not implemented runtime code.
+- C++/CUDA lower-level performance work (Phase 7-8) is deliberately gated behind measured bottlenecks and has not been started.
 
 ---
 
