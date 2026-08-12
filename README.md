@@ -5,18 +5,15 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
 
-**V-Gate** is an AI infrastructure project for real-time model serving and, in its next stage, distributed multimedia data processing. Today it provides an OpenAI-shaped Chat Completions subset with streaming, dynamic micro-batching, result caching, observability, security, benchmarking, and container/Kubernetes deployment artifacts. The [vLLM](https://github.com/vllm-project/vllm) path has been exercised against a live GPU; the [SGLang](https://github.com/sgl-project/sglang) path is currently a unit-tested non-streaming adapter and has not yet been validated against a live SGLang engine.
+**V-Gate** is an LLM inference gateway being built toward distributed serving: a gateway tier that owns admission, batching, caching, and routing, in front of a pool of inference workers.
 
-The project is evolving from a single-node inference gateway into a two-plane platform:
+The gateway tier is implemented — an OpenAI-shaped Chat Completions subset with streaming, dynamic micro-batching, result caching, observability, security, benchmarking, and container/Kubernetes deployment artifacts. The [vLLM](https://github.com/vllm-project/vllm) path has been exercised against a live GPU; the [SGLang](https://github.com/sgl-project/sglang) path is currently a unit-tested non-streaming adapter and has not yet been validated against a live SGLang engine.
 
-- an **online serving plane** for low-latency inference (currently text generation, with multimodal requests planned);
-- an **asynchronous batch compute plane** for Daft multimedia pipelines running locally with the native runner or distributed through Ray.
-
-The text-serving baseline of the online plane is implemented. Multimodal requests and the batch compute plane are planned engineering milestones and are not available in the current release. Live-GPU validation has been performed on one NVIDIA GeForce RTX 3060 Laptop GPU with 6GB VRAM; no RTX 4060 or multi-GPU validation is claimed.
+**The worker tier is not implemented yet.** The runtime today is one gateway process holding one in-process backend, not multi-worker serving. Splitting gateway from workers — worker registry, health checks, latency-aware routing, circuit breaking, and 1-vs-N worker evidence — is the current top priority and is tracked as [Phase 4](ROADMAP.md#phase-4-multi-worker-serving). Multimodal requests are a separate planned milestone. Live-GPU validation has been performed on one NVIDIA GeForce RTX 3060 Laptop GPU with 6GB VRAM; no RTX 4060 or multi-GPU validation is claimed.
 
 ## Validated Evidence
 
-The evidence below is a measured snapshot of the serving plane, not evidence for the planned multimedia batch plane. The vLLM run predates parts of the current async path and is retained as a directional baseline pending a refreshed repeat-run report.
+The evidence below is a measured snapshot of the current serving path. The vLLM run predates parts of the current async path and is retained as a directional baseline pending a refreshed repeat-run report.
 
 | Path | Evidence | Scope |
 |------|----------|-------|
@@ -42,70 +39,50 @@ The evidence below is a measured snapshot of the serving plane, not evidence for
 | **Configuration as Code** | Implemented | YAML configuration with environment-variable overrides |
 | **Container Deployment** | Implemented | Docker CPU/GPU targets, Compose stack, and baseline Kubernetes manifests |
 | **Python Client SDK** | Implemented | Sync/async clients with deterministic streaming cleanup |
-| **Multimedia Job API** | Planned | Submit, inspect, and cancel asynchronous multimedia jobs |
-| **Ray Jobs Integration** | Planned | Let the independent job worker submit and reconcile batch entrypoints on an external Ray cluster |
-| **Daft Pipelines** | Planned | Native local execution and a Daft Ray Runner for distributed video processing and Parquet output |
+| **Gateway/Worker Split** | Planned | Move inference out of the gateway process behind a worker API |
+| **Worker Registry & Health** | Planned | Worker registration, health checks, and failure isolation |
+| **Latency-Aware Routing** | Planned | Round-robin, least-inflight, and EWMA-latency routing strategies |
+| **Circuit Breaking & Recovery** | Planned | Trip on unhealthy workers, drain, and rejoin on recovery |
 
 ---
 
 ## Architecture
 
-V-Gate keeps latency-sensitive online inference separate from asynchronous data processing. Solid arrows below represent the current serving path; dashed arrows represent the planned batch compute path.
+Solid arrows are the current runtime; dashed arrows are the planned gateway/worker split. Today everything below runs inside a single process — the backend is called in-process, not over a worker API.
 
 ```mermaid
 flowchart LR
-    Client[Client / SDK] --> API[V-Gate API]
+    Client[Client / SDK] --> API[Gateway API]
 
-    API --> Serving[Online Serving Plane]
-    Serving --> NonStream[Non-streaming Path]
-    Serving --> Stream[Direct SSE Path / vLLM or dry-run]
-    NonStream --> Batcher[Batching / Cache]
-    Batcher --> VLLM[vLLM]
-    Batcher --> SGLang[SGLang]
-    Stream --> VLLM
+    subgraph GW[Gateway tier - implemented]
+        API --> Sec[Auth / Rate limit]
+        Sec --> NonStream[Non-streaming path]
+        Sec --> Stream[Streaming path / SSE]
+        NonStream --> Batcher[Admission / Batching / Cache]
+    end
 
-    API -. planned .-> Jobs[Multimedia Job Controller]
-    Jobs -. queued job .-> Worker[Job Worker]
-    Worker -. local .-> Native[Daft Pipeline / Native Runner]
-    Worker -. distributed submit .-> RayJobs[Ray Jobs API]
-    RayJobs -. launch .-> RayDaft[Daft Pipeline / Ray Runner]
-    Native -. CPU operations .-> CPU[Decode / Sample / Transform]
-    Native -. GPU operation .-> GPU["Daft @daft.cls GPU UDF"]
-    RayDaft -. CPU operations .-> CPU
-    RayDaft -. GPU operation .-> GPU
-    GPU -. planned .-> Adapter[Batch Multimodal Adapter]
-    Adapter -. model execution .-> BatchVLLM[vLLM Multimodal Engine]
-    Native -. output .-> Store[Object Storage / Parquet]
-    RayDaft -. output .-> Store
+    Batcher --> Backend[In-process backend]
+    Stream --> Backend
+    Backend --> VLLM[vLLM]
+    Backend --> SGLang[SGLang]
 
-    Serving --> Obs[Metrics / Logs / Traces]
-    Jobs -. planned .-> Obs
+    Batcher -. planned .-> Router[Router: round-robin / least-inflight / EWMA]
+    Router -. planned .-> Registry[Worker registry + health checks]
+    Registry -. planned .-> W1[Inference worker 1]
+    Registry -. planned .-> W2[Inference worker N]
+    Router -. planned .-> CB[Circuit breaker / recovery]
+
+    GW --> Obs[Metrics / Logs / Traces]
+    W1 -. planned .-> Obs
 ```
 
-The planned batch path will live in this repository but run through a separate job-worker process. Local jobs will use Daft's native runner; distributed jobs will be submitted through the Ray Jobs API and run the same pipeline with Daft's Ray Runner. The FastAPI gateway will not start a Ray cluster, and Daft will not sit on the latency-sensitive chat/streaming path.
-
-### Target Multimedia Workflow
-
-The first end-to-end batch workload is intentionally narrow and measurable:
-
-```text
-video manifest or object-store URI
-  -> job worker
-  -> local: Daft native runner | distributed: Ray Jobs -> Daft Ray Runner
-  -> Daft CPU operations: decode, key-frame sampling, preprocessing
-  -> stateful @daft.cls GPU UDF
-  -> planned batch-only multimodal adapter -> vLLM inference
-  -> aggregation, job metadata, and Parquet/JSON output
-```
-
-Planned acceptance evidence includes local-vs-Ray and 1-vs-N CPU-worker benchmarks, task retry/cancellation tests, injected worker failures, and per-stage queue time, latency, retry, and CPU/GPU-time metrics. Real-GPU batch evidence is planned on rented 2x A100 hardware rather than the 6GB development device; GPU scaling claims will stop at a measured 1-vs-2 comparison and will not be extrapolated to larger clusters.
+The target boundary: the gateway owns admission control, deduplication, caching, routing, and observability; each worker owns one engine instance and reports health and inflight load. That split is what makes 1-vs-N worker scaling, health-aware failover, and independent GPU-node placement measurable rather than hypothetical.
 
 ---
 
 ## Documentation
 
-- [Roadmap](ROADMAP.md): detailed roadmap for the **online serving track** — correctness, continuous batching, reliability, multi-worker routing, Kubernetes, and performance work, with per-phase acceptance criteria. Its `Phase 0-8` numbering is internal to that track and is not a cross-track priority order; the [Roadmap](#roadmap) section below is the authoritative ordering across both planes.
-- [Batch compute plane design](docs/design/BATCH_PLANE.md): design proposal and ordered task breakdown for the Priority 1 multimedia batch compute plane, including the Daft native/Ray runner split, job-worker boundary, and persistent job-store design.
+- [Roadmap](ROADMAP.md): detailed roadmap — correctness, continuous batching, reliability, multi-worker routing, Kubernetes, and performance work, with per-phase acceptance criteria. Its `Phase 0-8` numbering is internal to that document; the [Roadmap](#roadmap) section below is the authoritative priority ordering.
 - [Documentation conventions](docs/README.md): meaning of the Implemented / Partial / Planned / Design proposal status labels used across these docs.
 - [V2 architecture proposal](docs/design/V2_ARCHITECTURE_PROPOSAL.md): design proposal for future C++/CUDA data-plane work.
 - [Containerization test report](docs/reports/CONTAINERIZATION_TEST_REPORT.md): Docker validation notes.
@@ -644,28 +621,29 @@ ruff check .
 - [x] Concurrent load tools and checked-in dry-run/real-GPU benchmark reports
 - [x] Docker, baseline Kubernetes manifests, CI, and sync/async Python SDK
 
-The priority order below is authoritative across both planes. The batch compute plane is sequenced first because it is architecturally independent of the serving-side work: a separate job worker runs Daft locally or submits the pipeline through Ray Jobs, so it does not depend on splitting the gateway into gateway + inference workers (Priority 2). [ROADMAP.md](ROADMAP.md) holds the detailed acceptance criteria for the Priority 2/3 serving items; its internal `Phase` numbering does not imply execution order relative to Priority 1. [docs/design/BATCH_PLANE.md](docs/design/BATCH_PLANE.md) expands Priority 1 into acceptance criteria and implementation details.
+The priority order below is authoritative. [ROADMAP.md](ROADMAP.md) holds the detailed acceptance criteria; its internal `Phase` numbering is a different axis and does not imply execution order relative to these priorities.
 
-### Priority 1: Multimedia Batch Compute Plane
+### Priority 1: Backpressure And Reliability
 
-- [ ] Run a technical spike to pin the batch compatibility matrix, validate Daft's native/Ray runner behavior, and select a multimodal model on the rented benchmark hardware
-- [ ] Build a Daft-native vertical slice: manifest ingestion, validation, frame sampling, fake captioning, and Parquet output
-- [ ] Add a persistent SQLite Job API and independent job worker with submit/status/cancel lifecycle and idempotent job IDs
-- [ ] Submit the same pipeline through Ray Jobs with Daft's Ray Runner and explicit CPU/GPU resource requirements
-- [ ] Add a stateful `@daft.cls(gpus=1)` UDF backed by a batch-only vLLM multimodal adapter, with a batch-size sweep and a 1-vs-2 GPU measurement
-- [ ] Add retry, cancellation, checkpointing, dead-letter output, failure injection, and local-vs-Ray / 1-vs-N CPU-worker benchmarks with per-stage CPU/GPU-time metrics
-
-### Priority 2: Serving Reliability
+Prerequisites for distributing anything: a single node must fail predictably before N nodes can.
 
 - [ ] Unify streaming and non-streaming admission control
-- [ ] Add bounded queues, deadlines, stable overload responses, and backend abort on cancellation
-- [ ] Split gateway and inference workers; add discovery, health-aware routing, circuit breakers, and recovery
-- [ ] Compare 1-worker and N-worker throughput, tail latency, and behavior under injected failures
+- [ ] Add bounded queues, deadlines, and stable overload responses
+- [ ] Abort backend work on client cancellation instead of computing orphaned tokens
+- [ ] Add request timeouts and per-backend error classification
+
+### Priority 2: Distributed Inference Serving
+
+- [ ] Split the gateway from inference workers behind a worker API
+- [ ] Add a worker registry with health checks and failure isolation
+- [ ] Add routing strategies: round-robin, least-inflight, and EWMA latency
+- [ ] Add worker circuit breakers, draining, and recovery on rejoin
+- [ ] Add gateway-to-worker authentication for a private cluster
+- [ ] Measure 1-worker vs N-worker throughput, tail latency, and behavior under injected worker failure
 
 ### Priority 3: Heterogeneous Kubernetes Deployment
 
-- [ ] Deploy the gateway/job API, job worker, Ray head, CPU workers, and GPU workers as separate components
-- [ ] Replace the single-host SQLite job store with a networked store before splitting the control plane across pods
+- [ ] Deploy the gateway and inference workers as separate components
 - [ ] Add GPU node placement and independent CPU/GPU worker scaling
 - [ ] Scale on pending resource demand and queue/inflight signals instead of CPU utilization alone
 - [ ] Add worker-down, overload, and tail-latency alerts plus an operational runbook

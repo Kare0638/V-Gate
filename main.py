@@ -106,8 +106,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="V-Gate AI Model Serving Gateway",
-    description="A high-performance AI model serving gateway for various models.",
+    title="V-Gate LLM Inference Gateway",
+    description="An LLM inference gateway providing an OpenAI-shaped Chat Completions subset with streaming, admission control, dynamic micro-batching, result caching, and observability.",
     version=APP_VERSION,
     lifespan=lifespan,
 )
