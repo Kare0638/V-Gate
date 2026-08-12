@@ -23,7 +23,7 @@ import time
 from unittest.mock import MagicMock, patch
 from dataclasses import dataclass
 
-from vgate.batcher import RequestBatcher, BatchRequest
+from vgate.batcher import RequestBatcher
 
 
 class MockBackend:
@@ -61,6 +61,42 @@ class MockEngine:
         self.backend = MockBackend()
 
 
+class _SlowBackend:
+    """Backend with a controllable delay, for timeout/cancellation tests."""
+
+    def __init__(self, delay: float):
+        self.delay = delay
+        self.calls = 0
+
+    def create_sampling_params(self, temperature, top_p, max_tokens):
+        return {"temperature": temperature, "top_p": top_p, "max_tokens": max_tokens}
+
+    def generate(self, prompts, sampling_params):
+        import time as _t
+
+        self.calls += 1
+        _t.sleep(self.delay)
+        return [
+            {
+                "text": f"Response to: {p[:30]}",
+                "token_ids": list(range(10)),
+                "num_tokens": 10,
+                "metrics": {},
+            }
+            for p in prompts
+        ]
+
+    def shutdown(self):
+        pass
+
+
+class _EngineWith:
+    """Minimal engine wrapper around an arbitrary backend."""
+
+    def __init__(self, backend):
+        self.backend = backend
+
+
 @pytest.fixture
 def mock_engine():
     """Create a mock engine for testing."""
@@ -77,26 +113,6 @@ def batcher(mock_engine):
     )
 
 
-class TestBatchRequest:
-    """Tests for BatchRequest dataclass."""
-
-    def test_creation(self):
-        """Test BatchRequest can be created with required fields."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            req = BatchRequest(
-                prompt="Hello world",
-                max_tokens=100,
-            )
-            assert req.prompt == "Hello world"
-            assert req.max_tokens == 100
-            assert req.future is not None
-            assert req.created_at > 0
-        finally:
-            loop.close()
-
-
 class TestRequestBatcher:
     """Tests for RequestBatcher class."""
 
@@ -105,7 +121,9 @@ class TestRequestBatcher:
         """Test batcher can start and stop cleanly."""
         await batcher.start()
         assert batcher._running is True
-        assert batcher._batch_task is not None
+        # No background loop any more: requests drive their own inference
+        # instead of waiting for a timer to seal a window.
+        assert batcher._inflight == {}
 
         await batcher.stop()
         assert batcher._running is False
@@ -243,34 +261,60 @@ class TestRequestBatcher:
         await batcher.stop()
 
     @pytest.mark.asyncio
-    async def test_submit_timeout_raises_and_cleans_up_queue(self, mock_engine):
-        """A submit() timeout must raise and remove the request from the
-        queue, not leave a dead entry that would occupy a future batch slot."""
-        # max_batch_size high enough, and no start(), so nothing ever drains
-        # the queue: submit() has no way to resolve except the timeout.
-        batcher = RequestBatcher(engine=mock_engine, max_batch_size=100, max_wait_time_ms=50000.0)
+    async def test_submit_timeout_raises_without_leaking_state(self, mock_engine):
+        """
+        A submit() timeout must raise without leaking admission state.
 
-        with pytest.raises(asyncio.TimeoutError):
-            await batcher.submit("Never processed", max_tokens=50, timeout=0.05)
+        Under fan-out the timeout does *not* cancel the inference: other
+        waiters may still need it, and its result still populates the cache.
+        So the assertion is that the in-flight entry retires once the
+        inference finishes, not that it vanishes at timeout.
+        """
+        slow = _SlowBackend(delay=0.2)
+        batcher = RequestBatcher(engine=_EngineWith(slow), max_batch_size=4)
+        await batcher.start()
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await batcher.submit("Slow one", max_tokens=50, timeout=0.05)
 
-        assert len(batcher._queue) == 0
-        assert batcher.get_metrics()["pending_requests"] == 0
+            # Still running: the shield kept it alive past the caller's timeout.
+            assert len(batcher._inflight) == 1
+
+            await batcher.stop()  # drains in-flight work
+            assert batcher._inflight == {}
+            assert batcher.get_metrics()["pending_requests"] == 0
+            # The result the caller gave up on is still cached.
+            assert slow.calls == 1
+        finally:
+            await batcher.stop()
 
     @pytest.mark.asyncio
-    async def test_submit_cancellation_cleans_up_queue(self, mock_engine):
-        """Cancelling the caller's task while awaiting submit() must remove
-        the request from the queue instead of leaking it."""
-        batcher = RequestBatcher(engine=mock_engine, max_batch_size=100, max_wait_time_ms=50000.0)
+    async def test_cancellation_does_not_kill_shared_inference(self, mock_engine):
+        """
+        One caller cancelling must not cancel an inference another caller is
+        waiting on -- that is the point of shielding the shared task.
+        """
+        slow = _SlowBackend(delay=0.15)
+        batcher = RequestBatcher(engine=_EngineWith(slow), max_batch_size=4)
+        await batcher.start()
+        try:
+            first = asyncio.create_task(batcher.submit("Shared", max_tokens=50))
+            await asyncio.sleep(0.01)
+            second = asyncio.create_task(batcher.submit("Shared", max_tokens=50))
+            await asyncio.sleep(0.01)
 
-        task = asyncio.create_task(batcher.submit("Never processed", max_tokens=50))
-        await asyncio.sleep(0.01)  # let it enqueue
-        assert len(batcher._queue) == 1
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
 
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+            # The survivor still gets a result, from the same single inference.
+            result = await second
+            assert result["text"].startswith("Response to: Shared")
+            assert slow.calls == 1
+        finally:
+            await batcher.stop()
 
-        assert len(batcher._queue) == 0
+        assert batcher._inflight == {}
         assert batcher.get_metrics()["pending_requests"] == 0
 
     @pytest.mark.asyncio

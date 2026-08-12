@@ -26,6 +26,7 @@ transport for that method rather than a second API with its own semantics.
 
 import asyncio
 import time
+from contextlib import nullcontext
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, HTTPException
@@ -42,17 +43,28 @@ router = APIRouter(tags=["worker"])
 
 # Set by main.py during lifespan when running with role=worker.
 _engine = None
-# The in-process engines are not safe to call concurrently, which is why the
-# gateway's batcher holds a lock around local backends. That lock lives on the
-# gateway, so once inference moves here the worker has to enforce it itself.
+# Serializes engine access for backends that need it. Which those are is the
+# backend's own declaration, not an assumption made here: AsyncLLMEngine is
+# built to serve concurrent requests, and serializing it would leave the GPU
+# decoding one sequence at a time with continuous batching switched off.
 _inference_lock: asyncio.Lock | None = None
+_serialize_inference = True
 
 
 def set_engine(engine) -> None:
     """Bind the worker's engine. Called once from the app lifespan."""
-    global _engine, _inference_lock
+    global _engine, _inference_lock, _serialize_inference
     _engine = engine
     _inference_lock = asyncio.Lock()
+    backend = getattr(engine, "backend", None)
+    _serialize_inference = not getattr(backend, "supports_concurrent_calls", False)
+    logger.info(
+        "Worker engine bound",
+        extra={"extra_data": {
+            "backend": type(backend).__name__ if backend else None,
+            "serialized": _serialize_inference,
+        }}
+    )
 
 
 class SamplingParams(BaseModel):
@@ -92,9 +104,11 @@ async def internal_generate(request: GenerateRequest) -> GenerateResponse:
 
         started = time.perf_counter()
         try:
-            # Serialize engine access, then run the blocking call off the event
-            # loop so this worker can still answer /health while generating.
-            async with _inference_lock:
+            # Serialize only when the backend requires it, then run the
+            # blocking call off the event loop so this worker can still answer
+            # /health while generating.
+            guard = _inference_lock if _serialize_inference else nullcontext()
+            async with guard:
                 results = await asyncio.get_running_loop().run_in_executor(
                     None, backend.generate, request.prompts, sampling_params
                 )

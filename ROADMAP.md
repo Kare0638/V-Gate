@@ -29,9 +29,9 @@ What is implemented is an OpenAI-style LLM gateway with:
 Current gaps:
 
 - OpenAI API compatibility is still shallow. Streaming (`stream: true`, SSE) now works end-to-end for the dry-run backend and real vLLM (verified on GPU); SGLang still raises a clear `NotImplementedError` until its async engine path lands (Phase 2 task 8).
-- `RequestBatcher` still forms a static, sealed Python-side batch per window (queue drain, `max_batch_size`/`max_wait_time_ms`) before handing prompts to the backend — new requests still can't join an already-formed batch at that layer. Below that layer, `VLLMBackend` now submits each prompt as an independent `AsyncLLMEngine.generate()` call, so vLLM's own scheduler does get to interleave/continuously-batch them at the GPU level even though the Python-side batch above it is still static. Full task 9 (redefine `RequestBatcher` as dedup/admission/fan-out, not batch construction) is not done.
+- Streaming still bypasses `RequestBatcher` entirely (`_stream_chat_completion` calls the backend directly), so streamed requests get no cache lookup, no deduplication, and no admission control. Folding streaming into the same admission path is the remaining half of task 9.
 - Multi-worker serving runs but is unmeasured: the gateway routes round-robin across healthy workers with health-based failover, yet no 1-vs-N throughput or tail-latency evidence exists, and routing is not load-aware.
-- Routing granularity is per batch, not per request, because `RequestBatcher` still hands a whole batch to one backend call. This blocks least-inflight and EWMA routing.
+- Routing is per request now that `RequestBatcher` fans out, so least-inflight and EWMA are unblocked — but neither is implemented, and routing remains round-robin.
 - Streaming does not work through a remote worker; the gateway returns 501 rather than opening a stream it cannot serve.
 - Dry-run and single-GPU vLLM reports are checked in, but they predate parts of the current async serving path. A refreshed streaming baseline, repeat-run variance analysis, and 1-vs-N-worker evidence are still missing.
 - Cache is RAM-only. There is no persistent local disk cache layer, and cache value depends on process lifetime. This is an intentional, benchmark-gated decision (Phase 1.5), not an oversight — current traffic shows no L1 eviction pressure.
@@ -288,7 +288,7 @@ Task 5 (streaming metrics) is done: `vgate_stream_ttft_seconds`, `vgate_stream_t
 
 Known, intentional limitation: the streaming path in `main.py` (`_stream_chat_completion`) calls `engine.backend.stream_generate()` directly and bypasses `RequestBatcher` entirely — no cache lookup, no batch-level dedup, no admission control for streamed requests yet. That integration is task 9, not started.
 
-Not yet done: the SGLang async backend path (task 8) and redefining `RequestBatcher` (task 9).
+Task 9 is now half done: `RequestBatcher` has been redefined as dedup/admission/fan-out, so the non-streaming path gets per-request routing and in-flight coalescing. The streaming path still bypasses it entirely. Not yet done: the SGLang async backend path (task 8), and folding streaming into the same admission path.
 
 Priority: high.
 
@@ -406,7 +406,7 @@ Tasks:
 8. [ ] Add multi-worker benchmarks — **nothing is measured yet**; no 1-vs-N throughput or tail-latency numbers exist.
 9. [x] Add minimal gateway-to-worker authentication — bearer token on both generate calls and health probes; `/internal/generate` is not an exempt path.
 
-Blocking task 5's remaining strategies: routing is currently decided once per batch, because `RequestBatcher` still hands a whole batch to one `backend.generate()` call. Least-inflight and EWMA select between workers on per-request load, so they need Phase 2 task 9 (redefine `RequestBatcher` as dedup/admission/fan-out) first. Implementing them at batch granularity would produce a routing policy that cannot act on the signal it reads.
+Task 5's remaining strategies are now unblocked: `RequestBatcher` fans out, so each request is routed on its own and a load-aware policy can act on the signal it reads. Least-inflight needs per-worker in-flight counters; EWMA needs per-worker latency tracking with exponential decay. Neither is implemented.
 
 Retry semantics worth recording, since they are a design decision rather than a detail: a connection failure is retried on another worker because nothing was delivered; a timeout is not, because the worker may already be generating and retrying would spend two GPU generations on one client request; a non-200 is not, because another worker would most likely reject it identically.
 
