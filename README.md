@@ -83,8 +83,7 @@ The target boundary: the gateway owns admission control, deduplication, caching,
 ## Documentation
 
 - [Roadmap](ROADMAP.md): detailed roadmap — correctness, continuous batching, reliability, multi-worker routing, Kubernetes, and performance work, with per-phase acceptance criteria. Its `Phase 0-8` numbering is internal to that document; the [Roadmap](#roadmap) section below is the authoritative priority ordering.
-- [Documentation conventions](docs/README.md): meaning of the Implemented / Partial / Planned / Design proposal status labels used across these docs.
-- [V2 architecture proposal](docs/design/V2_ARCHITECTURE_PROPOSAL.md): design proposal for future C++/CUDA data-plane work.
+- [Documentation conventions](docs/README.md): meaning of the Implemented / Partial / Planned status labels used across these docs.
 - [Containerization test report](docs/reports/CONTAINERIZATION_TEST_REPORT.md): Docker validation notes.
 
 ---
