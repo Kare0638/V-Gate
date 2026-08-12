@@ -10,7 +10,7 @@
 
 ## 1. Project Positioning
 
-The target is a distributed LLM inference system: a gateway tier that owns admission, batching, caching, and routing, in front of a pool of inference workers. The gateway tier exists today; the worker tier does not.
+The target is a distributed LLM inference system: a gateway tier that owns admission, batching, caching, and routing, in front of a pool of inference workers. Both tiers exist today. What does not exist is evidence that the pool helps — no 1-vs-N measurement has been taken — or load-aware routing to make it help more.
 
 What is implemented is an OpenAI-style LLM gateway with:
 
@@ -24,12 +24,15 @@ What is implemented is an OpenAI-style LLM gateway with:
 - API key authentication and rate limiting
 - Docker / docker-compose / Kubernetes manifests
 - Python client SDK
+- separate gateway and worker roles over an internal HTTP API, with a worker registry, background health probing, round-robin routing, and automatic failover and recovery
 
 Current gaps:
 
 - OpenAI API compatibility is still shallow. Streaming (`stream: true`, SSE) now works end-to-end for the dry-run backend and real vLLM (verified on GPU); SGLang still raises a clear `NotImplementedError` until its async engine path lands (Phase 2 task 8).
 - `RequestBatcher` still forms a static, sealed Python-side batch per window (queue drain, `max_batch_size`/`max_wait_time_ms`) before handing prompts to the backend — new requests still can't join an already-formed batch at that layer. Below that layer, `VLLMBackend` now submits each prompt as an independent `AsyncLLMEngine.generate()` call, so vLLM's own scheduler does get to interleave/continuously-batch them at the GPU level even though the Python-side batch above it is still static. Full task 9 (redefine `RequestBatcher` as dedup/admission/fan-out, not batch construction) is not done.
-- The runtime is still a single gateway with a single local backend, not real multi-worker serving.
+- Multi-worker serving runs but is unmeasured: the gateway routes round-robin across healthy workers with health-based failover, yet no 1-vs-N throughput or tail-latency evidence exists, and routing is not load-aware.
+- Routing granularity is per batch, not per request, because `RequestBatcher` still hands a whole batch to one backend call. This blocks least-inflight and EWMA routing.
+- Streaming does not work through a remote worker; the gateway returns 501 rather than opening a stream it cannot serve.
 - Dry-run and single-GPU vLLM reports are checked in, but they predate parts of the current async serving path. A refreshed streaming baseline, repeat-run variance analysis, and 1-vs-N-worker evidence are still missing.
 - Cache is RAM-only. There is no persistent local disk cache layer, and cache value depends on process lifetime. This is an intentional, benchmark-gated decision (Phase 1.5), not an oversight — current traffic shows no L1 eviction pressure.
 - Backpressure, request timeout, circuit breaking, and worker failure handling are incomplete.
@@ -382,24 +385,30 @@ Expected outcome:
 
 ### Phase 4: Multi-Worker Serving
 
+**Status: mostly implemented; unmeasured.** Role separation, the internal generate API, a static registry with background health probing, round-robin routing, failover, recovery, and bearer authentication are in `main`. What is missing is the part that would justify calling it good: load-aware routing, and any measurement at all.
+
 Priority: highest for distributed serving.
 
 Reason: distributed inference serving depends on worker management, routing, health checks, and failure isolation.
 
 Tasks:
 
-1. Split gateway and worker responsibilities.
-2. Add worker HTTP/gRPC API.
-3. Maintain a worker registry in the gateway.
-4. Add worker health checks.
+1. [x] Split gateway and worker responsibilities — `role: gateway | worker`, with client-facing routes returning 404 on a worker.
+2. [x] Add worker HTTP API — `/internal/generate`, shaped as the wire form of `InferenceBackend.generate()` so `RemoteBackend` is a transport rather than a second API.
+3. [x] Maintain a worker registry in the gateway — static membership from config; the registry tracks usability, not discovery.
+4. [x] Add worker health checks — background `/health` probing on its own client, independent of request traffic, so recovery is noticed on an idle gateway.
 5. Add routing strategies:
-   - round-robin
-   - least-inflight
-   - EWMA latency
-6. Add worker circuit breakers.
-7. Add worker recovery.
-8. Add multi-worker benchmarks.
-9. Add minimal gateway-to-worker authentication suitable for a local/private cluster.
+   - [x] round-robin
+   - [ ] least-inflight
+   - [ ] EWMA latency
+6. [x] Add worker circuit breakers — threshold-based removal from rotation; no in-flight draining.
+7. [x] Add worker recovery — sustained successful probes return a worker to rotation automatically.
+8. [ ] Add multi-worker benchmarks — **nothing is measured yet**; no 1-vs-N throughput or tail-latency numbers exist.
+9. [x] Add minimal gateway-to-worker authentication — bearer token on both generate calls and health probes; `/internal/generate` is not an exempt path.
+
+Blocking task 5's remaining strategies: routing is currently decided once per batch, because `RequestBatcher` still hands a whole batch to one `backend.generate()` call. Least-inflight and EWMA select between workers on per-request load, so they need Phase 2 task 9 (redefine `RequestBatcher` as dedup/admission/fan-out) first. Implementing them at batch granularity would produce a routing policy that cannot act on the signal it reads.
+
+Retry semantics worth recording, since they are a design decision rather than a detail: a connection failure is retried on another worker because nothing was delivered; a timeout is not, because the worker may already be generating and retrying would spend two GPU generations on one client request; a non-200 is not, because another worker would most likely reject it identically.
 
 Suggested directory structure:
 

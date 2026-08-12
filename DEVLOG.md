@@ -537,7 +537,9 @@ Branch: `feat/phase4.2-python-sdk`
 
 ---
 
-## Project Progress
+## Project Progress (Historical Snapshot)
+
+This checklist records the state when the entries above were written. It is kept as a record, not as current status — the phase numbering here predates the current roadmap and does not match it. See the [README roadmap](README.md#roadmap) for authoritative status.
 
 - [x] **Phase 1**: Core MVP - Unified API Gateway
 - [ ] **Phase 2**: Performance & Efficiency Optimization
@@ -553,11 +555,15 @@ Branch: `feat/phase4.2-python-sdk`
   - [x] 4.2 Python Client SDK
   - [x] 4.3 Kubernetes Deployment
 
+Two items above have since been overtaken by work not reflected in this snapshot: 2.3 was delivered as a direct gateway/worker HTTP split with its own registry and health-based routing rather than via Ray or RunPod, and CI now runs on GitHub Actions.
+
 ---
 
 ## Next Steps
 
-| Priority | Feature | Description |
-|----------|---------|-------------|
-| 1 | **Multi-Worker Load Balancing** | Horizontal scaling with Ray/RunPod |
-| 2 | **CI/CD Pipeline** | GitHub Actions for automated testing and deployment |
+Superseded. The plan below was written before the project was repositioned around distributed inference serving; it is preserved for history. Current priorities live in the [README roadmap](README.md#roadmap) and [ROADMAP.md](ROADMAP.md).
+
+| Priority | Feature | Description | Outcome |
+|----------|---------|-------------|---------|
+| 1 | **Multi-Worker Load Balancing** | Horizontal scaling with Ray/RunPod | Delivered without Ray: gateway/worker split over an internal HTTP API, static registry, background health probing, round-robin routing, failover and recovery. Load-aware routing and 1-vs-N measurement remain open. |
+| 2 | **CI/CD Pipeline** | GitHub Actions for automated testing and deployment | Testing implemented; no deployment automation. |
