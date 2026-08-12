@@ -17,7 +17,7 @@ import time
 from typing import Optional
 
 from vgate.backends.base import DryRunBackend, InferenceBackend
-from vgate.config import ModelConfig, get_config
+from vgate.config import ModelConfig, WorkerConfig, get_config
 from vgate.tracing import get_tracer
 
 tracer = get_tracer("vgate.engine")
@@ -25,8 +25,21 @@ tracer = get_tracer("vgate.engine")
 DRY_RUN = os.getenv("VGATE_DRY_RUN", "false").lower() in ("true", "1", "yes")
 
 
-def _create_backend(engine_type: str) -> InferenceBackend:
-    """Factory function to create the appropriate inference backend."""
+def _create_backend(
+    engine_type: str, worker_config: Optional[WorkerConfig] = None
+) -> InferenceBackend:
+    """
+    Factory function to create the appropriate inference backend.
+
+    A gateway configured with worker endpoints forwards inference instead of
+    running it, so that check comes before DRY_RUN and engine_type: those
+    describe how the *worker* runs a model, and are irrelevant to a process
+    that only forwards. Without any endpoints the historical single-process
+    behavior is preserved.
+    """
+    if worker_config is not None and worker_config.endpoints:
+        from vgate.backends.remote_backend import RemoteBackend
+        return RemoteBackend(worker_config)
     if DRY_RUN:
         return DryRunBackend()
     if engine_type == "vllm":
@@ -39,19 +52,34 @@ def _create_backend(engine_type: str) -> InferenceBackend:
 
 
 class VGateEngine:
-    def __init__(self, model_config: Optional[ModelConfig] = None):
+    def __init__(
+        self,
+        model_config: Optional[ModelConfig] = None,
+        worker_config: Optional[WorkerConfig] = None,
+    ):
         """
         Initialize the inference engine with configuration.
 
         Args:
             model_config: Model configuration. If None, uses global config.
+            worker_config: Remote worker settings. If it lists endpoints, this
+                engine forwards inference instead of loading a model locally.
+                If None, uses global config.
         """
+        config = get_config()
         if model_config is None:
-            model_config = get_config().model
+            model_config = config.model
+        if worker_config is None:
+            worker_config = config.worker
 
-        self.backend: InferenceBackend = _create_backend(model_config.engine_type)
+        self.is_remote = bool(worker_config.endpoints)
+        self.backend: InferenceBackend = _create_backend(
+            model_config.engine_type, worker_config
+        )
 
-        if DRY_RUN:
+        if self.is_remote:
+            print(f"V-Gate gateway forwarding inference to {worker_config.endpoints}")
+        elif DRY_RUN:
             print("V-Gate starting in DRY-RUN mode (no GPU required)")
         else:
             self.backend.load_model(model_config)
