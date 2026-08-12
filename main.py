@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
@@ -34,6 +34,7 @@ from vgate.metrics import (
 )
 from vgate.security import SecurityMiddleware
 from vgate.tracing import init_tracing, shutdown_tracing, get_current_trace_id
+from vgate import worker_api
 
 # Prometheus client for metrics endpoint
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
@@ -47,6 +48,10 @@ app_logger = get_logger("vgate.app")
 
 # Version from config
 APP_VERSION = config.version
+
+# Role decides which half of the system this process runs: a gateway serves the
+# public API and owns batching/caching, a worker only runs inference.
+IS_WORKER = config.role == "worker"
 
 # Lazy initialization - will be set in lifespan
 engine = None
@@ -69,11 +74,31 @@ async def lifespan(app: FastAPI):
     # Initialize the VGateEngine with config (inside lifespan for multiprocessing safety)
     engine = VGateEngine()
 
-    # Initialize the RequestBatcher (uses config defaults)
-    batcher = RequestBatcher(engine=engine)
-
     # Initialize app info for Prometheus
     init_app_info(version=APP_VERSION, model=config.model.model_id)
+
+    if IS_WORKER:
+        # A worker only runs inference. Batching, caching, and admission
+        # control stay on the gateway; running them here too would batch and
+        # cache every request twice.
+        worker_api.set_engine(engine)
+        app_logger.info(
+            "V-Gate worker started",
+            extra={"extra_data": {
+                "version": APP_VERSION,
+                "model": config.model.model_id,
+                "engine_type": config.model.engine_type,
+                "security_enabled": config.security.enabled,
+            }}
+        )
+        yield
+        engine.backend.shutdown()
+        shutdown_tracing()
+        app_logger.info("V-Gate worker stopped")
+        return
+
+    # Initialize the RequestBatcher (uses config defaults)
+    batcher = RequestBatcher(engine=engine)
 
     # Startup: start the batcher
     await batcher.start()
@@ -83,6 +108,8 @@ async def lifespan(app: FastAPI):
             "version": APP_VERSION,
             "model": config.model.model_id,
             "engine_type": config.model.engine_type,
+            "inference": "remote" if engine.is_remote else "in-process",
+            "worker_endpoints": config.worker.endpoints,
             "batch_config": {
                 "max_batch_size": config.batch.max_batch_size,
                 "max_wait_time_ms": config.batch.max_wait_time_ms,
@@ -106,11 +133,24 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="V-Gate LLM Inference Gateway",
-    description="An LLM inference gateway providing an OpenAI-shaped Chat Completions subset with streaming, admission control, dynamic micro-batching, result caching, and observability.",
+    title="V-Gate LLM Inference Worker" if IS_WORKER else "V-Gate LLM Inference Gateway",
+    description=(
+        "Internal inference worker for a V-Gate gateway. Not a public API surface."
+        if IS_WORKER else
+        "An LLM inference gateway providing an OpenAI-shaped Chat Completions subset "
+        "with streaming, admission control, dynamic micro-batching, result caching, "
+        "and observability."
+    ),
     version=APP_VERSION,
     lifespan=lifespan,
 )
+
+# Mounted only in the worker role, so a gateway never exposes an unbatched,
+# uncached inference endpoint. /internal/generate is deliberately not in
+# security.exempt_paths: with security enabled it requires the same bearer key
+# as any other route, which is what authenticates the gateway to the worker.
+if IS_WORKER:
+    app.include_router(worker_api.router)
 
 # Add security middleware (runs before observability middleware)
 # Note: Middlewares are executed in LIFO order, so add security first
@@ -201,12 +241,28 @@ def messages_to_prompt(messages: list[ChatMessage]) -> str:
     return "\n".join(prompt_parts) + "\nAssistant:"
 
 
+def gateway_only() -> None:
+    """
+    Reject client-facing routes in the worker role.
+
+    A worker has no batcher and no cache, so these handlers would fail on a
+    None batcher. Returning 404 states the intent: this surface does not exist
+    on a worker, rather than existing and being broken.
+    """
+    if IS_WORKER:
+        raise HTTPException(
+            status_code=404, detail="Not available in worker role; call the gateway instead"
+        )
+
+
 @app.get("/health", summary="Health Check")
 async def health_check():
     """
     Returns the health status of the V-Gate service.
+
+    Available in both roles: the gateway's worker health checks poll this.
     """
-    return {"status": "ok", "version": APP_VERSION}
+    return {"status": "ok", "version": APP_VERSION, "role": config.role}
 
 
 async def _stream_chat_completion(prompt: str, request: ChatCompletionRequest):
@@ -325,7 +381,8 @@ async def _stream_chat_completion(prompt: str, request: ChatCompletionRequest):
         yield "data: [DONE]\n\n"
 
 
-@app.post("/v1/chat/completions", summary="Create Chat Completion")
+@app.post("/v1/chat/completions", summary="Create Chat Completion",
+          dependencies=[Depends(gateway_only)])
 async def create_chat_completion(request: ChatCompletionRequest):
     """
     Generates a chat completion response from the specified model.
@@ -334,6 +391,19 @@ async def create_chat_completion(request: ChatCompletionRequest):
     _stream_chat_completion for why.
     """
     if request.stream:
+        # Reject before any SSE bytes are written. Once the 200 and stream
+        # headers are flushed the only way to report this is an in-band error
+        # event, which reads to a client as "the request succeeded and then
+        # something went wrong mid-stream" — misleading when the backend never
+        # supported streaming at all.
+        if not getattr(engine.backend, "supports_streaming", True):
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    "Streaming is not supported when the gateway forwards to remote "
+                    "workers. Send stream=false, or run a gateway with an in-process backend."
+                ),
+            )
         prompt = messages_to_prompt(request.messages)
         return StreamingResponse(
             _stream_chat_completion(prompt, request),
@@ -382,7 +452,8 @@ async def create_chat_completion(request: ChatCompletionRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/v1/embeddings", summary="Create Embeddings")
+@app.post("/v1/embeddings", summary="Create Embeddings",
+          dependencies=[Depends(gateway_only)])
 async def create_embeddings(request: EmbeddingRequest):
     """
     Generates embeddings for the given input text from the specified model.
@@ -425,7 +496,8 @@ async def prometheus_metrics(request: Request):
     )
 
 
-@app.get("/stats", summary="JSON Statistics")
+@app.get("/stats", summary="JSON Statistics",
+         dependencies=[Depends(gateway_only)])
 async def get_stats():
     """
     Returns metrics about the request batching system and cache in JSON format.
@@ -473,7 +545,8 @@ class BenchmarkRequest(BaseModel):
     rounds: int = 3
 
 
-@app.post("/v1/benchmark", summary="Run Inline Benchmark")
+@app.post("/v1/benchmark", summary="Run Inline Benchmark",
+          dependencies=[Depends(gateway_only)])
 async def run_benchmark(request: BenchmarkRequest):
     """
     Run a quick inline benchmark through the full pipeline (batcher + cache + engine).

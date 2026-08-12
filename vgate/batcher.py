@@ -14,6 +14,7 @@
 
 import asyncio
 import time
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 
@@ -77,6 +78,14 @@ class RequestBatcher:
         self._queue: List[BatchRequest] = []
         self._lock = asyncio.Lock()
         self._inference_lock = asyncio.Lock()  # Prevent concurrent vLLM calls
+        # In-process engines are not safe to call concurrently, so batches are
+        # serialized through _inference_lock. A backend that forwards over the
+        # network has no such constraint, and holding the lock there would
+        # serialize every worker call — making additional workers useless.
+        # Backends opt out by declaring supports_concurrent_calls; the default
+        # stays locked, so local backends are unaffected.
+        backend = getattr(engine, "backend", None)
+        self._serialize_inference = not getattr(backend, "supports_concurrent_calls", False)
         self._batch_task: asyncio.Task = None
         self._running = False
 
@@ -223,8 +232,10 @@ class RequestBatcher:
 
     async def _process_batch(self):
         """Process up to max_batch_size pending requests as a batch, with deduplication."""
-        # Use inference lock to prevent concurrent vLLM calls
-        async with self._inference_lock:
+        # Serialize batches only when the backend requires it (see __init__).
+        # nullcontext supports async use on Python 3.10+.
+        inference_guard = self._inference_lock if self._serialize_inference else nullcontext()
+        async with inference_guard:
             async with self._lock:
                 if not self._queue:
                     return

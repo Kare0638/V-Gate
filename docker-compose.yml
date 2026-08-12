@@ -46,6 +46,52 @@ services:
       - cpu
 
   # ---------------------------------------------------------------------------
+  # Split mode — gateway and inference worker as separate processes
+  # docker compose --profile split up
+  #
+  # The gateway holds no model: it owns admission, batching, caching, and
+  # observability, and forwards inference to the worker over HTTP. Runs on the
+  # CPU image with a dry-run worker so the topology can be exercised without a
+  # GPU. Streaming is not supported through a worker yet and returns 501.
+  # ---------------------------------------------------------------------------
+  vgate-gateway:
+    build:
+      context: .
+      target: vgate-cpu
+    image: vgate:cpu
+    ports:
+      - "8000:8000"
+    environment:
+      - VGATE_ROLE=gateway
+      - VGATE_CONFIG_PATH=/app/config.yaml
+      - VGATE_WORKER__ENDPOINTS=["http://vgate-worker:8000"]
+    depends_on:
+      vgate-worker:
+        condition: service_healthy
+    profiles:
+      - split
+
+  vgate-worker:
+    build:
+      context: .
+      target: vgate-cpu
+    image: vgate:cpu
+    environment:
+      - VGATE_ROLE=worker
+      - VGATE_DRY_RUN=true
+      - VGATE_CONFIG_PATH=/app/config.yaml
+    # Deliberately no published port: the worker is reachable only from the
+    # gateway on the compose network, not from the host.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    profiles:
+      - split
+
+  # ---------------------------------------------------------------------------
   # Prometheus — metrics collection
   # docker compose --profile monitoring up
   # ---------------------------------------------------------------------------

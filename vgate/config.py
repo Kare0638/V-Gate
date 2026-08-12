@@ -40,6 +40,35 @@ class ServerConfig(BaseModel):
     port: int = 8000
 
 
+class WorkerConfig(BaseModel):
+    """
+    Remote inference worker settings, read by the gateway role.
+
+    When `endpoints` is empty the gateway keeps the historical behavior of
+    holding an in-process backend, so existing single-process deployments are
+    unaffected. Listing endpoints switches the gateway to RemoteBackend.
+    """
+    endpoints: list[str] = Field(default_factory=list)
+    # Generous by default: a cold worker may still be loading model weights
+    # when the first request arrives.
+    timeout_seconds: float = 120.0
+    connect_timeout_seconds: float = 5.0
+    # Sent as `Authorization: Bearer <api_key>` to the worker. Needed when the
+    # worker runs with security.enabled, since /internal/generate is not an
+    # exempt path.
+    api_key: Optional[str] = None
+
+    @field_validator("endpoints")
+    @classmethod
+    def validate_endpoints(cls, v: list[str]) -> list[str]:
+        for endpoint in v:
+            if not endpoint.startswith(("http://", "https://")):
+                raise ValueError(
+                    f"worker endpoint must start with http:// or https://, got {endpoint!r}"
+                )
+        return [e.rstrip("/") for e in v]
+
+
 class ModelConfig(BaseModel):
     """Model configuration for inference engine."""
     model_id: str = "Qwen/Qwen2.5-1.5B-Instruct-AWQ"
@@ -190,7 +219,11 @@ class VGateConfig(BaseSettings):
     )
 
     version: str = "0.3.2"
+    # "gateway" runs admission, batching, caching, and routing. "worker" runs
+    # only inference and exposes the internal generate API.
+    role: str = "gateway"
     server: ServerConfig = Field(default_factory=ServerConfig)
+    worker: WorkerConfig = Field(default_factory=WorkerConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
     batch: BatchConfig = Field(default_factory=BatchConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
@@ -200,6 +233,14 @@ class VGateConfig(BaseSettings):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     tracing: TracingConfig = Field(default_factory=TracingConfig)
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
+
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls, v: str) -> str:
+        allowed = ("gateway", "worker")
+        if v not in allowed:
+            raise ValueError(f"role must be one of {allowed}, got '{v}'")
+        return v
 
     @classmethod
     def settings_customise_sources(

@@ -9,7 +9,7 @@
 
 The gateway tier is implemented — an OpenAI-shaped Chat Completions subset with streaming, dynamic micro-batching, result caching, observability, security, benchmarking, and container/Kubernetes deployment artifacts. The [vLLM](https://github.com/vllm-project/vllm) path has been exercised against a live GPU; the [SGLang](https://github.com/sgl-project/sglang) path is currently a unit-tested non-streaming adapter and has not yet been validated against a live SGLang engine.
 
-**The worker tier is not implemented yet.** The runtime today is one gateway process holding one in-process backend, not multi-worker serving. Splitting gateway from workers — worker registry, health checks, latency-aware routing, circuit breaking, and 1-vs-N worker evidence — is the current top priority and is tracked as [Phase 4](ROADMAP.md#phase-4-multi-worker-serving). Multimodal requests are a separate planned milestone. Live-GPU validation has been performed on one NVIDIA GeForce RTX 3060 Laptop GPU with 6GB VRAM; no RTX 4060 or multi-GPU validation is claimed.
+**The worker tier runs, but there is only one of it.** Inference can now be moved out of the gateway into a separate worker process (`role: worker`), and the gateway forwards to it over HTTP while keeping batching, caching, and admission control. What is still missing is everything that makes it *multi*-worker: a registry, health checks, routing strategies, and circuit breaking — tracked as [Phase 4](ROADMAP.md#phase-4-multi-worker-serving). Streaming through a worker is also not supported yet and returns 501. Multimodal requests are a separate planned milestone. Live-GPU validation has been performed on one NVIDIA GeForce RTX 3060 Laptop GPU with 6GB VRAM; no RTX 4060 or multi-GPU validation is claimed.
 
 ## Validated Evidence
 
@@ -39,7 +39,7 @@ The evidence below is a measured snapshot of the current serving path. The vLLM 
 | **Configuration as Code** | Implemented | YAML configuration with environment-variable overrides |
 | **Container Deployment** | Implemented | Docker CPU/GPU targets, Compose stack, and baseline Kubernetes manifests |
 | **Python Client SDK** | Implemented | Sync/async clients with deterministic streaming cleanup |
-| **Gateway/Worker Split** | Planned | Move inference out of the gateway process behind a worker API |
+| **Gateway/Worker Split** | Partial | Inference runs in a separate `role: worker` process reached over HTTP; one worker only, and streaming through a worker returns 501 |
 | **Worker Registry & Health** | Planned | Worker registration, health checks, and failure isolation |
 | **Latency-Aware Routing** | Planned | Round-robin, least-inflight, and EWMA-latency routing strategies |
 | **Circuit Breaking & Recovery** | Planned | Trip on unhealthy workers, drain, and rejoin on recovery |
@@ -48,35 +48,43 @@ The evidence below is a measured snapshot of the current serving path. The vLLM 
 
 ## Architecture
 
-Solid arrows are the current runtime; dashed arrows are the planned gateway/worker split. Today everything below runs inside a single process — the backend is called in-process, not over a worker API.
+Solid arrows are the current runtime; dashed arrows are not implemented yet. The gateway can either hold a backend in-process (the single-process default) or forward to one worker process — both paths exist today. Everything needed to run *more than one* worker is still missing.
 
 ```mermaid
 flowchart LR
     Client[Client / SDK] --> API[Gateway API]
 
-    subgraph GW[Gateway tier - implemented]
+    subgraph GW[Gateway process]
         API --> Sec[Auth / Rate limit]
         Sec --> NonStream[Non-streaming path]
         Sec --> Stream[Streaming path / SSE]
         NonStream --> Batcher[Admission / Batching / Cache]
     end
 
-    Batcher --> Backend[In-process backend]
-    Stream --> Backend
-    Backend --> VLLM[vLLM]
-    Backend --> SGLang[SGLang]
+    Batcher --> Local[In-process backend]
+    Stream --> Local
+    Local --> VLLM[vLLM]
+    Local --> SGLang[SGLang]
 
-    Batcher -. planned .-> Router[Router: round-robin / least-inflight / EWMA]
-    Router -. planned .-> Registry[Worker registry + health checks]
-    Registry -. planned .-> W1[Inference worker 1]
-    Registry -. planned .-> W2[Inference worker N]
-    Router -. planned .-> CB[Circuit breaker / recovery]
+    Batcher --> Remote[RemoteBackend / HTTP]
+
+    subgraph WK[Worker process]
+        Remote --> WAPI["/internal/generate"]
+        WAPI --> WEngine[Engine: vLLM or SGLang]
+    end
+
+    Remote -. not implemented .-> Router[Router: round-robin / least-inflight / EWMA]
+    Router -. not implemented .-> Registry[Worker registry + health checks]
+    Registry -. not implemented .-> W2[Workers 2..N]
+    Router -. not implemented .-> CB[Circuit breaker / recovery]
 
     GW --> Obs[Metrics / Logs / Traces]
-    W1 -. planned .-> Obs
+    WK --> Obs
 ```
 
-The target boundary: the gateway owns admission control, deduplication, caching, routing, and observability; each worker owns one engine instance and reports health and inflight load. That split is what makes 1-vs-N worker scaling, health-aware failover, and independent GPU-node placement measurable rather than hypothetical.
+The boundary: the gateway owns admission control, deduplication, caching, and observability; a worker owns one engine instance and nothing else. Because `RemoteBackend` implements the same `InferenceBackend` protocol as the local engines, the batcher does not know whether inference is local or remote — adding the worker hop required no change to it.
+
+That split is what makes 1-vs-N worker scaling, health-aware failover, and independent GPU-node placement measurable rather than hypothetical. None of those are measured yet; the routing layer that would make them possible is the next step.
 
 ---
 
@@ -140,6 +148,39 @@ pip install -r requirements.txt
 # Run server
 python main.py
 ```
+
+### Option 2b: Gateway + Worker (Split Mode)
+
+Run inference in a separate process. The gateway loads no model — it forwards
+to the worker and keeps batching, caching, and admission control.
+
+```bash
+# Terminal 1 — worker (owns the engine)
+VGATE_ROLE=worker VGATE_SERVER__PORT=8001 VGATE_DRY_RUN=true python main.py
+
+# Terminal 2 — gateway (holds no model)
+VGATE_ROLE=gateway VGATE_SERVER__PORT=8000 \
+  VGATE_WORKER__ENDPOINTS='["http://127.0.0.1:8001"]' python main.py
+
+# Requests go to the gateway as usual
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"test","messages":[{"role":"user","content":"hello"}],"max_tokens":16}'
+```
+
+Or with Compose:
+
+```bash
+docker compose --profile split up
+```
+
+Current limits of split mode:
+
+- **One worker.** Configuring more than one endpoint is rejected at startup rather than silently ignored; routing across workers needs the registry and health checks that come next.
+- **No streaming.** `stream: true` returns `501` before any SSE bytes are sent, instead of a `200` followed by an in-band error.
+- **No health checking.** If the worker is down, requests fail with `500` and a `worker unreachable` detail. The gateway itself stays up, and cached responses continue to be served.
+- The worker exposes only `/internal/generate`, `/health`, and `/metrics`; client-facing routes return `404` in the worker role.
+- With `security.enabled`, set `worker.api_key` on the gateway — `/internal/generate` is not an exempt path, so it requires the same bearer token as any other route.
 
 ### Option 3: Isolated SGLang Environment (Recommended)
 
