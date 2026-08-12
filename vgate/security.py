@@ -45,6 +45,13 @@ class RateLimiter:
 
     Tracks request timestamps per API key and enforces rate limits
     using a sliding window algorithm.
+
+    Window arithmetic uses time.monotonic(). A wall clock can jump backwards
+    or forwards when NTP corrects it, which would either widen the window
+    (letting through requests that should be limited) or narrow it (rejecting
+    requests that should pass) with no way to tell it happened. The only value
+    that must stay on the wall clock is the X-RateLimit-Reset header, which is
+    an absolute Unix timestamp the client interprets against its own clock.
     """
 
     def __init__(self, window_seconds: int = 60):
@@ -58,7 +65,12 @@ class RateLimiter:
         self._requests: dict[str, list[float]] = defaultdict(list)
 
     def _cleanup_old_requests(self, key: str, now: float) -> None:
-        """Remove requests outside the current window."""
+        """
+        Remove requests outside the current window.
+
+        `now` must come from the same clock as the stored timestamps
+        (time.monotonic()), not from time.time().
+        """
         cutoff = now - self.window_seconds
         self._requests[key] = [ts for ts in self._requests[key] if ts > cutoff]
 
@@ -74,12 +86,14 @@ class RateLimiter:
             Tuple of (allowed: bool, headers: dict) where headers contains
             X-RateLimit-* values.
         """
-        now = time.time()
+        now = time.monotonic()
         self._cleanup_old_requests(key, now)
 
         current_count = len(self._requests[key])
         remaining = max(0, limit - current_count)
-        reset_time = int(now + self.window_seconds)
+        # Absolute wall-clock timestamp: the client compares it against its
+        # own clock, so a monotonic value would be meaningless to it.
+        reset_time = int(time.time() + self.window_seconds)
 
         headers = {
             "X-RateLimit-Limit": str(limit),
@@ -105,7 +119,7 @@ class RateLimiter:
 
     def get_usage(self, key: str) -> dict:
         """Get current usage stats for a key."""
-        now = time.time()
+        now = time.monotonic()
         self._cleanup_old_requests(key, now)
         return {
             "current_requests": len(self._requests[key]),

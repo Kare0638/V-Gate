@@ -79,7 +79,10 @@ class TestRateLimiter:
 
     def test_window_reset(self):
         """Requests should be allowed after window resets."""
-        limiter = RateLimiter(window_seconds=1)  # 1 second window
+        # Small window with generous headroom below. A 1s window slept past by
+        # 1.1s left only 100ms of margin, which a scheduling delay on a loaded
+        # machine could eat -- this test failed intermittently for that reason.
+        limiter = RateLimiter(window_seconds=1)
 
         # Use up the limit
         for _ in range(3):
@@ -89,8 +92,8 @@ class TestRateLimiter:
         allowed, _ = limiter.is_allowed("test-key", limit=3)
         assert allowed is False
 
-        # Wait for window to pass
-        time.sleep(1.1)
+        # Wait well past the window rather than just past it.
+        time.sleep(1.5)
 
         # Should be allowed again
         allowed, _ = limiter.is_allowed("test-key", limit=3)
@@ -106,6 +109,45 @@ class TestRateLimiter:
         assert "X-RateLimit-Remaining" in headers
         assert "X-RateLimit-Reset" in headers
         assert int(headers["X-RateLimit-Reset"]) > int(time.time())
+
+    def test_window_uses_monotonic_clock(self, monkeypatch):
+        """
+        Window arithmetic must not read the wall clock.
+
+        An NTP correction moving time.time() would otherwise widen or narrow
+        the window silently. Reset stays on the wall clock because the client
+        interprets that header against its own.
+        """
+        limiter = RateLimiter(window_seconds=60)
+        limiter.is_allowed("test-key", limit=10)
+
+        # Jump the wall clock far past the window. A monotonic-based window is
+        # unaffected; a wall-clock one would drop the recorded request.
+        real_time = time.time
+        monkeypatch.setattr(time, "time", lambda: real_time() + 3600)
+
+        assert limiter.get_usage("test-key")["current_requests"] == 1, (
+            "a wall-clock jump must not evict entries from the window"
+        )
+
+        _, headers = limiter.is_allowed("test-key", limit=10)
+        # Reset still tracks the (now shifted) wall clock, as clients expect.
+        assert int(headers["X-RateLimit-Reset"]) > int(real_time() + 3600)
+
+    def test_window_survives_wall_clock_moving_backwards(self, monkeypatch):
+        """A backwards jump must not un-limit a key that is over its limit."""
+        limiter = RateLimiter(window_seconds=60)
+        for _ in range(3):
+            limiter.is_allowed("test-key", limit=3)
+
+        allowed, _ = limiter.is_allowed("test-key", limit=3)
+        assert allowed is False
+
+        real_time = time.time
+        monkeypatch.setattr(time, "time", lambda: real_time() - 3600)
+
+        allowed, _ = limiter.is_allowed("test-key", limit=3)
+        assert allowed is False, "clock moving backwards must not reset the window"
 
     def test_get_usage(self):
         """get_usage should return current stats."""
