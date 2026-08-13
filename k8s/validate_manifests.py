@@ -188,18 +188,81 @@ def check_no_unresolved_interpolation(docs: list[dict]) -> None:
                     )
 
 
+def check_images_are_pinned(docs: list[dict]) -> None:
+    """
+    No moving tags, and never an implicit pull policy.
+
+    ":latest" and imagePullPolicy: IfNotPresent is the pairing that fails
+    silently: the node keeps whatever it cached under that tag, so one node can
+    serve a months-old build while another serves today's, and nothing reports
+    the difference. Leaving imagePullPolicy unset is its own hazard, because the
+    default is derived from the tag — Always for ":latest", IfNotPresent for
+    anything else — so the behaviour changes when someone edits the tag.
+    """
+    for doc in docs:
+        spec = doc.get("spec", {}).get("template", {}).get("spec")
+        if not spec:
+            continue
+        for container in spec.get("containers", []):
+            image = container.get("image", "")
+            name = f"{doc['kind']}/{doc['metadata']['name']}"
+            if image.endswith(":latest") or ":" not in image.rsplit("/", 1)[-1]:
+                raise Failure(
+                    f"{name} uses a moving image tag: {image!r}. Pin a version "
+                    "tag or a digest."
+                )
+            if "imagePullPolicy" not in container:
+                raise Failure(
+                    f"{name} leaves imagePullPolicy unset, so it is inferred "
+                    f"from the tag {image!r} and changes when the tag changes"
+                )
+
+
+def check_overlays_agree_on_immutable_fields(rendered: dict[str, list[dict]]) -> None:
+    """
+    Fields that Kubernetes refuses to update must not differ between overlays.
+
+    A StatefulSet's volumeClaimTemplates cannot be changed after creation. If
+    the CPU and GPU overlays disagree on it, moving a cluster from one to the
+    other is rejected by the API server, and the only way forward is deleting
+    the StatefulSet — which on the GPU overlay means discarding the model
+    cache. This once shipped as CPU=1Gi against GPU=10Gi.
+    """
+    if len(rendered) < 2:
+        return
+    baseline_name, baseline_docs = next(iter(rendered.items()))
+    baseline = find(baseline_docs, "StatefulSet", "vgate-worker")["spec"]["volumeClaimTemplates"]
+
+    for overlay, docs in list(rendered.items())[1:]:
+        other = find(docs, "StatefulSet", "vgate-worker")["spec"]["volumeClaimTemplates"]
+        if other != baseline:
+            raise Failure(
+                "StatefulSet/vgate-worker volumeClaimTemplates differ between "
+                f"the {baseline_name} and {overlay} overlays, and the field is "
+                "immutable — switching a live cluster between them would be "
+                f"rejected.\n  {baseline_name}: {baseline}\n  {overlay}: {other}"
+            )
+
+
 CHECKS = [
     ("gateway holds no model resources", check_gateway_holds_no_model),
     ("worker Service is headless", check_worker_service_is_headless),
     ("gateway Service excludes workers", check_gateway_service_excludes_workers),
     ("endpoint list matches worker replicas", check_endpoints_match_workers),
     ("no unresolved $(VAR) interpolation", check_no_unresolved_interpolation),
+    ("images are pinned with an explicit pull policy", check_images_are_pinned),
+]
+
+# Checks that need every overlay at once rather than one at a time.
+CROSS_OVERLAY_CHECKS = [
+    ("overlays agree on immutable fields", check_overlays_agree_on_immutable_fields),
 ]
 
 
 def main(argv: list[str]) -> int:
     overlays = argv[1:] or DEFAULT_OVERLAYS
     failed = 0
+    rendered: dict[str, list[dict]] = {}
 
     for overlay in overlays:
         print(f"\n=== overlay: {overlay} ===")
@@ -209,10 +272,22 @@ def main(argv: list[str]) -> int:
             print(f"  FAIL  render: {exc}")
             failed += 1
             continue
+        rendered[overlay] = docs
 
         for label, check in CHECKS:
             try:
                 check(docs)
+            except Failure as exc:
+                print(f"  FAIL  {label}\n        {exc}")
+                failed += 1
+            else:
+                print(f"  ok    {label}")
+
+    if len(rendered) > 1:
+        print("\n=== across overlays ===")
+        for label, check in CROSS_OVERLAY_CHECKS:
+            try:
+                check(rendered)
             except Failure as exc:
                 print(f"  FAIL  {label}\n        {exc}")
                 failed += 1

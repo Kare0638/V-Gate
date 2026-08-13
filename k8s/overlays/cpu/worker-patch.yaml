@@ -22,16 +22,12 @@ spec:
               port: http
             failureThreshold: 10
             periodSeconds: 3
-  # No model is downloaded in dry-run, so the cache only has to exist. Kept
-  # rather than dropped so the CPU and GPU overlays exercise the same volume
-  # wiring; a StatefulSet's volumeClaimTemplates cannot be added later without
-  # recreating it.
-  volumeClaimTemplates:
-    - metadata:
-        name: model-cache
-      spec:
-        accessModes:
-          - ReadWriteOnce
-        resources:
-          requests:
-            storage: 1Gi
+# volumeClaimTemplates is deliberately NOT patched here. This overlay used to
+# shrink the claim to 1Gi because dry-run downloads no weights, which made the
+# two overlays render different templates — and a StatefulSet's
+# volumeClaimTemplates is immutable, so switching a cluster from the CPU
+# overlay to the GPU one (or back) would be rejected by the API server with no
+# way forward short of deleting the StatefulSet. Both overlays now inherit the
+# base's 10Gi. On kind the request costs nothing: the local-path provisioner
+# hands out a directory and ignores the size.
+# k8s/validate_manifests.py fails the build if the two ever diverge again.

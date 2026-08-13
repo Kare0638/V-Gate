@@ -1,9 +1,16 @@
-# Headless (clusterIP: None) on purpose. A normal ClusterIP Service would hand
-# the gateway one virtual IP and let kube-proxy pick a worker, which would
-# override the gateway's own routing: the worker registry could no longer tell
-# workers apart, track their health individually, or implement load-aware
-# routing. Headless instead publishes one DNS record per pod, so the registry
-# addresses each worker directly.
+# Headless (clusterIP: None) on purpose: it removes the load-balanced virtual
+# IP, leaving per-pod DNS as the only way to address this Service. The gateway
+# routes by pod name because its registry tracks each worker's health
+# separately; a virtual IP in front of the pool is precisely the thing that
+# would undo that, by letting anything resolve `vgate-worker` to one address
+# that kube-proxy fans out.
+#
+# Measured, not assumed: dropping `clusterIP: None` does NOT by itself stop
+# `vgate-worker-0.vgate-worker` from resolving. A StatefulSet writes each pod's
+# hostname into the EndpointSlice, and CoreDNS serves per-pod records from that
+# whether or not the Service is headless. So the reason to keep this line is
+# the virtual IP it suppresses, not per-pod records it is often assumed to
+# create.
 #
 # This Service is never exposed outside the cluster. /internal/generate is a
 # gateway-to-worker call, not a client-facing API.

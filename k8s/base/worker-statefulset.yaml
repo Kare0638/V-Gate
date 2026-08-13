@@ -56,9 +56,9 @@ spec:
       terminationGracePeriodSeconds: 120
       containers:
         - name: vgate
-          image: vgate:cpu
-          # See gateway-deployment.yaml: the default varies with the tag, and
-          # side-loaded images are never pullable.
+          # See gateway-deployment.yaml for why this is version-pinned and not
+          # ":latest".
+          image: vgate:0.3.2-cpu
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

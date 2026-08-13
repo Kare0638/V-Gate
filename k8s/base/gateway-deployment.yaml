@@ -29,11 +29,16 @@ spec:
     spec:
       containers:
         - name: vgate
-          image: vgate:cpu
-          # Explicit because the default depends on the tag: a ":latest" tag
-          # silently becomes Always, which fails on a kind cluster where the
-          # image was side-loaded and never pushed anywhere. Production should
-          # pin an immutable tag or digest rather than rely on either default.
+          # Version-pinned rather than ":latest". IfNotPresent below means a
+          # node reuses whatever it already has under this tag, so a mutable
+          # tag would let one node keep serving a months-old image with no
+          # signal that it differs from its neighbours. A moving tag would need
+          # imagePullPolicy: Always to be safe, which in turn breaks the kind
+          # workflow where the image is side-loaded and never pushed anywhere.
+          # A digest (vgate@sha256:...) is the only genuinely immutable form;
+          # a version tag is a convention this repo keeps rather than a
+          # guarantee the registry enforces.
+          image: vgate:0.3.2-cpu
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

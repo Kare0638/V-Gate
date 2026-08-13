@@ -15,7 +15,13 @@ spec:
     spec:
       containers:
         - name: vgate
-          image: vgate:latest
+          # Was vgate:latest, which is the worst pairing with the base's
+          # imagePullPolicy: IfNotPresent — the node keeps whatever it cached
+          # under that tag, so a GPU node can run a stale build indefinitely
+          # while a freshly joined node runs a different one, and nothing in
+          # the cluster reports the difference. Build and push this exact tag:
+          #   docker build --target vgate-gpu -t vgate:0.3.2-gpu .
+          image: vgate:0.3.2-gpu
           env:
             # Merged into the base list by name. Strategic merge puts entries
             # that only exist in the patch at the front, so this reorders the

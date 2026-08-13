@@ -207,12 +207,24 @@ worker `StatefulSet`.
 **On a fresh cluster:**
 
 ```bash
+# Build the tags the manifests reference. They are version-pinned rather than
+# :latest — the manifests set imagePullPolicy: IfNotPresent, so a moving tag
+# would let one node keep serving a months-old image while another serves
+# today's, with nothing in the cluster reporting the difference.
+docker build --target vgate-cpu -t vgate:0.3.2-cpu .
+docker build --target vgate-gpu -t vgate:0.3.2-gpu .
+
 # Render and apply the dry-run overlay
 kustomize build k8s/overlays/cpu | kubectl apply -f -
 
 # Real vLLM workers on GPU nodes; the gateway stays on the CPU image
 kustomize build k8s/overlays/gpu | kubectl apply -f -
 ```
+
+A digest (`vgate@sha256:…`) is the only genuinely immutable reference; the
+version tag is a convention this repo keeps, not something the registry
+enforces. `k8s/validate_manifests.py` fails the build if any image reverts to a
+moving tag or leaves `imagePullPolicy` unset.
 
 > #### Upgrading a cluster that ran the pre-split manifests
 >
@@ -229,14 +241,14 @@ kustomize build k8s/overlays/gpu | kubectl apply -f -
 >
 > Reproduced on kind ([full log](docs/reports/K8S_MIGRATION_VERIFICATION.md)):
 > after a plain apply, `Service/vgate` listed three endpoints — two old
-> monolith pods and one new gateway — and **26 of 40 requests came back
+> monolith pods and one new gateway — and **24 of 40 requests came back
 > `401`**, against 40 of 40 succeeding before the upgrade. The old pods still
 > validate the API key from the ConfigMap they mounted at startup rather than
 > the Secret the new manifests use, and a mounted ConfigMap key does not
-> reload. So the practical result is not a subtle routing quirk but roughly
-> two thirds of client traffic failing outright. After migrating, all 40
-> requests reached the new gateway. On a GPU cluster the old Deployment also
-> holds its `nvidia.com/gpu` until deleted, which can leave the new workers
+> reload. So the practical result is not a subtle routing quirk but most of
+> the client traffic failing outright. After migrating, all 40 requests
+> reached the new gateway. On a GPU cluster the old Deployment also holds its
+> `nvidia.com/gpu` until deleted, which can leave the new workers
 > unschedulable.
 >
 > ```bash
@@ -264,13 +276,23 @@ kustomize build k8s/overlays/gpu | kubectl apply -f -
 > nothing to migrate and applies normally, so it is safe to use unconditionally.
 
 Why a `StatefulSet` for workers: the gateway's registry tracks each worker
-separately, so it needs to address them individually. A `Deployment`'s pods get
-random names and no per-pod DNS, leaving only a load-balanced Service — one
-opaque endpoint, with per-worker health tracking and routing collapsed into
-kube-proxy. A `StatefulSet` behind a headless Service gives every pod a stable
-record (`vgate-worker-0.vgate-worker.vgate.svc.cluster.local`) that the
-registry can name. It also gives each worker its own model-cache volume, so a
-`ReadWriteOnce` StorageClass still supports more than one replica.
+separately, so it needs to address them individually. A `Deployment` gives its
+pods random, changing names, so there is no stable address to put in a registry
+— only the Service in front of them. A `StatefulSet` gives every pod an
+ordinal-stable name and therefore a stable record
+(`vgate-worker-0.vgate-worker.vgate.svc.cluster.local`). It also gives each
+worker its own model-cache volume, so a `ReadWriteOnce` StorageClass supports
+more than one replica; a single shared claim would force every worker onto one
+node.
+
+The Service in front of them is headless (`clusterIP: None`) to remove the
+load-balanced virtual IP, leaving per-pod DNS as the only way to address the
+pool. Worth stating precisely, because it is easy to overclaim: dropping
+`clusterIP: None` does **not** by itself stop `vgate-worker-0.vgate-worker`
+from resolving — a StatefulSet writes each pod's hostname into the
+EndpointSlice and CoreDNS serves per-pod records from that either way. This was
+measured, not assumed. Headless earns its place by suppressing the virtual IP,
+not by creating records it is often credited with.
 
 Because the endpoint list is static, **the worker replica count and the
 gateway's `VGATE_WORKER__ENDPOINTS` have to be changed together** — `kubectl
@@ -301,31 +323,44 @@ In the checked-in run the two workers were scheduled on different nodes, each
 bound its own PVC, per-pod DNS resolved to distinct addresses, and requests
 split 5/4 across the pool.
 
-Across the removal, that run served **77 of 77 requests with `200`**: two
-requests reached the departed worker, were classified `connect_error`, and were
-retried on the survivor — visible as `vgate_worker_retries_total` in the log.
+Across the removal, that run served **61 of 62 requests with `200`** and one
+with `500`. **The window is not zero-loss, and that is by design.** The retry
+policy splits on what the departed worker could already have started:
 
-**This is not a guaranteed zero-loss window.** Repeat runs produced 81/81 and
-60/61, the last one returning a single `500`. That failure is the retry policy
-working as specified rather than a defect: a request that was already delivered
-when the pod died surfaces as a `RequestError`, not a `ConnectError`, and is
-deliberately *not* retried elsewhere — the worker may already be generating,
-and one client request must not cost two GPU generations. Which class occurred
-is recorded per worker in `vgate_worker_requests_total`, so the log
-distinguishes "retried successfully" from "failed by design". Closing that
-window needs draining, which is listed as a gap in [ROADMAP.md](ROADMAP.md).
+| Failure | Meaning | Action |
+|---|---|---|
+| `connect_error` | never delivered | retried on another worker |
+| `request_error` | already in flight when the pod died | **not** retried |
+
+Retrying the second class would let one client request cost two GPU
+generations. The run's metrics show exactly one `request_error` against the
+removed worker, which accounts for the single `500` — so the assertion the
+script makes is not "no request failed" but "every non-200 is an un-retryable
+mid-flight failure". Other runs came out 77/77 and 81/81 with no failure at
+all; whether the window catches a request in flight is timing. Closing it needs
+draining, listed as a gap in [ROADMAP.md](ROADMAP.md).
 
 One gap the run exposed: the gateway passes its readiness probe while holding
 zero healthy workers, because `/health` never consults the registry. See
 [ROADMAP.md](ROADMAP.md).
 
+Both live scripts **assert** rather than print. Every claim they make is a
+`[PASS]`/`[FAIL]` line and the script exits non-zero on any failure, so a wrong
+topology cannot produce a passing report. Verified by breaking the manifests on
+purpose: with the worker count reduced to one, six assertions failed and the
+run exited 1.
+
 **Manifests are checked in CI** (`.github/workflows/manifests.yml`) at two
 levels: `kubeconform` for schema validity, and `k8s/validate_manifests.py` for
 architecture invariants — the gateway requests no GPU and mounts no model
 cache, the worker Service is headless, the public Service cannot select worker
-pods, and the endpoint list matches the replica count. The second layer exists
-because these manifests once described a single-process service for months
-after the split landed, while passing schema validation the whole time.
+pods, the endpoint list matches the replica count, images are pinned with an
+explicit pull policy, and both overlays agree on the fields Kubernetes refuses
+to update in place. The second layer exists because these manifests once
+described a single-process service for months after the split landed, while
+passing schema validation the whole time. Each check is verified to fail
+against a deliberately broken manifest, not only to pass against the current
+one.
 
 ### Option 3: Isolated SGLang Environment (Recommended)
 
