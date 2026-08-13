@@ -1,0 +1,19 @@
+# The gateway image is the same in both overlays: it forwards inference and
+# never loads a model, so it has no reason to carry the CUDA/vLLM image. Only
+# its resource envelope shrinks here for local single-node clusters.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vgate-gateway
+spec:
+  template:
+    spec:
+      containers:
+        - name: vgate
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi

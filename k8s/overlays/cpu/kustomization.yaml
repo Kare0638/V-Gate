@@ -1,3 +1,4 @@
+# CPU overlay: dry-run workers, no GPU required. This is what runs on kind.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -5,4 +6,5 @@ resources:
   - ../../base
 
 patches:
-  - path: deployment-patch.yaml
+  - path: gateway-patch.yaml
+  - path: worker-patch.yaml

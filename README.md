@@ -37,7 +37,7 @@ The evidence below is a measured snapshot of the current serving path. The vLLM 
 | **Observability** | Implemented | Prometheus metrics, structured logs, and optional OpenTelemetry tracing |
 | **Security** | Implemented | Bearer API keys and per-key sliding-window rate limits |
 | **Configuration as Code** | Implemented | YAML configuration with environment-variable overrides |
-| **Container Deployment** | Implemented | Docker CPU/GPU targets, Compose stack, and baseline Kubernetes manifests |
+| **Container Deployment** | Implemented | Docker CPU/GPU targets, Compose stack, and Kubernetes manifests deploying the gateway and workers as separate components |
 | **Python Client SDK** | Implemented | Sync/async clients with deterministic streaming cleanup |
 | **Gateway/Worker Split** | Partial | Inference runs in separate `role: worker` processes reached over HTTP; streaming through a worker returns 501 |
 | **Worker Registry & Health** | Implemented | Static registry with background `/health` probing, threshold-based removal, and automatic rejoin on recovery |
@@ -198,6 +198,169 @@ Behavior of split mode:
 - **No streaming.** `stream: true` returns `501` before any SSE bytes are sent, instead of a `200` followed by an in-band error.
 - The worker exposes only `/internal/generate`, `/health`, and `/metrics`; client-facing routes return `404` in the worker role.
 - With `security.enabled`, set `worker.api_key` on the gateway — `/internal/generate` is not an exempt path, so it requires the same bearer token as any other route (health probes send it too).
+
+### Option 2c: Kubernetes
+
+The manifests deploy the same split: a gateway `Deployment` in front of a
+worker `StatefulSet`.
+
+**On a fresh cluster:**
+
+```bash
+# Build the tags the manifests reference. They are version-pinned rather than
+# :latest — the manifests set imagePullPolicy: IfNotPresent, so a moving tag
+# would let one node keep serving a months-old image while another serves
+# today's, with nothing in the cluster reporting the difference.
+docker build --target vgate-cpu -t vgate:0.3.2-cpu .
+docker build --target vgate-gpu -t vgate:0.3.2-gpu .
+
+# Render and apply the dry-run overlay
+kustomize build k8s/overlays/cpu | kubectl apply -f -
+
+# Real vLLM workers on GPU nodes; the gateway stays on the CPU image
+kustomize build k8s/overlays/gpu | kubectl apply -f -
+```
+
+A digest (`vgate@sha256:…`) is the only genuinely immutable reference; the
+version tag is a convention this repo keeps, not something the registry
+enforces. `k8s/validate_manifests.py` fails the build if any image reverts to a
+moving tag or leaves `imagePullPolicy` unset.
+
+> #### Upgrading a cluster that ran the pre-split manifests
+>
+> **`kubectl apply` alone is not a safe upgrade path here.** It creates and
+> updates but never deletes objects that were removed from the manifests, and
+> the split renamed the workloads. Three objects are left behind:
+> `Deployment/vgate`, `HorizontalPodAutoscaler/vgate`, and
+> `PersistentVolumeClaim/vgate-model-cache`.
+>
+> The Deployment is the damaging one. Its pods carry
+> `app.kubernetes.io/name=vgate` and `app.kubernetes.io/component=gateway` —
+> exactly what the new `Service/vgate` selects — so the old monolith stays
+> behind the public endpoint and keeps taking live traffic.
+>
+> Reproduced on kind ([full log](docs/reports/K8S_MIGRATION_VERIFICATION.md)):
+> after a plain apply, `Service/vgate` listed three endpoints — two old
+> monolith pods and one new gateway — and **24 of 40 requests came back
+> `401`**, against 40 of 40 succeeding before the upgrade. The old pods still
+> validate the API key from the ConfigMap they mounted at startup rather than
+> the Secret the new manifests use, and a mounted ConfigMap key does not
+> reload. So the practical result is not a subtle routing quirk but most of
+> the client traffic failing outright. After migrating, all 40 requests
+> reached the new gateway. On a GPU cluster the old Deployment also holds its
+> `nvidia.com/gpu` until deleted, which can leave the new workers
+> unschedulable.
+>
+> ```bash
+> # Report what would be removed; changes nothing, exits non-zero if found
+> ./k8s/migrate-from-monolith.sh --check
+>
+> # Remove the pre-split objects, then apply
+> ./k8s/migrate-from-monolith.sh --overlay cpu
+> ./k8s/migrate-from-monolith.sh --overlay gpu --delete-pvc
+> ```
+>
+> The script deletes the old objects *before* applying the new ones, accepting
+> a short gap with no gateway running. Applying first would avoid the gap but
+> puts both topologies behind the same Service at once, and on GPU nodes would
+> require enough GPUs for both.
+>
+> `kubectl apply --prune` is the built-in mechanism for this and is
+> deliberately not used: it is still Alpha, carries a "do not use unless you
+> are aware of what the current state is" warning in kubectl's own help, and
+> prunes by label expression, so a bad match deletes live workloads. The orphan
+> set here is small, known, and fixed, which makes naming the three objects
+> both safer and easier to review.
+>
+> On a cluster that never ran the pre-split manifests the script reports
+> nothing to migrate and applies normally, so it is safe to use unconditionally.
+
+Why a `StatefulSet` for workers: the gateway's registry tracks each worker
+separately, so it needs to address them individually. A `Deployment` gives its
+pods random, changing names, so there is no stable address to put in a registry
+— only the Service in front of them. A `StatefulSet` gives every pod an
+ordinal-stable name and therefore a stable record
+(`vgate-worker-0.vgate-worker.vgate.svc.cluster.local`). It also gives each
+worker its own model-cache volume, so a `ReadWriteOnce` StorageClass supports
+more than one replica; a single shared claim would force every worker onto one
+node.
+
+The Service in front of them is headless (`clusterIP: None`) to remove the
+load-balanced virtual IP, leaving per-pod DNS as the only way to address the
+pool. Worth stating precisely, because it is easy to overclaim: dropping
+`clusterIP: None` does **not** by itself stop `vgate-worker-0.vgate-worker`
+from resolving — a StatefulSet writes each pod's hostname into the
+EndpointSlice and CoreDNS serves per-pod records from that either way. This was
+measured, not assumed. Headless earns its place by suppressing the virtual IP,
+not by creating records it is often credited with.
+
+Because the endpoint list is static, **the worker replica count and the
+gateway's `VGATE_WORKER__ENDPOINTS` have to be changed together** — `kubectl
+scale` alone does not reach the gateway. `k8s/validate_manifests.py` fails the
+build when they disagree. Replacing the list with headless-Service DNS
+discovery is the next step in [Priority 2](#priority-2-distributed-inference-serving).
+
+Autoscaling covers the gateway only. CPU utilization is a false signal for a
+GPU worker — the GPU saturates while the CPU waits on it — so a CPU-triggered
+rule would never fire on an overloaded worker. Worker autoscaling needs queue
+depth and in-flight counts exported through the custom metrics API, plus DNS
+discovery so a new replica receives traffic at all.
+
+**Verified on a live cluster.** [`docs/reports/K8S_SPLIT_VERIFICATION.md`](docs/reports/K8S_SPLIT_VERIFICATION.md)
+is the log of a real run, reproducible with:
+
+```bash
+./k8s/kind-verify.sh          # add --keep to leave the cluster up
+```
+
+It builds the CPU image, creates a 3-node [kind](https://kind.sigs.k8s.io/)
+cluster, deploys the overlay, serves a request end to end, then removes a
+worker **while traffic is still flowing** and reports the status codes seen
+across the removal — the window before the health checker reacts is the part
+worth measuring, and asking once afterwards would only show the steady state.
+
+In the checked-in run the two workers were scheduled on different nodes, each
+bound its own PVC, per-pod DNS resolved to distinct addresses, and requests
+split 5/4 across the pool.
+
+Across the removal, that run served **61 of 62 requests with `200`** and one
+with `500`. **The window is not zero-loss, and that is by design.** The retry
+policy splits on what the departed worker could already have started:
+
+| Failure | Meaning | Action |
+|---|---|---|
+| `connect_error` | never delivered | retried on another worker |
+| `request_error` | already in flight when the pod died | **not** retried |
+
+Retrying the second class would let one client request cost two GPU
+generations. The run's metrics show exactly one `request_error` against the
+removed worker, which accounts for the single `500` — so the assertion the
+script makes is not "no request failed" but "every non-200 is an un-retryable
+mid-flight failure". Other runs came out 77/77 and 81/81 with no failure at
+all; whether the window catches a request in flight is timing. Closing it needs
+draining, listed as a gap in [ROADMAP.md](ROADMAP.md).
+
+One gap the run exposed: the gateway passes its readiness probe while holding
+zero healthy workers, because `/health` never consults the registry. See
+[ROADMAP.md](ROADMAP.md).
+
+Both live scripts **assert** rather than print. Every claim they make is a
+`[PASS]`/`[FAIL]` line and the script exits non-zero on any failure, so a wrong
+topology cannot produce a passing report. Verified by breaking the manifests on
+purpose: with the worker count reduced to one, six assertions failed and the
+run exited 1.
+
+**Manifests are checked in CI** (`.github/workflows/manifests.yml`) at two
+levels: `kubeconform` for schema validity, and `k8s/validate_manifests.py` for
+architecture invariants — the gateway requests no GPU and mounts no model
+cache, the worker Service is headless, the public Service cannot select worker
+pods, the endpoint list matches the replica count, images are pinned with an
+explicit pull policy, and both overlays agree on the fields Kubernetes refuses
+to update in place. The second layer exists because these manifests once
+described a single-process service for months after the split landed, while
+passing schema validation the whole time. Each check is verified to fail
+against a deliberately broken manifest, not only to pass against the current
+one.
 
 ### Option 3: Isolated SGLang Environment (Recommended)
 
@@ -631,11 +794,17 @@ V-Gate/
 │       ├── baseline.md         # Dry-run baseline report
 │       └── vllm_baseline.md    # Real GPU (RTX 3060) baseline report
 ├── k8s/
-│   ├── base/                   # namespace, deployment, service, HPA, PVC,
-│   │                           #   configmap, secret, servicemonitor
-│   └── overlays/
-│       ├── cpu/                # CPU / dry-run overlay
-│       └── gpu/                # GPU overlay (+ HPA patch)
+│   ├── base/                   # gateway Deployment + Service + HPA,
+│   │                           #   worker StatefulSet + headless Service,
+│   │                           #   namespace, configmap, secret, servicemonitor
+│   ├── overlays/
+│   │   ├── cpu/                # dry-run workers, no GPU (used by kind)
+│   │   └── gpu/                # vLLM workers on GPU nodes
+│   ├── kind-cluster.yaml       # 3-node local cluster definition
+│   ├── kind-verify.sh          # Deploy on kind and prove failover works
+│   ├── migrate-from-monolith.sh # Remove pre-split orphans, then apply
+│   ├── verify-migration.sh     # Reproduce the upgrade hazard and the fix
+│   └── validate_manifests.py   # Architecture invariants, checked in CI
 ├── monitoring/
 │   └── prometheus.yml          # Prometheus configuration
 ├── scripts/
@@ -709,7 +878,7 @@ ruff check .
 - [x] Dynamic micro-batching, request deduplication, and RAM result cache
 - [x] Prometheus metrics, structured logging, and OpenTelemetry integration
 - [x] Concurrent load tools and checked-in dry-run/real-GPU benchmark reports
-- [x] Docker, baseline Kubernetes manifests, CI, and sync/async Python SDK
+- [x] Docker, split-topology Kubernetes manifests with CI validation, and sync/async Python SDK
 
 The priority order below is authoritative. [ROADMAP.md](ROADMAP.md) holds the detailed acceptance criteria; its internal `Phase` numbering is a different axis and does not imply execution order relative to these priorities.
 
@@ -736,9 +905,10 @@ Prerequisites for distributing anything: a single node must fail predictably bef
 
 ### Priority 3: Heterogeneous Kubernetes Deployment
 
-- [ ] Deploy the gateway and inference workers as separate components
-- [ ] Add GPU node placement and independent CPU/GPU worker scaling
-- [ ] Scale on pending resource demand and queue/inflight signals instead of CPU utilization alone
+- [x] Deploy the gateway and inference workers as separate components
+- [x] Add GPU node placement and independent CPU/GPU worker scaling
+- [x] Validate manifests in CI for schema and for architecture invariants
+- [~] Scale on pending resource demand and queue/inflight signals instead of CPU utilization alone — the gateway autoscales on CPU, which suits it; the worker has no autoscaler, because CPU is a false signal for a GPU process and the queue-depth signals that would work are not exported through the custom metrics API. Worker autoscaling is also blocked on DNS discovery, since a new replica gets no traffic while the endpoint list is static.
 - [ ] Add worker-down, overload, and tail-latency alerts plus an operational runbook
 
 ### Optional Follow-ups

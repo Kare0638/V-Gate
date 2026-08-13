@@ -1,0 +1,38 @@
+# Headless (clusterIP: None) on purpose: it removes the load-balanced virtual
+# IP, leaving per-pod DNS as the only way to address this Service. The gateway
+# routes by pod name because its registry tracks each worker's health
+# separately; a virtual IP in front of the pool is precisely the thing that
+# would undo that, by letting anything resolve `vgate-worker` to one address
+# that kube-proxy fans out.
+#
+# Measured, not assumed: dropping `clusterIP: None` does NOT by itself stop
+# `vgate-worker-0.vgate-worker` from resolving. A StatefulSet writes each pod's
+# hostname into the EndpointSlice, and CoreDNS serves per-pod records from that
+# whether or not the Service is headless. So the reason to keep this line is
+# the virtual IP it suppresses, not per-pod records it is often assumed to
+# create.
+#
+# This Service is never exposed outside the cluster. /internal/generate is a
+# gateway-to-worker call, not a client-facing API.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vgate-worker
+  labels:
+    app.kubernetes.io/name: vgate
+    app.kubernetes.io/component: worker
+spec:
+  clusterIP: None
+  # Publish DNS for pods that are not yet Ready. Rotation membership is the
+  # gateway registry's decision, made from its own /health probes; withholding
+  # DNS would put that decision in a second place and delay the moment the
+  # gateway can see a recovering worker come back.
+  publishNotReadyAddresses: true
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: vgate
+    app.kubernetes.io/component: worker

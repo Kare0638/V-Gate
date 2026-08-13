@@ -3,16 +3,24 @@ kind: Kustomization
 
 namespace: vgate
 
-commonLabels:
-  app.kubernetes.io/managed-by: kustomize
+# includeSelectors is off on purpose. The deprecated `commonLabels` field this
+# replaces injected the label into selectors as well, which both makes
+# managed-by part of a pod's identity and writes an immutable field that cannot
+# be changed on an existing Deployment. Selectors are declared explicitly in
+# each manifest instead.
+labels:
+  - pairs:
+      app.kubernetes.io/managed-by: kustomize
+    includeSelectors: false
 
 resources:
   - namespace.yaml
   - configmap.yaml
   - secret.yaml
-  - pvc.yaml
-  - deployment.yaml
-  - service.yaml
-  - hpa.yaml
+  - gateway-deployment.yaml
+  - gateway-service.yaml
+  - gateway-hpa.yaml
+  - worker-statefulset.yaml
+  - worker-service.yaml
   # Uncomment if Prometheus Operator CRDs are installed:
   # - servicemonitor.yaml

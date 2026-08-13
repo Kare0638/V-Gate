@@ -1,0 +1,20 @@
+# Local cluster for exercising the split topology without a GPU.
+#
+# Three nodes rather than one: with a single node every pod is trivially
+# co-located, which hides scheduling and cross-node networking. Two worker
+# nodes let the two vgate-worker pods land on different machines, so the
+# gateway's per-pod DNS routing is actually crossing a network boundary.
+#
+# kind's default storage class (rancher local-path) provisions node-local
+# volumes with WaitForFirstConsumer binding, which is what makes the
+# StatefulSet's per-pod volumeClaimTemplates work here. It also means a worker
+# rescheduled onto another node cannot reach its old volume — acceptable for a
+# dry-run cache holding nothing, and the reason the GPU overlay's model cache
+# wants a real ReadWriteOnce class with proper node affinity.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: vgate
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
