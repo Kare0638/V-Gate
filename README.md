@@ -204,6 +204,8 @@ Behavior of split mode:
 The manifests deploy the same split: a gateway `Deployment` in front of a
 worker `StatefulSet`.
 
+**On a fresh cluster:**
+
 ```bash
 # Render and apply the dry-run overlay
 kustomize build k8s/overlays/cpu | kubectl apply -f -
@@ -211,6 +213,55 @@ kustomize build k8s/overlays/cpu | kubectl apply -f -
 # Real vLLM workers on GPU nodes; the gateway stays on the CPU image
 kustomize build k8s/overlays/gpu | kubectl apply -f -
 ```
+
+> #### Upgrading a cluster that ran the pre-split manifests
+>
+> **`kubectl apply` alone is not a safe upgrade path here.** It creates and
+> updates but never deletes objects that were removed from the manifests, and
+> the split renamed the workloads. Three objects are left behind:
+> `Deployment/vgate`, `HorizontalPodAutoscaler/vgate`, and
+> `PersistentVolumeClaim/vgate-model-cache`.
+>
+> The Deployment is the damaging one. Its pods carry
+> `app.kubernetes.io/name=vgate` and `app.kubernetes.io/component=gateway` —
+> exactly what the new `Service/vgate` selects — so the old monolith stays
+> behind the public endpoint and keeps taking live traffic.
+>
+> Reproduced on kind ([full log](docs/reports/K8S_MIGRATION_VERIFICATION.md)):
+> after a plain apply, `Service/vgate` listed three endpoints — two old
+> monolith pods and one new gateway — and **26 of 40 requests came back
+> `401`**, against 40 of 40 succeeding before the upgrade. The old pods still
+> validate the API key from the ConfigMap they mounted at startup rather than
+> the Secret the new manifests use, and a mounted ConfigMap key does not
+> reload. So the practical result is not a subtle routing quirk but roughly
+> two thirds of client traffic failing outright. After migrating, all 40
+> requests reached the new gateway. On a GPU cluster the old Deployment also
+> holds its `nvidia.com/gpu` until deleted, which can leave the new workers
+> unschedulable.
+>
+> ```bash
+> # Report what would be removed; changes nothing, exits non-zero if found
+> ./k8s/migrate-from-monolith.sh --check
+>
+> # Remove the pre-split objects, then apply
+> ./k8s/migrate-from-monolith.sh --overlay cpu
+> ./k8s/migrate-from-monolith.sh --overlay gpu --delete-pvc
+> ```
+>
+> The script deletes the old objects *before* applying the new ones, accepting
+> a short gap with no gateway running. Applying first would avoid the gap but
+> puts both topologies behind the same Service at once, and on GPU nodes would
+> require enough GPUs for both.
+>
+> `kubectl apply --prune` is the built-in mechanism for this and is
+> deliberately not used: it is still Alpha, carries a "do not use unless you
+> are aware of what the current state is" warning in kubectl's own help, and
+> prunes by label expression, so a bad match deletes live workloads. The orphan
+> set here is small, known, and fixed, which makes naming the three objects
+> both safer and easier to review.
+>
+> On a cluster that never ran the pre-split manifests the script reports
+> nothing to migrate and applies normally, so it is safe to use unconditionally.
 
 Why a `StatefulSet` for workers: the gateway's registry tracks each worker
 separately, so it needs to address them individually. A `Deployment`'s pods get
@@ -716,6 +767,8 @@ V-Gate/
 │   │   └── gpu/                # vLLM workers on GPU nodes
 │   ├── kind-cluster.yaml       # 3-node local cluster definition
 │   ├── kind-verify.sh          # Deploy on kind and prove failover works
+│   ├── migrate-from-monolith.sh # Remove pre-split orphans, then apply
+│   ├── verify-migration.sh     # Reproduce the upgrade hazard and the fix
 │   └── validate_manifests.py   # Architecture invariants, checked in CI
 ├── monitoring/
 │   └── prometheus.yml          # Prometheus configuration
