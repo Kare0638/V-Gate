@@ -1,0 +1,133 @@
+# Workers run inference and nothing else: no batching, no cache, no admission
+# control. Those live on the gateway, and running them here would batch and
+# cache every request twice.
+#
+# A StatefulSet rather than a Deployment, for two reasons:
+#
+#  1. Stable network identity. Each pod gets a predictable DNS name
+#     (vgate-worker-0.vgate-worker.<ns>.svc.cluster.local) that the gateway's
+#     worker registry can address individually. A Deployment's pods get random
+#     names and no per-pod records, so the registry could only reach them
+#     through a load-balanced Service — which would collapse the pool into one
+#     opaque endpoint and defeat per-worker health tracking and routing.
+#  2. Per-pod storage. volumeClaimTemplates gives every worker its own model
+#     cache PVC, so a ReadWriteOnce StorageClass still supports more than one
+#     replica. A single shared ReadWriteOnce PVC could only ever be mounted by
+#     pods on one node.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vgate-worker
+  labels:
+    app.kubernetes.io/name: vgate
+    app.kubernetes.io/component: worker
+spec:
+  serviceName: vgate-worker
+  replicas: 2
+  # Workers share nothing, so there is no reason to start them one at a time.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vgate
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vgate
+        app.kubernetes.io/component: worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # uvicorn stops accepting connections on SIGTERM and finishes in-flight
+      # requests, so a generation already running survives a rolling restart
+      # instead of being cut off at the 30s default.
+      #
+      # This is not full draining. The gateway routes to pods by DNS name, not
+      # through this Service, so removing the pod from the Service's endpoints
+      # — the mechanism Kubernetes normally uses to stop new traffic during
+      # shutdown — has no effect on it. The gateway only stops sending work
+      # once its own /health probe fails, which happens after the server is
+      # already going down. Closing that window means failing /health on
+      # SIGTERM while still serving in-flight work, which is application code,
+      # not a manifest change. Tracked in README.md Priority 2 as the
+      # in-flight draining gap.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: vgate
+          image: vgate:cpu
+          # See gateway-deployment.yaml: the default varies with the tag, and
+          # side-loaded images are never pullable.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: VGATE_ROLE
+              value: "worker"
+            - name: VGATE_DRY_RUN
+              value: "true"
+            # The gateway authenticates to /internal/generate with this key, so
+            # both roles are given the same Secret value. Taken whole rather
+            # than assembled from parts — see secret.yaml.
+            - name: VGATE_SECURITY__API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: vgate-secrets
+                  key: api-keys-json
+            - name: VGATE_CONFIG_PATH
+              value: "/app/config.yaml"
+            - name: HF_HOME
+              value: "/cache/huggingface"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: vgate-secrets
+                  key: hf-token
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            # Sized for the GPU overlay, where this covers weight loading and
+            # KV cache warmup; the CPU overlay patches it down.
+            failureThreshold: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            - name: model-cache
+              mountPath: /cache/huggingface
+      volumes:
+        - name: config
+          configMap:
+            name: vgate-config
+  volumeClaimTemplates:
+    - metadata:
+        name: model-cache
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi

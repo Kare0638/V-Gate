@@ -1,3 +1,11 @@
+# GPU overlay: real vLLM workers on GPU nodes, gateway unchanged on CPU.
+#
+# This split is the point of the overlay. Only the worker patch touches the GPU
+# image, the nvidia.com/gpu request, and the GPU-node toleration; the gateway
+# keeps the small CPU image and scales on its own. Before the roles were
+# separated, asking for more serving capacity meant scheduling another copy of
+# the CUDA image and its GPU request even though the extra capacity needed was
+# request handling, not inference.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -5,5 +13,4 @@ resources:
   - ../../base
 
 patches:
-  - path: deployment-patch.yaml
-  - path: hpa-patch.yaml
+  - path: worker-patch.yaml

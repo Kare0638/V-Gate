@@ -1,0 +1,37 @@
+# Dry-run workers load no weights, so the long startup budget the base sets
+# aside for weight loading and KV cache warmup is dead waiting time here.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vgate-worker
+spec:
+  template:
+    spec:
+      containers:
+        - name: vgate
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 10
+            periodSeconds: 3
+  # No model is downloaded in dry-run, so the cache only has to exist. Kept
+  # rather than dropped so the CPU and GPU overlays exercise the same volume
+  # wiring; a StatefulSet's volumeClaimTemplates cannot be added later without
+  # recreating it.
+  volumeClaimTemplates:
+    - metadata:
+        name: model-cache
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi

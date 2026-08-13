@@ -1,0 +1,51 @@
+# Gateway only. The gateway is stateless and CPU-bound — it parses requests,
+# looks up the cache, deduplicates, and forwards — so CPU utilization tracks
+# its actual load.
+#
+# There is deliberately no equivalent for the worker StatefulSet. CPU
+# utilization is a false signal for a GPU inference process: the GPU saturates
+# while the CPU mostly waits on it, so a CPU-triggered rule would sit far below
+# its threshold on a worker that is already overloaded and would never fire.
+# The signals that do track worker load are queue depth and in-flight work
+# (vgate_pending_requests, vgate_inflight_inferences) plus GPU utilization, and
+# scaling on those requires exporting Prometheus metrics through the custom
+# metrics API (e.g. prometheus-adapter), which is cluster infrastructure this
+# repo does not install.
+#
+# Scaling the worker StatefulSet would also have no effect today: the gateway
+# reads a static endpoint list, so a worker it was never told about receives no
+# traffic. Autoscaling workers is blocked on DNS-based discovery landing first.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: vgate-gateway
+  labels:
+    app.kubernetes.io/name: vgate
+    app.kubernetes.io/component: autoscaler
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vgate-gateway
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60

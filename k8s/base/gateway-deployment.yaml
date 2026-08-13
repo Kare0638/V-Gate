@@ -1,0 +1,106 @@
+# The gateway owns admission, deduplication, caching, routing, and the public
+# API. It never loads a model: setting worker endpoints makes VGateEngine build
+# a RemoteBackend, which takes precedence over VGATE_DRY_RUN and engine_type
+# (see vgate/engine.py::_create_backend). That is why there is no model cache
+# volume and no GPU request here — a gateway that asked for either would be
+# holding resources it cannot use.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vgate-gateway
+  labels:
+    app.kubernetes.io/name: vgate
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vgate
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vgate
+        app.kubernetes.io/component: gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: vgate
+          image: vgate:cpu
+          # Explicit because the default depends on the tag: a ":latest" tag
+          # silently becomes Always, which fails on a kind cluster where the
+          # image was side-loaded and never pushed anywhere. Production should
+          # pin an immutable tag or digest rather than rely on either default.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: VGATE_ROLE
+              value: "gateway"
+            # Stable per-pod DNS names, which only a StatefulSet provides. A
+            # Deployment's pods get random names and no individual records, so
+            # a static registry could not address them one by one.
+            #
+            # The cost of listing them statically is that scaling the worker
+            # StatefulSet does not reach the gateway: a new vgate-worker-2
+            # would receive no traffic until this value is edited. Replacing
+            # this list with headless-Service DNS discovery is tracked as the
+            # next step in README.md's Priority 2.
+            - name: VGATE_WORKER__ENDPOINTS
+              value: >-
+                ["http://vgate-worker-0.vgate-worker:8000",
+                 "http://vgate-worker-1.vgate-worker:8000"]
+            # /internal/generate is not an exempt path, so the gateway must
+            # present the same key the workers validate against.
+            - name: VGATE_WORKER__API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: vgate-secrets
+                  key: api-key
+            # Taken whole from the Secret rather than assembled here, so no
+            # entry in this list depends on the position of another. See
+            # secret.yaml for why $(VAR) interpolation was rejected.
+            - name: VGATE_SECURITY__API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: vgate-secrets
+                  key: api-keys-json
+            - name: VGATE_CONFIG_PATH
+              value: "/app/config.yaml"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 10
+            periodSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: vgate-config

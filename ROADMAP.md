@@ -35,6 +35,7 @@ Current gaps:
 - Streaming does not work through a remote worker; the gateway returns 501 rather than opening a stream it cannot serve.
 - Dry-run and single-GPU vLLM reports are checked in, but they predate parts of the current async serving path. A refreshed streaming baseline, repeat-run variance analysis, and 1-vs-N-worker evidence are still missing.
 - Cache is RAM-only. There is no persistent local disk cache layer, and cache value depends on process lifetime. This is an intentional, benchmark-gated decision (Phase 1.5), not an oversight — current traffic shows no L1 eviction pressure.
+- Kubernetes manifests now deploy the gateway and workers as separate components, and are validated in CI for both schema and architecture invariants. They have not yet been applied to a live cluster: `k8s/kind-verify.sh` automates that end-to-end check, but no run of it is checked in.
 - Backpressure, request timeout, circuit breaking, and worker failure handling are incomplete.
 - The embedding endpoint is currently a mock MVP implementation.
 - C++/CUDA lower-level performance work (Phase 7-8) is deliberately gated behind measured bottlenecks and has not been started.

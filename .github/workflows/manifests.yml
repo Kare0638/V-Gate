@@ -1,0 +1,68 @@
+# The Kubernetes manifests in this repo went stale once already: they kept
+# describing a single-process service for months after the gateway and workers
+# were split apart. Nothing caught it, because nothing looked at them. This
+# workflow is that missing reader.
+#
+# Two layers, because they answer different questions:
+#   kubeconform            — is this valid Kubernetes YAML?
+#   validate_manifests.py  — does it deploy the architecture this project has?
+# Only the second one would have caught the drift; the stale manifests passed
+# schema validation the entire time.
+name: Manifests
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "k8s/**"
+      - ".github/workflows/manifests.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "k8s/**"
+      - ".github/workflows/manifests.yml"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      KUSTOMIZE_VERSION: "5.7.1"
+      KUBECONFORM_VERSION: "0.7.0"
+      # Floor rather than the newest release: the manifests must stay
+      # deployable on the oldest version the project claims to support.
+      KUBERNETES_VERSION: "1.31.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Install kustomize and kubeconform
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
+            | tar xz -C "$HOME/.local/bin" kustomize
+          curl -sL "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar xz -C "$HOME/.local/bin" kubeconform
+          chmod +x "$HOME/.local/bin/kustomize" "$HOME/.local/bin/kubeconform"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Schema validation
+        run: |
+          set -euo pipefail
+          for overlay in cpu gpu; do
+            echo "::group::kubeconform $overlay"
+            kustomize build "k8s/overlays/$overlay" \
+              | kubeconform -strict -summary \
+                  -kubernetes-version "$KUBERNETES_VERSION" \
+                  -schema-location default
+            echo "::endgroup::"
+          done
+
+      - name: Architecture invariants
+        run: python k8s/validate_manifests.py

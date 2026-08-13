@@ -37,7 +37,7 @@ The evidence below is a measured snapshot of the current serving path. The vLLM 
 | **Observability** | Implemented | Prometheus metrics, structured logs, and optional OpenTelemetry tracing |
 | **Security** | Implemented | Bearer API keys and per-key sliding-window rate limits |
 | **Configuration as Code** | Implemented | YAML configuration with environment-variable overrides |
-| **Container Deployment** | Implemented | Docker CPU/GPU targets, Compose stack, and baseline Kubernetes manifests |
+| **Container Deployment** | Implemented | Docker CPU/GPU targets, Compose stack, and Kubernetes manifests deploying the gateway and workers as separate components |
 | **Python Client SDK** | Implemented | Sync/async clients with deterministic streaming cleanup |
 | **Gateway/Worker Split** | Partial | Inference runs in separate `role: worker` processes reached over HTTP; streaming through a worker returns 501 |
 | **Worker Registry & Health** | Implemented | Static registry with background `/health` probing, threshold-based removal, and automatic rejoin on recovery |
@@ -198,6 +198,59 @@ Behavior of split mode:
 - **No streaming.** `stream: true` returns `501` before any SSE bytes are sent, instead of a `200` followed by an in-band error.
 - The worker exposes only `/internal/generate`, `/health`, and `/metrics`; client-facing routes return `404` in the worker role.
 - With `security.enabled`, set `worker.api_key` on the gateway — `/internal/generate` is not an exempt path, so it requires the same bearer token as any other route (health probes send it too).
+
+### Option 2c: Kubernetes
+
+The manifests deploy the same split: a gateway `Deployment` in front of a
+worker `StatefulSet`.
+
+```bash
+# Render and apply the dry-run overlay
+kustomize build k8s/overlays/cpu | kubectl apply -f -
+
+# Real vLLM workers on GPU nodes; the gateway stays on the CPU image
+kustomize build k8s/overlays/gpu | kubectl apply -f -
+```
+
+Why a `StatefulSet` for workers: the gateway's registry tracks each worker
+separately, so it needs to address them individually. A `Deployment`'s pods get
+random names and no per-pod DNS, leaving only a load-balanced Service — one
+opaque endpoint, with per-worker health tracking and routing collapsed into
+kube-proxy. A `StatefulSet` behind a headless Service gives every pod a stable
+record (`vgate-worker-0.vgate-worker.vgate.svc.cluster.local`) that the
+registry can name. It also gives each worker its own model-cache volume, so a
+`ReadWriteOnce` StorageClass still supports more than one replica.
+
+Because the endpoint list is static, **the worker replica count and the
+gateway's `VGATE_WORKER__ENDPOINTS` have to be changed together** — `kubectl
+scale` alone does not reach the gateway. `k8s/validate_manifests.py` fails the
+build when they disagree. Replacing the list with headless-Service DNS
+discovery is the next step in [Priority 2](#priority-2-distributed-inference-serving).
+
+Autoscaling covers the gateway only. CPU utilization is a false signal for a
+GPU worker — the GPU saturates while the CPU waits on it — so a CPU-triggered
+rule would never fire on an overloaded worker. Worker autoscaling needs queue
+depth and in-flight counts exported through the custom metrics API, plus DNS
+discovery so a new replica receives traffic at all.
+
+**Verify it locally on [kind](https://kind.sigs.k8s.io/):**
+
+```bash
+./k8s/kind-verify.sh          # add --keep to leave the cluster up
+```
+
+This builds the CPU image, creates a 3-node cluster, deploys the overlay,
+serves a request end to end, scales a worker away and shows the gateway
+continuing on the survivor, then scales it back and shows it rejoining
+rotation. Output is written to `docs/reports/K8S_SPLIT_VERIFICATION.md`.
+
+**Manifests are checked in CI** (`.github/workflows/manifests.yml`) at two
+levels: `kubeconform` for schema validity, and `k8s/validate_manifests.py` for
+architecture invariants — the gateway requests no GPU and mounts no model
+cache, the worker Service is headless, the public Service cannot select worker
+pods, and the endpoint list matches the replica count. The second layer exists
+because these manifests once described a single-process service for months
+after the split landed, while passing schema validation the whole time.
 
 ### Option 3: Isolated SGLang Environment (Recommended)
 
@@ -631,11 +684,15 @@ V-Gate/
 │       ├── baseline.md         # Dry-run baseline report
 │       └── vllm_baseline.md    # Real GPU (RTX 3060) baseline report
 ├── k8s/
-│   ├── base/                   # namespace, deployment, service, HPA, PVC,
-│   │                           #   configmap, secret, servicemonitor
-│   └── overlays/
-│       ├── cpu/                # CPU / dry-run overlay
-│       └── gpu/                # GPU overlay (+ HPA patch)
+│   ├── base/                   # gateway Deployment + Service + HPA,
+│   │                           #   worker StatefulSet + headless Service,
+│   │                           #   namespace, configmap, secret, servicemonitor
+│   ├── overlays/
+│   │   ├── cpu/                # dry-run workers, no GPU (used by kind)
+│   │   └── gpu/                # vLLM workers on GPU nodes
+│   ├── kind-cluster.yaml       # 3-node local cluster definition
+│   ├── kind-verify.sh          # Deploy on kind and prove failover works
+│   └── validate_manifests.py   # Architecture invariants, checked in CI
 ├── monitoring/
 │   └── prometheus.yml          # Prometheus configuration
 ├── scripts/
@@ -709,7 +766,7 @@ ruff check .
 - [x] Dynamic micro-batching, request deduplication, and RAM result cache
 - [x] Prometheus metrics, structured logging, and OpenTelemetry integration
 - [x] Concurrent load tools and checked-in dry-run/real-GPU benchmark reports
-- [x] Docker, baseline Kubernetes manifests, CI, and sync/async Python SDK
+- [x] Docker, split-topology Kubernetes manifests with CI validation, and sync/async Python SDK
 
 The priority order below is authoritative. [ROADMAP.md](ROADMAP.md) holds the detailed acceptance criteria; its internal `Phase` numbering is a different axis and does not imply execution order relative to these priorities.
 
@@ -736,9 +793,10 @@ Prerequisites for distributing anything: a single node must fail predictably bef
 
 ### Priority 3: Heterogeneous Kubernetes Deployment
 
-- [ ] Deploy the gateway and inference workers as separate components
-- [ ] Add GPU node placement and independent CPU/GPU worker scaling
-- [ ] Scale on pending resource demand and queue/inflight signals instead of CPU utilization alone
+- [x] Deploy the gateway and inference workers as separate components
+- [x] Add GPU node placement and independent CPU/GPU worker scaling
+- [x] Validate manifests in CI for schema and for architecture invariants
+- [~] Scale on pending resource demand and queue/inflight signals instead of CPU utilization alone — the gateway autoscales on CPU, which suits it; the worker has no autoscaler, because CPU is a false signal for a GPU process and the queue-depth signals that would work are not exported through the custom metrics API. Worker autoscaling is also blocked on DNS discovery, since a new replica gets no traffic while the endpoint list is static.
 - [ ] Add worker-down, overload, and tail-latency alerts plus an operational runbook
 
 ### Optional Follow-ups

@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vgate-worker
+spec:
+  # Kept at the base value of 2 because the gateway's endpoint list names
+  # exactly vgate-worker-0 and vgate-worker-1. On a single-GPU cluster, drop
+  # this to 1 and remove the matching entry from VGATE_WORKER__ENDPOINTS in
+  # k8s/base/gateway-deployment.yaml — the two have to be changed together.
+  #
+  # Having to edit the gateway to change the worker count is the concrete cost
+  # of a static registry, and the reason DNS-based discovery is the next step.
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: vgate
+          image: vgate:latest
+          env:
+            # Merged into the base list by name. Strategic merge puts entries
+            # that only exist in the patch at the front, so this reorders the
+            # list — harmless here only because no entry references another.
+            - name: VGATE_DRY_RUN
+              value: "false"
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule

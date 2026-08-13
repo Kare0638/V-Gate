@@ -1,0 +1,31 @@
+# Headless (clusterIP: None) on purpose. A normal ClusterIP Service would hand
+# the gateway one virtual IP and let kube-proxy pick a worker, which would
+# override the gateway's own routing: the worker registry could no longer tell
+# workers apart, track their health individually, or implement load-aware
+# routing. Headless instead publishes one DNS record per pod, so the registry
+# addresses each worker directly.
+#
+# This Service is never exposed outside the cluster. /internal/generate is a
+# gateway-to-worker call, not a client-facing API.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vgate-worker
+  labels:
+    app.kubernetes.io/name: vgate
+    app.kubernetes.io/component: worker
+spec:
+  clusterIP: None
+  # Publish DNS for pods that are not yet Ready. Rotation membership is the
+  # gateway registry's decision, made from its own /health probes; withholding
+  # DNS would put that decision in a second place and delay the moment the
+  # gateway can see a recovering worker come back.
+  publishNotReadyAddresses: true
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: vgate
+    app.kubernetes.io/component: worker

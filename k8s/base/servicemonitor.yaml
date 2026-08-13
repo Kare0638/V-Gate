@@ -1,6 +1,13 @@
 # ServiceMonitor for Prometheus Operator integration.
 # Requires the Prometheus Operator CRDs to be installed in the cluster.
 # This resource is commented out in kustomization.yaml by default.
+#
+# The selector matches on name alone, without a component, so it picks up both
+# the gateway Service and the headless worker Service. That is intended: the
+# two roles export different metrics — routing and cache counters on the
+# gateway, inference counters on the workers — and both are needed to tell
+# whether a slowdown is in the gateway or on a GPU. Pods are distinguished by
+# the labels Prometheus attaches, not by having separate monitors.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:

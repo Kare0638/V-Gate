@@ -49,12 +49,15 @@ data:
       enabled: true
 
     # Security & Access Control
+    #
+    # api_keys is deliberately absent here. Both roles receive it as
+    # VGATE_SECURITY__API_KEYS, interpolated from the vgate-secrets Secret, so
+    # the key exists in exactly one place instead of being duplicated into a
+    # ConfigMap that is plain text in the API server and in git. Environment
+    # variables outrank this file and deep-merge into it, so only api_keys is
+    # replaced — enabled, rate_limiting, and exempt_paths below still apply.
     security:
       enabled: true
-      api_keys:
-        - key: "PLACEHOLDER_REPLACE_WITH_REAL_KEY"
-          name: "default"
-          rate_limit: 100
       rate_limiting:
         enabled: true
         default_limit: 60

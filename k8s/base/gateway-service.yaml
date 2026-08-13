@@ -1,3 +1,6 @@
+# The only entry point. Workers are deliberately not reachable through this
+# Service: the selector pins component=gateway, so a worker pod carrying the
+# same app.kubernetes.io/name label can never end up behind it.
 apiVersion: v1
 kind: Service
 metadata:
@@ -14,3 +17,4 @@ spec:
       protocol: TCP
   selector:
     app.kubernetes.io/name: vgate
+    app.kubernetes.io/component: gateway
