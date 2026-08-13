@@ -34,6 +34,7 @@ Current gaps:
 - Routing is per request now that `RequestBatcher` fans out, so least-inflight and EWMA are unblocked — but neither is implemented, and routing remains round-robin.
 - Streaming does not work through a remote worker; the gateway returns 501 rather than opening a stream it cannot serve.
 - Dry-run and single-GPU vLLM reports are checked in, but they predate parts of the current async serving path. A refreshed streaming baseline, repeat-run variance analysis, and 1-vs-N-worker evidence are still missing.
+- All live-GPU evidence comes from one 6GB laptop GPU running a 1.5B AWQ model. That is enough to prove the vLLM path works and not enough to say anything about the problems this project claims to be near: tensor parallelism, KV-cache pressure at realistic context lengths, and scheduling behaviour when a single model does not fit on one device are all untested. Any statement about multi-GPU behaviour here would be extrapolation, so none is made. A single rented two-GPU run would replace the assumption with a measurement.
 - Cache is RAM-only. There is no persistent local disk cache layer, and cache value depends on process lifetime. This is an intentional, benchmark-gated decision (Phase 1.5), not an oversight — current traffic shows no L1 eviction pressure.
 - Kubernetes manifests deploy the gateway and workers as separate components, are validated in CI for both schema and architecture invariants, and have been exercised on a live 3-node kind cluster — see [K8S_SPLIT_VERIFICATION.md](docs/reports/K8S_SPLIT_VERIFICATION.md). Only the dry-run overlay has been run; the GPU overlay is validated but unexercised.
 - Upgrading a cluster that ran the pre-split manifests requires `k8s/migrate-from-monolith.sh`; `kubectl apply` alone leaves the old `Deployment/vgate` behind the new `Service/vgate` and most traffic fails. Reproduced and fixed in [K8S_MIGRATION_VERIFICATION.md](docs/reports/K8S_MIGRATION_VERIFICATION.md). The general mechanism — `kubectl apply --prune` — is still Alpha, so any future rename of a manifest object has the same hazard and needs the same kind of explicit migration step.
@@ -123,6 +124,23 @@ Completion criteria:
 
 This ordering is internal to this document. [README.md](README.md)'s Roadmap section holds the authoritative project priority.
 
+The `Phase` numbers below are areas of work, not a schedule, and they have not
+been executed in order — Phases 4 and 5 landed while Phase 3 stayed untouched.
+The current execution sequence lives in README's **Next Up** section:
+
+1. Worker discovery — Phase 4, task 10
+2. 1-vs-N measurement — Phase 4, task 8
+3. Backpressure and readiness — Phase 3
+4. Load-aware routing — Phase 4, task 5
+5. Prefix-affinity routing — Phase 4, task 5
+6. Multi-GPU validation — Phase 1, extending the checked-in GPU baseline
+
+Each step is placed where it is because of what it unblocks, not because of its
+phase number. Discovery comes first because it makes the worker count a variable;
+measurement comes before both backpressure and routing because limits chosen
+without load data are guesses, and a routing policy nobody can measure is a
+change nobody can defend.
+
 ### Phase 0: Credibility Fixes
 
 **Status: done.** All six tasks are implemented and covered by tests (`pytest tests/ vgate-client/tests/` — 146 + 48 passing):
@@ -174,6 +192,12 @@ Expected outcome:
 **Status: done.** `benchmarks/bench_load.py` (concurrent HTTP load generator) and `benchmarks/run_report.py` (multi-scenario orchestrator) are implemented; `benchmarks/results/baseline.md` (dry-run) and `benchmarks/results/vllm_baseline.md` (real GPU: RTX 3060 Laptop, Qwen2.5-1.5B-AWQ, vLLM 0.26) are both checked in. Batcher tracks `avg_queue_time_s`/`avg_ttft_s`/`avg_tpot_s` and `/v1/benchmark` reports TTFT/TPOT percentiles plus batch/cache stats.
 
 Producing the real GPU baseline surfaced and fixed three bugs that only show up against live hardware/dependencies: (1) `time.time()` for queue-time deltas could go negative on wall-clock adjustment, now `time.monotonic()`; (2) vLLM under WSL2 needs `VLLM_WSL2_ENABLE_PIN_MEMORY=1` or it crashes at startup; (3) `VLLMBackend` read renamed/removed vLLM metrics fields plus relied on a stats-collection flag that `LLM()` defaults off, so TTFT/TPOT were silently always 0 for the real backend. It also surfaced a fourth issue, fixed in Phase 0: `max_batch_size` was only a trigger threshold, not a hard cap. See `benchmarks/results/vllm_baseline.md` for the original data.
+
+**Remaining, and the reason this phase is not closed:**
+
+1. [ ] **Multi-GPU baseline.** Every live-GPU number here comes from one 6GB laptop GPU running a 1.5B AWQ model. That establishes the vLLM path works; it establishes nothing about the regime this project positions itself near. One rented two-GPU run, comparing `tensor_parallel_size` 1 against 2 on a model that does not comfortably fit on one device, would produce the first evidence about KV-cache pressure and multi-device scheduling here. Until it exists, no claim about multi-GPU behaviour should appear anywhere in this repo.
+2. [ ] **Repeat-run variance.** Single runs are reported without spread, so a difference between two numbers cannot currently be distinguished from noise.
+3. [ ] **Refreshed streaming baseline.** The checked-in reports predate parts of the current async serving path.
 
 Priority: highest.
 
@@ -342,6 +366,17 @@ Expected outcome:
 
 ### Phase 3: Backpressure And Reliability
 
+**Status: not started, and overdue.** This was written as a prerequisite for
+distribution — a single node should fail predictably before N nodes do — but the
+split, the routing rewrite, and the Kubernetes work all landed while this stayed
+empty. Recording that plainly is more useful than renumbering it into looking
+like a plan that was followed.
+
+It is scheduled after the 1-vs-N measurement (README's Next Up, step 3) for one
+reason: the numbers below — queue length, timeout, shed threshold — are only
+meaningful against observed load. Choosing them first would mean picking values
+with nothing to check them against.
+
 Priority: high.
 
 Reason: reliable infrastructure must define what happens under overload. Batching alone is not enough; the system must avoid unbounded memory growth and cascading failure.
@@ -355,6 +390,16 @@ Tasks:
 5. Define 429/503 behavior.
 6. Improve graceful shutdown.
 7. Add overload metrics.
+8. Split readiness from liveness on the gateway. `/health` currently returns `ok`
+   without consulting the worker registry, so Kubernetes marks a gateway Ready
+   while it holds zero healthy workers and routes traffic that can only return
+   `503`. It cannot simply be changed in place: the worker health checker polls
+   the same endpoint with different intent.
+9. Drain in-flight work on worker shutdown. The gateway addresses worker pods by
+   DNS name rather than through a Service, so removing a pod from a Service's
+   endpoints — the mechanism Kubernetes normally uses to stop traffic during
+   termination — has no effect on it. A terminating worker has to fail its own
+   `/health` while still finishing the requests it already accepted.
 
 Recommended configuration:
 
@@ -389,7 +434,7 @@ Expected outcome:
 
 ### Phase 4: Multi-Worker Serving
 
-**Status: mostly implemented; unmeasured.** Role separation, the internal generate API, a static registry with background health probing, round-robin routing, failover, recovery, and bearer authentication are in `main`. What is missing is the part that would justify calling it good: load-aware routing, and any measurement at all.
+**Status: mostly implemented; unmeasured.** Role separation, the internal generate API, a static registry with background health probing, round-robin routing, failover, recovery, and bearer authentication are in `main`, and the topology has been exercised on a live Kubernetes cluster ([K8S_SPLIT_VERIFICATION.md](docs/reports/K8S_SPLIT_VERIFICATION.md)). What is missing is the part that would justify calling it good: discovery instead of a fixed endpoint list, load-aware routing, and any throughput measurement at all.
 
 Priority: highest for distributed serving.
 
@@ -405,12 +450,21 @@ Tasks:
    - [x] round-robin
    - [ ] least-inflight
    - [ ] EWMA latency
+   - [ ] prompt-prefix affinity
 6. [x] Add worker circuit breakers — threshold-based removal from rotation; no in-flight draining.
 7. [x] Add worker recovery — sustained successful probes return a worker to rotation automatically.
 8. [ ] Add multi-worker benchmarks — **nothing is measured yet**; no 1-vs-N throughput or tail-latency numbers exist.
 9. [x] Add minimal gateway-to-worker authentication — bearer token on both generate calls and health probes; `/internal/generate` is not an exempt path.
+10. [ ] Replace static endpoint configuration with discovery. The registry currently tracks usability only; membership is fixed at startup from `worker.endpoints`. On Kubernetes this means `kubectl scale` does not reach the gateway, so a new replica receives nothing and a removed one is probed forever. Resolving the headless Service's DNS on the health-check tick makes membership follow the cluster, and is what unblocks worker autoscaling in Phase 5.
 
-Task 5's remaining strategies are now unblocked: `RequestBatcher` fans out, so each request is routed on its own and a load-aware policy can act on the signal it reads. Least-inflight needs per-worker in-flight counters; EWMA needs per-worker latency tracking with exponential decay. Neither is implemented.
+**Execution order for the remaining tasks** (README's Next Up section is authoritative):
+task 10, then task 8, then Phase 3, then the load-aware strategies in task 5.
+
+Task 5's remaining strategies are unblocked at the seam: `RequestBatcher` fans out, so each request is routed on its own and a load-aware policy can act on the signal it reads. Least-inflight needs per-worker in-flight counters; EWMA needs per-worker latency tracking with exponential decay, and `RemoteBackend` already records a per-worker `vgate_worker_latency_seconds` histogram it can be built from.
+
+They are nonetheless sequenced after task 8, because **under uniform load, round-robin and least-inflight are indistinguishable**. Two workers of equal speed serving requests of equal cost will be balanced either way. The difference only appears under heterogeneous load — uneven request cost, or workers of differing speed — and nothing in this repo can currently generate that and measure the result. Implementing a policy first would produce code whose benefit cannot be shown, which is the same failure as an untested manifest: it looks like progress and asserts nothing.
+
+Prompt-prefix affinity is listed separately because it is the one routing policy specific to LLM serving rather than general request distribution. Requests sharing a system prompt or conversation prefix hit the same KV cache if they land on the same worker; round-robin scatters them and forces recomputation. It depends on the same routing seam, and its benefit is measurable in a way the others are not — prefix cache hit rate, reported by the engine.
 
 Retry semantics worth recording, since they are a design decision rather than a detail: a connection failure is retried on another worker because nothing was delivered; a timeout is not, because the worker may already be generating and retrying would spend two GPU generations on one client request; a non-200 is not, because another worker would most likely reject it identically.
 
@@ -441,12 +495,14 @@ Suggested APIs:
 
 Acceptance criteria:
 
-- Local docker-compose can start 1 gateway + 2 workers.
-- If one worker is killed under active load, the gateway detects it, routes around it, and no request is silently dropped (chaos-style failure test).
-- When the worker recovers, it can receive traffic again.
-- Benchmarks show throughput improvement with multiple workers.
-- `/stats` shows inflight requests, latency, and state for each worker.
-- Gateway-worker calls use a minimal authentication mechanism. mTLS and audit logging are deferred to governance/security hardening.
+- [x] Local docker-compose can start 1 gateway + 2 workers.
+- [x] If one worker is killed under active load, the gateway detects it, routes around it, and requests are not silently dropped. Verified on a live cluster: across a worker removal, 61 of 62 requests were served, and the single failure was the documented un-retryable class — a request already in flight when the pod died — accounted for by exactly one `request_error` in the metrics. "No request is dropped" is deliberately not the criterion, because retrying that class would spend two GPU generations on one client request.
+- [x] When the worker recovers, it can receive traffic again.
+- [x] `/stats` shows failure counts, health, and time-in-state for each worker.
+- [x] Gateway-worker calls use a minimal authentication mechanism. mTLS and audit logging are deferred to governance/security hardening.
+- [ ] Worker membership follows the cluster rather than a startup config (task 10).
+- [ ] Benchmarks show throughput improvement with multiple workers. Specifically: throughput and p50/p95/p99 at N = 1, 2, 4 under fixed concurrency, plus the same run with a worker killed mid-flight. Two things have to be reported honestly for the numbers to mean anything — whether the load generator or the gateway is the bottleneck at high N, and whether dry-run workers were used, since those measure how well the gateway feeds N backends rather than how much GPU throughput N GPUs provide.
+- [ ] `/stats` reports per-worker in-flight counts and latency, which least-inflight and EWMA both need as their input signal.
 
 Expected outcome:
 

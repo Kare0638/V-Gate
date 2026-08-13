@@ -882,14 +882,58 @@ ruff check .
 
 The priority order below is authoritative. [ROADMAP.md](ROADMAP.md) holds the detailed acceptance criteria; its internal `Phase` numbering is a different axis and does not imply execution order relative to these priorities.
 
+### Next Up
+
+The Priority sections below group work by area. This is the execution order, with
+what each step unblocks or answers, so the sequence can be argued with rather
+than guessed at.
+
+**1. DNS-based worker discovery.** The gateway reads a static endpoint list, so
+`kubectl scale` does not reach it and the worker count cannot change without
+editing the gateway. Everything below needs N to be a variable. Resolving the
+headless Service instead makes the registry track membership as well as health.
+
+**2. Measure 1 worker vs N.** The central claim of the architecture — that a
+pool serves better than a single process — has never been measured. Throughput,
+p50/p95/p99, and behaviour under injected worker failure, at N = 1, 2, 4. This
+is also the harness step 4 needs.
+
+**3. Backpressure: bounded queues, request deadlines, stable overload
+responses.** Priority 1 below has stayed unstarted while Priorities 2 and 3
+advanced, which is worth stating plainly rather than quietly reordering. It
+moves after measurement because load data is what shows where the queue
+actually builds; adding limits first would be picking numbers with nothing to
+check them against.
+
+**4. Load-aware routing, measured against round-robin.** Least-inflight and
+EWMA are unblocked but not implemented. They are also unfalsifiable without
+step 2: under uniform load, round-robin and least-inflight are
+indistinguishable, so the deliverable is the comparison under heterogeneous
+load, not the code.
+
+**5. Prefix-cache-aware routing.** The first item on this list that is specific
+to LLM serving rather than general request routing: sending requests that share
+a prompt prefix to the same worker lets that worker reuse its KV cache, and
+round-robin actively destroys that locality. Needs step 4's routing seam.
+
+**6. Multi-GPU validation.** All live-GPU evidence comes from one 6GB laptop
+GPU running a 1.5B model, so tensor parallelism, KV-cache pressure, and
+multi-GPU scheduling are entirely untested. Renting two A100s for a single
+run would replace an assumption with a measurement.
+
 ### Priority 1: Backpressure And Reliability
 
-Prerequisites for distributing anything: a single node must fail predictably before N nodes can.
+Originally framed as a prerequisite — a single node should fail predictably
+before N nodes do. That ordering was not followed: the split, the routing
+rewrite, and the Kubernetes work all landed first, so this section describes
+work that is now overdue rather than upcoming.
 
 - [ ] Unify streaming and non-streaming admission control
 - [ ] Add bounded queues, deadlines, and stable overload responses
 - [ ] Abort backend work on client cancellation instead of computing orphaned tokens
 - [ ] Add request timeouts and per-backend error classification
+- [ ] Make gateway readiness reflect whether it can serve — `/health` returns `ok` without consulting the worker registry, so Kubernetes routes traffic to a gateway holding zero healthy workers and those requests get `503`
+- [ ] Drain in-flight work on worker shutdown — the gateway addresses pods directly, so removing a pod from a Service's endpoints does not stop traffic to it; a terminating worker must fail its own `/health` while still finishing what it has
 
 ### Priority 2: Distributed Inference Serving
 
@@ -899,9 +943,11 @@ Prerequisites for distributing anything: a single node must fail predictably bef
 - [~] Add routing strategies — round-robin is implemented; least-inflight and EWMA latency are not
 - [~] Add worker circuit breakers, draining, and recovery on rejoin — failing workers leave rotation and rejoin after sustained health; there is no in-flight draining
 - [x] Redefine `RequestBatcher` as dedup/admission/fan-out so routing decisions are per request rather than per batch
+- [ ] Replace the static endpoint list with headless-Service DNS discovery, so worker membership follows the cluster
 - [ ] Measure 1-worker vs N-worker throughput, tail latency, and behavior under injected worker failure
+- [ ] Route on prompt-prefix affinity so a worker can reuse its KV cache across related requests
 
-`[~]` marks partial items. Routing is currently decided once per batch, not per request, which is why least-inflight is not implemented yet: it would be choosing between workers on a signal it cannot act on at that granularity.
+`[~]` marks partial items. Least-inflight and EWMA are unblocked — `RequestBatcher` now fans out, so each request is routed on its own and a load-aware policy can act on the signal it reads. What is missing is not the seam but the evidence: under uniform load these policies are indistinguishable from round-robin, so implementing one without the 1-vs-N harness would produce a change nobody can show is an improvement.
 
 ### Priority 3: Heterogeneous Kubernetes Deployment
 
