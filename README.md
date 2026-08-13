@@ -233,16 +233,40 @@ rule would never fire on an overloaded worker. Worker autoscaling needs queue
 depth and in-flight counts exported through the custom metrics API, plus DNS
 discovery so a new replica receives traffic at all.
 
-**Verify it locally on [kind](https://kind.sigs.k8s.io/):**
+**Verified on a live cluster.** [`docs/reports/K8S_SPLIT_VERIFICATION.md`](docs/reports/K8S_SPLIT_VERIFICATION.md)
+is the log of a real run, reproducible with:
 
 ```bash
 ./k8s/kind-verify.sh          # add --keep to leave the cluster up
 ```
 
-This builds the CPU image, creates a 3-node cluster, deploys the overlay,
-serves a request end to end, scales a worker away and shows the gateway
-continuing on the survivor, then scales it back and shows it rejoining
-rotation. Output is written to `docs/reports/K8S_SPLIT_VERIFICATION.md`.
+It builds the CPU image, creates a 3-node [kind](https://kind.sigs.k8s.io/)
+cluster, deploys the overlay, serves a request end to end, then removes a
+worker **while traffic is still flowing** and reports the status codes seen
+across the removal — the window before the health checker reacts is the part
+worth measuring, and asking once afterwards would only show the steady state.
+
+In the checked-in run the two workers were scheduled on different nodes, each
+bound its own PVC, per-pod DNS resolved to distinct addresses, and requests
+split 5/4 across the pool.
+
+Across the removal, that run served **77 of 77 requests with `200`**: two
+requests reached the departed worker, were classified `connect_error`, and were
+retried on the survivor — visible as `vgate_worker_retries_total` in the log.
+
+**This is not a guaranteed zero-loss window.** Repeat runs produced 81/81 and
+60/61, the last one returning a single `500`. That failure is the retry policy
+working as specified rather than a defect: a request that was already delivered
+when the pod died surfaces as a `RequestError`, not a `ConnectError`, and is
+deliberately *not* retried elsewhere — the worker may already be generating,
+and one client request must not cost two GPU generations. Which class occurred
+is recorded per worker in `vgate_worker_requests_total`, so the log
+distinguishes "retried successfully" from "failed by design". Closing that
+window needs draining, which is listed as a gap in [ROADMAP.md](ROADMAP.md).
+
+One gap the run exposed: the gateway passes its readiness probe while holding
+zero healthy workers, because `/health` never consults the registry. See
+[ROADMAP.md](ROADMAP.md).
 
 **Manifests are checked in CI** (`.github/workflows/manifests.yml`) at two
 levels: `kubeconform` for schema validity, and `k8s/validate_manifests.py` for
