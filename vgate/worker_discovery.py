@@ -56,6 +56,32 @@ from vgate.logging_config import get_logger
 
 logger = get_logger("vgate.discovery")
 
+# Resolver failures that say nothing about whether the name exists. Everything
+# else getaddrinfo reports -- a broken resolver, a SERVFAIL, an exhausted
+# system resource -- is a statement about the resolver, not about the pool, and
+# must not be read as "there are no workers".
+#
+# EAI_NONAME and EAI_NODATA are the exceptions: they are the resolver saying
+# authoritatively that the name has no records, which is exactly what a
+# headless Service with zero endpoints looks like.
+_AUTHORITATIVE_EMPTY = {
+    getattr(socket, name)
+    for name in ("EAI_NONAME", "EAI_NODATA")
+    if hasattr(socket, name)
+}
+
+
+class TransientResolutionError(RuntimeError):
+    """
+    The resolver could not answer, which is not the same as answering "none".
+
+    Raised so callers keep the members they already have. Collapsing this into
+    an empty result made a CoreDNS outage indistinguishable from a pool scaled
+    to zero: after a few seconds of resolver trouble the gateway would discard
+    every healthy worker it had and start returning 503, having been told
+    nothing about the workers at all.
+    """
+
 # (host, port) -> list of addresses. Injectable so tests can drive membership
 # changes without a cluster or a resolver.
 ForwardResolver = Callable[[str, int], Sequence[str]]
@@ -122,18 +148,27 @@ class DnsWorkerDiscovery:
 
     def resolve(self) -> List[str]:
         """
-        Current worker endpoints, or an empty list if the name does not resolve.
+        Current worker endpoints.
 
-        An unresolvable name is not an error here. It is the normal state while
-        a StatefulSet is starting, and it is indistinguishable from a scaled-to-
-        zero deployment. Callers decide what an empty result means; this returns
-        what DNS said.
+        Returns an empty list only when the resolver answers authoritatively
+        that the name has no records -- the normal state while a StatefulSet is
+        starting, and what a pool scaled to zero looks like. Callers decide what
+        an empty result means; this reports what DNS said.
+
+        Raises TransientResolutionError when the resolver could not answer at
+        all. That distinction is the whole point: an empty answer and a broken
+        resolver are different facts, and treating the second as the first lets
+        a DNS outage empty a healthy pool.
         """
         try:
             addresses = self._forward(self.dns_name, self.port)
         except socket.gaierror as exc:
+            if exc.errno not in _AUTHORITATIVE_EMPTY:
+                raise TransientResolutionError(
+                    f"resolver could not answer for {self.dns_name!r}: {exc}"
+                ) from exc
             logger.debug(
-                "Worker DNS name did not resolve",
+                "Worker DNS name has no records",
                 extra={"extra_data": {"dns_name": self.dns_name, "error": str(exc)}},
             )
             return []

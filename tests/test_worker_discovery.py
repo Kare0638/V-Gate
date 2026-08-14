@@ -27,7 +27,7 @@ import socket
 import pytest
 
 from vgate.health_checker import WorkerHealthChecker
-from vgate.worker_discovery import DnsWorkerDiscovery
+from vgate.worker_discovery import DnsWorkerDiscovery, TransientResolutionError
 from vgate.worker_registry import WorkerRegistry
 
 SVC = "vgate-worker.vgate.svc.cluster.local"
@@ -81,19 +81,39 @@ def test_falls_back_to_the_address_when_reverse_lookup_fails():
     assert d.resolve() == ["http://10.244.1.4:8000"]
 
 
-def test_unresolvable_name_is_empty_not_an_error():
-    """
-    A name that does not resolve is the normal state before any worker pod is
-    scheduled. Raising here would make gateway startup depend on worker
-    scheduling order.
-    """
+def gaierror_discovery(errno_value, message="resolver said so"):
     d = make_discovery([])
 
     def forward(host, port):
-        raise socket.gaierror(-2, "Name or service not known")
+        raise socket.gaierror(errno_value, message)
 
     d._forward = forward
-    assert d.resolve() == []
+    return d
+
+
+def test_an_authoritative_no_such_name_is_empty_not_an_error():
+    """
+    A name with no records is the normal state before any worker pod is
+    scheduled, and is what a pool scaled to zero looks like. Raising here would
+    make gateway startup depend on worker scheduling order.
+    """
+    assert gaierror_discovery(socket.EAI_NONAME).resolve() == []
+
+
+@pytest.mark.parametrize(
+    "errno_value, name",
+    [(socket.EAI_AGAIN, "EAI_AGAIN"), (socket.EAI_FAIL, "EAI_FAIL")]
+    + ([(socket.EAI_SYSTEM, "EAI_SYSTEM")] if hasattr(socket, "EAI_SYSTEM") else []),
+)
+def test_a_resolver_that_cannot_answer_is_not_an_empty_pool(errno_value, name):
+    """
+    The distinction that keeps a DNS outage from emptying a healthy pool.
+    `EAI_AGAIN` and friends say the resolver failed, not that the name has no
+    records; collapsing them into an empty list made a CoreDNS blip look
+    exactly like a scale-to-zero.
+    """
+    with pytest.raises(TransientResolutionError):
+        gaierror_discovery(errno_value, name).resolve()
 
 
 def test_ptr_pointing_at_the_service_is_not_treated_as_identity():
@@ -192,11 +212,11 @@ def test_a_removed_worker_is_no_longer_picked_or_probed():
     assert {r.pick() for _ in range(4)} == {"http://b:8000"}
 
 
-def test_a_returning_worker_starts_healthy():
+def test_a_returning_worker_does_not_inherit_the_old_verdict():
     """
-    Arrivals are optimistic, matching how configured endpoints are treated.
-    A worker that left while unhealthy and comes back must not inherit the old
-    verdict, or a replaced pod would start out excluded.
+    A worker that left while unhealthy and comes back must not carry the old
+    failure count, or a replaced pod would start out one strike from exclusion.
+    It returns as pending -- not yet proven, but not condemned either.
     """
     r = WorkerRegistry(["http://a:8000", "http://b:8000"], failure_threshold=1)
     r.record_failure("http://a:8000")
@@ -204,7 +224,62 @@ def test_a_returning_worker_starts_healthy():
 
     r.set_members(["http://b:8000"])
     r.set_members(["http://a:8000", "http://b:8000"])
+
+    state = {s["endpoint"]: s for s in r.snapshot()}["http://a:8000"]
+    assert state["pending"] is True
+    assert state["consecutive_failures"] == 0, "carried the old failure count back"
+
+    # Pending, so one good probe is enough to admit it.
+    r.record_success("http://a:8000")
     assert "http://a:8000" in r.healthy_endpoints()
+
+
+def test_a_discovered_arrival_waits_for_a_probe_before_taking_traffic():
+    """
+    The worker Service publishes not-ready addresses on purpose, so a pod still
+    loading model weights appears in DNS. Admitting it on sight sends real
+    requests to a worker that may stall mid-request -- and a stalled request is
+    a request_error, which is deliberately not retried, so it reaches the
+    client as a 500.
+    """
+    r = WorkerRegistry(["http://a:8000"])
+    r.set_members(["http://a:8000", "http://new:8000"])
+
+    assert "http://new:8000" not in r.healthy_endpoints()
+    assert {r.pick() for _ in range(4)} == {"http://a:8000"}
+
+    r.record_success("http://new:8000")
+    assert "http://new:8000" in r.healthy_endpoints()
+
+
+def test_a_demoted_worker_still_needs_sustained_recovery():
+    """
+    The single-success admission applies only to workers that were never
+    proven bad. One that failed its way out of rotation must not be readmitted
+    by a single lucky probe, or a flapping worker rejoins on every blip.
+    """
+    r = WorkerRegistry(
+        ["http://a:8000", "http://b:8000"], failure_threshold=1, success_threshold=3
+    )
+    r.record_failure("http://a:8000")
+    assert "http://a:8000" not in r.healthy_endpoints()
+
+    r.record_success("http://a:8000")
+    assert "http://a:8000" not in r.healthy_endpoints(), "readmitted on one probe"
+    r.record_success("http://a:8000")
+    r.record_success("http://a:8000")
+    assert "http://a:8000" in r.healthy_endpoints()
+
+
+def test_configured_endpoints_are_still_optimistic():
+    """
+    Only *discovered* arrivals are held back. An endpoint listed in config
+    carries no readiness information at all, and a gateway that refused to
+    serve until its first probe would be needlessly unavailable at startup;
+    the worst case there is one request that a connection failure retries.
+    """
+    r = WorkerRegistry(["http://a:8000", "http://b:8000"])
+    assert set(r.healthy_endpoints()) == {"http://a:8000", "http://b:8000"}
 
 
 def test_round_robin_cycles_through_the_new_member_set():
@@ -234,7 +309,12 @@ def test_discovered_registry_may_start_empty():
     """A gateway must not require its workers to be scheduled first."""
     r = WorkerRegistry([], allow_empty=True)
     assert r.endpoints() == []
+
     r.set_members(["http://a:8000"])
+    assert r.endpoints() == ["http://a:8000"]
+    assert r.healthy_endpoints() == [], "a discovered arrival entered rotation unprobed"
+
+    r.record_success("http://a:8000")
     assert r.healthy_endpoints() == ["http://a:8000"]
 
 
@@ -316,6 +396,28 @@ async def test_a_successful_resolve_resets_the_empty_streak():
 
     # Four empties total, but never three in a row.
     assert r.endpoints() == ["http://w-0.svc:8000"]
+
+
+@pytest.mark.asyncio
+async def test_a_dns_outage_does_not_empty_a_healthy_pool():
+    """
+    The failure this pairs with the scale-to-zero behaviour. Sustained empty
+    *answers* mean the pool is gone; sustained resolver *failures* mean
+    nothing about the pool at all. Counting the second as the first let a
+    CoreDNS outage lasting a few ticks make the gateway discard every worker it
+    had and start returning 503 on its own initiative.
+    """
+    r = WorkerRegistry(["http://a:8000", "http://b:8000"])
+    checker = WorkerHealthChecker(
+        registry=r,
+        discovery=gaierror_discovery(socket.EAI_AGAIN),
+        empty_resolve_threshold=3,
+    )
+    for _ in range(10):
+        await checker.refresh_members()
+
+    assert r.endpoints() == ["http://a:8000", "http://b:8000"], \
+        "a resolver outage was mistaken for a scaled-down pool"
 
 
 @pytest.mark.asyncio

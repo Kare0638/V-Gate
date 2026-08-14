@@ -28,7 +28,7 @@ from typing import Optional
 import httpx
 
 from vgate.logging_config import get_logger
-from vgate.worker_discovery import DnsWorkerDiscovery
+from vgate.worker_discovery import DnsWorkerDiscovery, TransientResolutionError
 from vgate.worker_registry import WorkerRegistry
 
 logger = get_logger("vgate.health")
@@ -67,6 +67,8 @@ class WorkerHealthChecker:
         self._transport = transport
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        # Created in start(), which is where a running loop exists to bind it.
+        self._first_pass: Optional[asyncio.Event] = None
 
         headers = {}
         if api_key:
@@ -78,26 +80,31 @@ class WorkerHealthChecker:
             return
         self._running = True
 
-        # Resolve once before returning, so the caller's startup does not
-        # complete with an empty pool. Without this the first resolve happened
-        # inside the loop task, `await start()` returned immediately, and the
-        # gateway began accepting requests with nothing to route them to --
-        # answering 503 for as long as the resolution took.
+        self._first_pass = asyncio.Event()
+        self._task = asyncio.create_task(self._loop())
+
+        # Wait for one full pass -- resolve, then probe -- before returning.
         #
-        # Bounded, because startup must not hang on a resolver that never
-        # answers. On timeout the loop retries on its normal cadence; an
-        # unreachable resolver delays the first request rather than the
+        # Resolving alone is not enough now that discovered arrivals start out
+        # of rotation: startup would complete with a pool that is known but
+        # entirely unadmitted, and the gateway would answer 503 until the first
+        # scheduled probe an interval later. Probing here admits the workers
+        # that are actually up.
+        #
+        # Bounded, because startup must not hang on a resolver or a worker that
+        # never answers. On timeout the loop continues on its normal cadence,
+        # so an unreachable dependency delays the first request rather than the
         # process. (A gateway that is Ready while holding zero workers is a
         # separate gap, tracked in ROADMAP.md -- this narrows the window, it
         # does not close it.)
         if self.discovery is not None:
             try:
                 await asyncio.wait_for(
-                    self.refresh_members(), timeout=self.startup_resolve_timeout
+                    self._first_pass.wait(), timeout=self.startup_resolve_timeout
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "First worker discovery did not complete before startup; "
+                    "First discovery and probe did not complete before startup; "
                     "continuing and retrying in the background",
                     extra={"extra_data": {
                         "timeout_seconds": self.startup_resolve_timeout,
@@ -105,7 +112,6 @@ class WorkerHealthChecker:
                     }},
                 )
 
-        self._task = asyncio.create_task(self._loop())
         logger.info(
             "Worker health checker started",
             extra={"extra_data": {
@@ -133,11 +139,14 @@ class WorkerHealthChecker:
             headers=self._headers,
             transport=self._transport,
         ) as client:
-            # start() already resolved once, bounded by a timeout. This loop
-            # does not repeat it immediately: doing so would double-resolve on
-            # every successful startup to cover the case where that first
-            # attempt timed out, and the first scheduled tick covers that
-            # anyway.
+            # One immediate pass before the first sleep, so a freshly started
+            # gateway has an admitted pool rather than waiting a full interval
+            # with every discovered worker still pending. start() waits on the
+            # event this sets.
+            await self.refresh_members()
+            await self.probe_once(client)
+            self._first_pass.set()
+
             while self._running:
                 await asyncio.sleep(self.interval_seconds)
                 if not self._running:
@@ -154,6 +163,17 @@ class WorkerHealthChecker:
         loop = asyncio.get_running_loop()
         try:
             endpoints = await loop.run_in_executor(None, self.discovery.resolve)
+        except TransientResolutionError as exc:
+            # The resolver could not answer. That is not "there are no
+            # workers", and the empty-resolve counter deliberately does not
+            # advance here: counting it would let a DNS outage lasting a few
+            # ticks discard a pool that never stopped working.
+            logger.warning(
+                "Worker discovery could not resolve; keeping the current "
+                "member set and not counting this as empty",
+                extra={"extra_data": {"error": str(exc)}},
+            )
+            return
         except Exception as exc:  # resolver failures must not kill the loop
             logger.warning(
                 "Worker discovery failed; keeping the current member set",

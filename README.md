@@ -311,21 +311,34 @@ that it did, because the cost is invisible until it is severe.
 
 Three behaviours worth knowing:
 
-- **An empty resolve has to repeat before it is believed.** A resolver blip and
-  a pool scaled to zero look identical in one reading. Acting on the first
-  empty answer would turn a DNS hiccup into a total outage; never acting on it
-  leaves the last worker in the registry forever, probed after its pod is
-  gone — the exact failure discovery exists to remove. Three consecutive empty
-  ticks (~15s at the default interval) separate the two, after which the
-  registry empties and requests get `503` with `Retry-After`.
+- **An empty *answer* has to repeat before it is believed; a resolver *failure*
+  never counts.** Those are different facts. `EAI_NONAME` is the resolver
+  saying authoritatively that the name has no records, which is what a pool
+  scaled to zero looks like — three consecutive such ticks (~15s) empty the
+  registry, after which requests get `503` with `Retry-After`. `EAI_AGAIN` and
+  friends mean the resolver could not answer at all and say nothing about the
+  pool; treating those as empty let a CoreDNS blip lasting a few ticks make the
+  gateway discard every healthy worker it had.
+- **A discovered worker waits for a probe before taking traffic.** The worker
+  Service publishes not-ready addresses deliberately, so a pod still loading
+  model weights is in the DNS answer — its presence is evidence it exists, not
+  evidence it is ready. Admitting it on sight sends real requests to a worker
+  that may stall mid-request, and a stalled request is a `request_error`, which
+  is deliberately not retried and so reaches the client as a `500`. A worker
+  that has never been proven usable is admitted by a single successful probe;
+  one that was *demoted* still needs sustained recovery, because it was proven
+  bad once. Endpoints supplied in static config stay optimistic — they carry no
+  readiness information either way, and the worst case is one request that a
+  connection failure retries elsewhere.
 - **Health state survives a re-resolve.** Membership refreshes every few
   seconds while demotion needs consecutive failures, so resetting counters on
   refresh would mean a broken worker never accumulates enough to leave
   rotation.
-- **The first resolve completes before startup does.** Otherwise the gateway
-  begins accepting requests with an empty pool and answers `503` for as long as
-  resolution takes. The wait is bounded, so an unreachable resolver delays the
-  first request rather than the process.
+- **A full resolve-and-probe pass completes before startup does.** Resolving
+  alone is not enough now that arrivals start out of rotation: startup would
+  finish with a pool that is known but entirely unadmitted. The wait is
+  bounded, so an unreachable resolver or worker delays the first request rather
+  than the process.
 
 Resolution uses `AF_UNSPEC` rather than `AF_INET`, so an IPv6-only cluster —
 which publishes AAAA records and no A records — resolves normally; IPv6
