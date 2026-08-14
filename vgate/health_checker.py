@@ -23,6 +23,7 @@ would ever retry the worker and let it back in.
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import httpx
@@ -47,6 +48,7 @@ class WorkerHealthChecker:
         discovery: Optional[DnsWorkerDiscovery] = None,
         empty_resolve_threshold: int = 3,
         startup_resolve_timeout: float = 5.0,
+        resolve_timeout: float = 5.0,
     ):
         self.registry = registry
         self.interval_seconds = interval_seconds
@@ -62,6 +64,9 @@ class WorkerHealthChecker:
         self.empty_resolve_threshold = max(1, empty_resolve_threshold)
         self._empty_resolves = 0
         self.startup_resolve_timeout = startup_resolve_timeout
+        self.resolve_timeout = resolve_timeout
+        self._refresh_task: Optional[asyncio.Task] = None
+        self._dns_executor: Optional[ThreadPoolExecutor] = None
         # Injectable so the polling loop can be exercised without real network
         # calls; None means httpx picks its default transport.
         self._transport = transport
@@ -122,13 +127,24 @@ class WorkerHealthChecker:
 
     async def stop(self) -> None:
         self._running = False
-        if self._task:
-            self._task.cancel()
+        for task in (self._task, self._refresh_task):
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._task = None
+        self._task = None
+        self._refresh_task = None
+
+        if self._dns_executor is not None:
+            # wait=False on purpose. A resolve stuck in getaddrinfo cannot be
+            # interrupted, and joining it here would hang shutdown on exactly
+            # the failure this executor exists to contain. The thread is a
+            # daemon of the pool and dies with the process.
+            self._dns_executor.shutdown(wait=False, cancel_futures=True)
+            self._dns_executor = None
         logger.info("Worker health checker stopped")
 
     async def _loop(self) -> None:
@@ -143,6 +159,9 @@ class WorkerHealthChecker:
             # gateway has an admitted pool rather than waiting a full interval
             # with every discovered worker still pending. start() waits on the
             # event this sets.
+            # The first pass awaits discovery, because startup has nothing to
+            # probe until membership exists. Subsequent passes do not: see
+            # _begin_refresh.
             await self.refresh_members()
             await self.probe_once(client)
             self._first_pass.set()
@@ -151,18 +170,72 @@ class WorkerHealthChecker:
                 await asyncio.sleep(self.interval_seconds)
                 if not self._running:
                     break
-                await self.refresh_members()
+                self._begin_refresh()
                 await self.probe_once(client)
+
+    def _begin_refresh(self) -> None:
+        """
+        Start a membership refresh without waiting for it.
+
+        Probing must not queue behind resolution. Awaiting the resolve first
+        meant a wedged getaddrinfo stopped health probing too, so a worker that
+        recovered was never noticed and the pool froze in whatever shape it had
+        when DNS broke -- a resolver problem turning into a routing problem.
+
+        A refresh already in flight is skipped rather than queued: the point is
+        to keep ticking, and stacking resolves behind a stuck one achieves the
+        opposite.
+        """
+        if self.discovery is None:
+            return
+        if self._refresh_task is not None and not self._refresh_task.done():
+            logger.warning(
+                "Previous worker discovery has not finished; skipping this tick",
+                extra={"extra_data": {"dns_name": self.discovery.dns_name}},
+            )
+            return
+        self._refresh_task = asyncio.create_task(self.refresh_members())
 
     async def refresh_members(self) -> None:
         """Re-resolve worker membership, if discovery is configured."""
         if self.discovery is None:
             return
-        # getaddrinfo blocks; on a slow or unreachable resolver it would stall
-        # the event loop and with it every in-flight request on this gateway.
+        # getaddrinfo blocks, so it runs off the event loop -- and on its OWN
+        # executor, not the default one. The default executor is also where
+        # RequestBatcher dispatches inference, so a hung resolver there would
+        # consume threads that serving needs. One dedicated thread bounds the
+        # damage to discovery.
+        #
+        # The await is bounded, which stops a slow resolve from stalling the
+        # loop. It does not make the resolve cancellable: abandoning the future
+        # leaves the OS call blocked on its thread until it returns on its own.
+        # Discovery is therefore paused, not broken, while that thread is stuck
+        # -- probing continues throughout, and refreshes resume once the call
+        # returns. Making resolution genuinely interruptible needs an async
+        # resolver; recorded in ROADMAP.md rather than pretended here.
         loop = asyncio.get_running_loop()
+        # Created here rather than in __init__, and re-created after a stop():
+        # passing None would fall back to the default executor, which is the
+        # one thing this must never do.
+        if self._dns_executor is None:
+            self._dns_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vgate-dns"
+            )
         try:
-            endpoints = await loop.run_in_executor(None, self.discovery.resolve)
+            endpoints = await asyncio.wait_for(
+                loop.run_in_executor(self._dns_executor, self.discovery.resolve),
+                timeout=self.resolve_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Worker discovery did not answer in time; keeping the current "
+                "member set and not counting this as empty",
+                extra={"extra_data": {
+                    "dns_name": self.discovery.dns_name,
+                    "timeout_seconds": self.resolve_timeout,
+                }},
+            )
+            return
         except TransientResolutionError as exc:
             # The resolver could not answer. That is not "there are no
             # workers", and the empty-resolve counter deliberately does not

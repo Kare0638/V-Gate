@@ -488,6 +488,124 @@ async def test_start_does_not_hang_on_a_stalled_resolver():
 
 
 @pytest.mark.asyncio
+async def test_dns_resolution_does_not_use_the_default_executor():
+    """
+    RequestBatcher dispatches inference through the default executor
+    (batcher.py's run_in_executor(None, ...)). Resolving there too means a
+    resolver hanging in getaddrinfo occupies a thread that serving needs, so a
+    DNS problem becomes an inference problem. Discovery gets its own thread.
+    """
+    import threading
+
+    seen = {}
+
+    def forward(host, port):
+        seen["thread"] = threading.current_thread().name
+        return ["10.0.0.1"]
+
+    discovery = make_discovery(["10.0.0.1"], ptr={"10.0.0.1": "w-0.svc"})
+    discovery._forward = forward
+    checker = WorkerHealthChecker(
+        registry=WorkerRegistry([], allow_empty=True), discovery=discovery
+    )
+    try:
+        await checker.refresh_members()
+    finally:
+        await checker.stop()
+
+    assert seen["thread"].startswith("vgate-dns"), (
+        f"resolved on {seen['thread']!r}; discovery must not share the executor "
+        "that dispatches inference"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_resolve_that_never_answers_does_not_stall_the_tick():
+    """
+    The failure this prevents: awaiting the resolve before probing meant a
+    wedged getaddrinfo stopped health probing as well, so a recovered worker was
+    never noticed and the pool froze in whatever shape it had when DNS broke.
+    """
+    import time
+
+    def hangs(host, port):
+        time.sleep(3)
+        return []
+
+    discovery = make_discovery([])
+    discovery._forward = hangs
+    r = WorkerRegistry(["http://a:8000"])
+    checker = WorkerHealthChecker(
+        registry=r, discovery=discovery, resolve_timeout=0.2
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await checker.refresh_members()
+        elapsed = loop.time() - started
+
+        assert elapsed < 2, f"refresh waited {elapsed:.1f}s on a stalled resolver"
+        assert r.endpoints() == ["http://a:8000"], "a timeout emptied the pool"
+    finally:
+        await checker.stop()
+
+
+@pytest.mark.asyncio
+async def test_repeated_resolve_timeouts_do_not_count_as_empty():
+    """
+    A timeout says nothing about the pool, so it must not accumulate toward the
+    empty-resolve threshold -- otherwise a slow resolver empties a healthy pool
+    just as surely as the transient-error case did.
+    """
+    import time
+
+    def hangs(host, port):
+        time.sleep(3)
+        return []
+
+    discovery = make_discovery([])
+    discovery._forward = hangs
+    r = WorkerRegistry(["http://a:8000"])
+    checker = WorkerHealthChecker(
+        registry=r, discovery=discovery, resolve_timeout=0.05,
+        empty_resolve_threshold=2,
+    )
+    try:
+        for _ in range(5):
+            await checker.refresh_members()
+        assert r.endpoints() == ["http://a:8000"]
+    finally:
+        await checker.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_already_in_flight_is_skipped_not_queued():
+    """
+    Stacking resolves behind a stuck one defeats the purpose: the executor has
+    one thread, so queued work waits for the wedged call and every later tick
+    inherits the delay.
+    """
+    import time
+
+    def slow(host, port):
+        time.sleep(1)
+        return []
+
+    discovery = make_discovery([])
+    discovery._forward = slow
+    checker = WorkerHealthChecker(
+        registry=WorkerRegistry(["http://a:8000"]), discovery=discovery
+    )
+    try:
+        checker._begin_refresh()
+        first = checker._refresh_task
+        checker._begin_refresh()
+        assert checker._refresh_task is first, "a second resolve was queued"
+    finally:
+        await checker.stop()
+
+
+@pytest.mark.asyncio
 async def test_refresh_is_a_no_op_without_discovery():
     r = WorkerRegistry(["http://a:8000"])
     checker = WorkerHealthChecker(registry=r, discovery=None)
