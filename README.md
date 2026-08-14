@@ -309,16 +309,27 @@ new time series on every pod restart until the metrics endpoint buckles. Where
 a cluster serves no PTR records, discovery falls back to the address and logs
 that it did, because the cost is invisible until it is severe.
 
-Two behaviours worth knowing:
+Three behaviours worth knowing:
 
-- **An empty resolve is ignored** when the registry is already populated. Every
-  name vanishing between two ticks is far more likely to be a resolver blip
-  than every worker being deleted, and acting on it would turn a DNS hiccup
-  into a total outage.
+- **An empty resolve has to repeat before it is believed.** A resolver blip and
+  a pool scaled to zero look identical in one reading. Acting on the first
+  empty answer would turn a DNS hiccup into a total outage; never acting on it
+  leaves the last worker in the registry forever, probed after its pod is
+  gone — the exact failure discovery exists to remove. Three consecutive empty
+  ticks (~15s at the default interval) separate the two, after which the
+  registry empties and requests get `503` with `Retry-After`.
 - **Health state survives a re-resolve.** Membership refreshes every few
   seconds while demotion needs consecutive failures, so resetting counters on
   refresh would mean a broken worker never accumulates enough to leave
   rotation.
+- **The first resolve completes before startup does.** Otherwise the gateway
+  begins accepting requests with an empty pool and answers `503` for as long as
+  resolution takes. The wait is bounded, so an unreachable resolver delays the
+  first request rather than the process.
+
+Resolution uses `AF_UNSPEC` rather than `AF_INET`, so an IPv6-only cluster —
+which publishes AAAA records and no A records — resolves normally; IPv6
+literals are bracketed when discovery falls back to addresses.
 
 `worker.endpoints` still works and is what a docker-compose or bare-process
 deployment uses; setting `worker.discovery.dns_name` switches to discovery.

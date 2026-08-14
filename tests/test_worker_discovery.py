@@ -21,6 +21,7 @@ what the system does when DNS misbehaves -- none of which needs a real
 resolver, and all of which would be untestable if it did.
 """
 
+import asyncio
 import socket
 
 import pytest
@@ -111,6 +112,45 @@ def test_ptr_pointing_at_the_service_is_not_treated_as_identity():
 def test_scheme_and_port_are_configurable():
     d = make_discovery(["10.0.0.1"], ptr={}, port=9000, scheme="https")
     assert d.resolve() == ["https://10.0.0.1:9000"]
+
+
+def test_ipv6_addresses_are_bracketed():
+    """
+    `http://fd00::1:8000` cannot be parsed -- the colons in the address are
+    indistinguishable from the port separator. Only the fallback path is
+    affected, since resolved names never need brackets.
+    """
+    d = make_discovery(["fd00::1", "fd00::2"], ptr={})
+    assert d.resolve() == ["http://[fd00::1]:8000", "http://[fd00::2]:8000"]
+
+
+def test_ipv6_pod_names_are_not_bracketed():
+    d = make_discovery(["fd00::1"], ptr={"fd00::1": "vgate-worker-0.vgate-worker"})
+    assert d.resolve() == ["http://vgate-worker-0.vgate-worker:8000"]
+
+
+def test_forward_resolution_is_not_restricted_to_ipv4():
+    """
+    An IPv6-only cluster publishes AAAA records and no A records. Pinning the
+    lookup to AF_INET would resolve nothing there and leave the pool
+    permanently empty with no error to explain it.
+    """
+    from vgate import worker_discovery
+
+    seen = {}
+
+    def fake_getaddrinfo(host, port, family, socktype):
+        seen["family"] = family
+        return [(family, socktype, 6, "", ("fd00::1", port, 0, 0))]
+
+    original = worker_discovery.socket.getaddrinfo
+    worker_discovery.socket.getaddrinfo = fake_getaddrinfo
+    try:
+        assert worker_discovery._default_forward("svc", 8000) == ["fd00::1"]
+    finally:
+        worker_discovery.socket.getaddrinfo = original
+
+    assert seen["family"] == socket.AF_UNSPEC
 
 
 # --------------------------------------------------------------------------
@@ -222,17 +262,60 @@ async def test_refresh_applies_discovered_membership():
 
 
 @pytest.mark.asyncio
-async def test_an_empty_resolve_does_not_empty_a_populated_registry():
+async def test_one_empty_resolve_does_not_empty_a_populated_registry():
     """
-    Every name vanishing between two ticks is far more likely to be a resolver
-    blip than every worker being deleted. Acting on it would turn a DNS hiccup
-    into a total outage; the health checker already handles workers that stop
-    answering.
+    A single empty answer is more likely a resolver blip than every worker
+    being deleted between two ticks. Acting on it immediately would turn a DNS
+    hiccup into a total outage.
     """
     r = WorkerRegistry(["http://a:8000"])
     checker = WorkerHealthChecker(registry=r, discovery=make_discovery([]))
     await checker.refresh_members()
     assert r.endpoints() == ["http://a:8000"]
+
+
+@pytest.mark.asyncio
+async def test_sustained_empty_resolves_do_empty_the_registry():
+    """
+    Scaling the pool to zero. Without this, the guard against blips keeps the
+    last worker in the registry forever and the gateway probes a pod that has
+    been deleted -- reintroducing the exact failure discovery exists to remove.
+
+    The distinction between a blip and a real scale-to-zero is that the real
+    one keeps saying the same thing.
+    """
+    r = WorkerRegistry(["http://a:8000"])
+    checker = WorkerHealthChecker(
+        registry=r, discovery=make_discovery([]), empty_resolve_threshold=3
+    )
+    for _ in range(2):
+        await checker.refresh_members()
+        assert r.endpoints() == ["http://a:8000"], "gave up before the threshold"
+
+    await checker.refresh_members()
+    assert r.endpoints() == [], "scale-to-zero was never believed"
+
+
+@pytest.mark.asyncio
+async def test_a_successful_resolve_resets_the_empty_streak():
+    """
+    Intermittent blips must not accumulate across minutes into a false
+    scale-to-zero. Only *consecutive* empties count.
+    """
+    addresses = ["10.0.0.1"]
+    discovery = make_discovery(addresses, ptr={"10.0.0.1": "w-0.svc"})
+    r = WorkerRegistry(["http://w-0.svc:8000"])
+    checker = WorkerHealthChecker(
+        registry=r, discovery=discovery, empty_resolve_threshold=3
+    )
+
+    empty, full = [], list(addresses)
+    for answer in (empty, empty, full, empty, empty):
+        addresses[:] = answer
+        await checker.refresh_members()
+
+    # Four empties total, but never three in a row.
+    assert r.endpoints() == ["http://w-0.svc:8000"]
 
 
 @pytest.mark.asyncio
@@ -248,6 +331,58 @@ async def test_a_resolver_exception_does_not_kill_the_loop():
     checker = WorkerHealthChecker(registry=r, discovery=discovery)
     await checker.refresh_members()  # must not raise
     assert r.endpoints() == ["http://a:8000"]
+
+
+@pytest.mark.asyncio
+async def test_start_resolves_before_returning():
+    """
+    Startup must not complete with an empty pool. The first resolve used to
+    happen inside the background loop, so `await start()` returned immediately
+    and the gateway accepted requests with nothing to route them to, answering
+    503 for as long as resolution took.
+    """
+    r = WorkerRegistry([], allow_empty=True)
+    checker = WorkerHealthChecker(
+        registry=r,
+        interval_seconds=3600,  # the loop must not be what fills this in
+        discovery=make_discovery(["10.0.0.1"], ptr={"10.0.0.1": "w-0.svc"}),
+    )
+    try:
+        await checker.start()
+        assert r.endpoints() == ["http://w-0.svc:8000"]
+    finally:
+        await checker.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_does_not_hang_on_a_stalled_resolver():
+    """
+    Resolving before returning must not make startup depend on DNS answering.
+    A resolver that never responds should delay the first request, not the
+    process.
+    """
+    import time
+
+    # Long enough that the 0.2s timeout below cannot pass by luck, short
+    # enough that the executor thread does not hold up interpreter shutdown --
+    # `wait_for` abandons the wait, it cannot cancel the thread.
+    def never_answers(host, port):
+        time.sleep(2)
+        return []
+
+    discovery = make_discovery([])
+    discovery._forward = never_answers
+    r = WorkerRegistry(["http://a:8000"])
+    checker = WorkerHealthChecker(
+        registry=r, discovery=discovery, startup_resolve_timeout=0.2
+    )
+    try:
+        started = asyncio.get_running_loop().time()
+        await checker.start()
+        assert asyncio.get_running_loop().time() - started < 5
+        assert r.endpoints() == ["http://a:8000"]
+    finally:
+        await checker.stop()
 
 
 @pytest.mark.asyncio

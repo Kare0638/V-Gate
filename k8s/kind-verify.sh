@@ -103,7 +103,12 @@ cleanup() {
         echo "  manifest. Endpoints must also read as \`vgate-worker-<n>.\`"
         echo "  rather than as addresses: a restarted pod returns on a new IP,"
         echo "  and every \`vgate_worker_*\` metric is labelled by endpoint, so"
-        echo "  address identity would add a time series per restart."
+        echo "  address identity would add a time series per restart. The run"
+        echo "  also scales to zero and back, which is the boundary an earlier"
+        echo "  version skipped by going 1 -> 3 -> 2: an empty resolve is"
+        echo "  ambiguous, and the first guard against DNS blips ignored empty"
+        echo "  answers unconditionally, keeping the last worker in the"
+        echo "  registry forever."
         echo "- **Step 13** — \`state_changes_total\` normally shows one extra"
         echo "  removed/recovered pair per worker beyond the scripted one. That"
         echo "  is the cold start: the gateway passes its readiness probe and"
@@ -421,6 +426,45 @@ shrunk="$(curl -s "http://localhost:${PORT}/stats" -H "Authorization: Bearer ${A
     | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("workers") or []))')"
 claim "$([[ "$shrunk" -eq 2 ]] && echo 0 || echo 1)" \
     "a removed worker stops being tracked rather than probed forever (${shrunk}, want 2)"
+
+echo
+echo "--- scaling all the way to zero ---"
+# The boundary the earlier version of this script skipped by going 1 -> 3 -> 2.
+# An empty resolve is ambiguous -- a DNS blip and an empty pool read the same
+# in one tick -- and the first guard against blips ignored empty answers
+# unconditionally, which kept the last worker in the registry forever and went
+# on probing a pod that had been deleted. Believing a repeated empty answer is
+# what separates the two, and only a scale to zero exercises it.
+kubectl -n "$NS" scale statefulset/vgate-worker --replicas=0
+kubectl -n "$NS" wait --for=delete pod/vgate-worker-0 --timeout=120s || true
+# health_check_interval 5s x empty_resolve_threshold 3, plus slack.
+sleep 30
+emptied="$(curl -s "http://localhost:${PORT}/stats" -H "Authorization: Bearer ${API_KEY}" \
+    | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("workers") or []))')"
+claim "$([[ "$emptied" -eq 0 ]] && echo 0 || echo 1)" \
+    "scaling to zero empties the registry (known workers: ${emptied}, want 0)"
+
+# With no workers, the gateway must shed rather than hang or pretend.
+zero_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+    -X POST "http://localhost:${PORT}/v1/chat/completions" \
+    -H "Authorization: Bearer ${API_KEY}" -H "Content-Type: application/json" \
+    -d "{\"model\":\"vgate\",\"messages\":[{\"role\":\"user\",\"content\":\"empty pool $(date +%s)\"}],\"max_tokens\":8}" \
+    || echo "000")"
+claim "$([[ "$zero_code" == "503" ]] && echo 0 || echo 1)" \
+    "an empty pool returns 503 rather than hanging or erroring (got ${zero_code})"
+
+echo
+echo "--- scaling back up from zero ---"
+kubectl -n "$NS" scale statefulset/vgate-worker --replicas=2
+kubectl -n "$NS" rollout status statefulset/vgate-worker --timeout=180s
+sleep 15
+recovered_count="$(curl -s "http://localhost:${PORT}/stats" -H "Authorization: Bearer ${API_KEY}" \
+    | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("workers") or []))')"
+claim "$([[ "$recovered_count" -eq 2 ]] && echo 0 || echo 1)" \
+    "a pool that was emptied repopulates (known workers: ${recovered_count}, want 2)"
+recovery_answer="$(ask "post-zero probe $(date +%s)")"
+echo "$recovery_answer" | grep -q '"choices"' && rc=0 || rc=1
+claim "$rc" "the gateway serves again after the pool comes back"
 
 step "13. Worker rejoins when it comes back"
 kubectl -n "$NS" scale statefulset/vgate-worker --replicas=2

@@ -45,6 +45,8 @@ class WorkerHealthChecker:
         api_key: Optional[str] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
         discovery: Optional[DnsWorkerDiscovery] = None,
+        empty_resolve_threshold: int = 3,
+        startup_resolve_timeout: float = 5.0,
     ):
         self.registry = registry
         self.interval_seconds = interval_seconds
@@ -54,6 +56,12 @@ class WorkerHealthChecker:
         # and a second timer would only add a way for the two to disagree about
         # which workers exist.
         self.discovery = discovery
+        # How many consecutive empty resolves it takes to believe the pool is
+        # really gone. At the default interval this is ~15s of agreement, which
+        # a resolver blip does not survive and a scale-to-zero does.
+        self.empty_resolve_threshold = max(1, empty_resolve_threshold)
+        self._empty_resolves = 0
+        self.startup_resolve_timeout = startup_resolve_timeout
         # Injectable so the polling loop can be exercised without real network
         # calls; None means httpx picks its default transport.
         self._transport = transport
@@ -69,6 +77,34 @@ class WorkerHealthChecker:
         if self._running:
             return
         self._running = True
+
+        # Resolve once before returning, so the caller's startup does not
+        # complete with an empty pool. Without this the first resolve happened
+        # inside the loop task, `await start()` returned immediately, and the
+        # gateway began accepting requests with nothing to route them to --
+        # answering 503 for as long as the resolution took.
+        #
+        # Bounded, because startup must not hang on a resolver that never
+        # answers. On timeout the loop retries on its normal cadence; an
+        # unreachable resolver delays the first request rather than the
+        # process. (A gateway that is Ready while holding zero workers is a
+        # separate gap, tracked in ROADMAP.md -- this narrows the window, it
+        # does not close it.)
+        if self.discovery is not None:
+            try:
+                await asyncio.wait_for(
+                    self.refresh_members(), timeout=self.startup_resolve_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "First worker discovery did not complete before startup; "
+                    "continuing and retrying in the background",
+                    extra={"extra_data": {
+                        "timeout_seconds": self.startup_resolve_timeout,
+                        "dns_name": self.discovery.dns_name,
+                    }},
+                )
+
         self._task = asyncio.create_task(self._loop())
         logger.info(
             "Worker health checker started",
@@ -97,10 +133,11 @@ class WorkerHealthChecker:
             headers=self._headers,
             transport=self._transport,
         ) as client:
-            # Resolve before the first sleep so a discovering gateway has a
-            # pool by the time the first request arrives, rather than answering
-            # 503 for one interval after startup.
-            await self.refresh_members()
+            # start() already resolved once, bounded by a timeout. This loop
+            # does not repeat it immediately: doing so would double-resolve on
+            # every successful startup to cover the case where that first
+            # attempt timed out, and the first scheduled tick covers that
+            # anyway.
             while self._running:
                 await asyncio.sleep(self.interval_seconds)
                 if not self._running:
@@ -124,19 +161,40 @@ class WorkerHealthChecker:
             )
             return
 
-        if not endpoints and self.registry.endpoints():
-            # Every name disappearing at once is far more likely to be a DNS
-            # hiccup than every worker being deleted between two ticks.
-            # Emptying the registry on that reading would turn a resolver blip
-            # into a total outage, and the health checker already handles
-            # workers that stop answering.
+        if endpoints:
+            self._empty_resolves = 0
+            self.registry.set_members(endpoints)
+            return
+
+        if not self.registry.endpoints():
+            return  # already empty; nothing to decide
+
+        # An empty answer is ambiguous: a resolver blip and a pool scaled to
+        # zero look identical in a single reading. Acting on the first one
+        # would turn a DNS hiccup into a total outage; never acting on it
+        # leaves the last worker in the registry forever, probed after the pod
+        # it names has been deleted -- the exact failure discovery exists to
+        # remove. Requiring the answer to repeat separates them: a blip does
+        # not survive consecutive ticks, and a real scale-to-zero does.
+        self._empty_resolves += 1
+        if self._empty_resolves < self.empty_resolve_threshold:
             logger.warning(
-                "Worker discovery returned no endpoints; keeping the current member set",
-                extra={"extra_data": {"current": self.registry.endpoints()}},
+                "Worker discovery returned no endpoints; keeping the current "
+                "member set pending confirmation",
+                extra={"extra_data": {
+                    "current": self.registry.endpoints(),
+                    "consecutive_empty": self._empty_resolves,
+                    "threshold": self.empty_resolve_threshold,
+                }},
             )
             return
 
-        self.registry.set_members(endpoints)
+        logger.warning(
+            "Worker discovery returned no endpoints on %d consecutive ticks; "
+            "treating the pool as empty" % self._empty_resolves,
+            extra={"extra_data": {"removed": self.registry.endpoints()}},
+        )
+        self.registry.set_members([])
 
     async def probe_once(self, client: httpx.AsyncClient) -> None:
         """Probe every worker once, concurrently."""

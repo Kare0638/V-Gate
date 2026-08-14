@@ -48,6 +48,7 @@ silent, because the consequence â€” unbounded metric labels over a long uptime â
 is invisible until it is severe.
 """
 
+import ipaddress
 import socket
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -62,10 +63,31 @@ ReverseResolver = Callable[[str], str]
 
 
 def _default_forward(host: str, port: int) -> Sequence[str]:
-    infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-    # A headless Service returns one A record per pod; dedupe because
+    # AF_UNSPEC, not AF_INET: an IPv6-only cluster publishes AAAA records and
+    # no A records, so pinning to IPv4 would resolve nothing there and leave
+    # the pool permanently empty with no error to explain it.
+    infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    # A headless Service returns one record per pod; dedupe because
     # getaddrinfo repeats an address once per socket type.
     return sorted({info[4][0] for info in infos})
+
+
+def _host_for_url(host: str) -> str:
+    """
+    Bracket a bare IPv6 address so it can appear in a URL authority.
+
+    `http://fd00::1:8000` is unparseable -- the colons in the address are
+    indistinguishable from the port separator. Names and IPv4 addresses are
+    returned unchanged, and an already-bracketed value is left alone.
+    """
+    if host.startswith("["):
+        return host
+    try:
+        if ipaddress.ip_address(host).version == 6:
+            return f"[{host}]"
+    except ValueError:
+        pass  # a hostname, not a literal address
+    return host
 
 
 def _default_reverse(address: str) -> str:
@@ -119,6 +141,8 @@ class DnsWorkerDiscovery:
         endpoints = [self._endpoint_for(addr) for addr in addresses]
         return sorted(set(endpoints))
 
+    # Bracketing applies only to the fallback path: resolved pod names are
+    # hostnames, and a hostname is never bracketed.
     def _endpoint_for(self, address: str) -> str:
         host, stable = self._stable_name(address)
         if not stable and address not in self._reverse_failures_logged:
@@ -128,7 +152,7 @@ class DnsWorkerDiscovery:
                 "Metric labels will churn as pods restart.",
                 extra={"extra_data": {"address": address, "dns_name": self.dns_name}},
             )
-        return f"{self.scheme}://{host}:{self.port}"
+        return f"{self.scheme}://{_host_for_url(host)}:{self.port}"
 
     def _stable_name(self, address: str) -> Tuple[str, bool]:
         try:
