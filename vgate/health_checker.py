@@ -28,6 +28,7 @@ from typing import Optional
 import httpx
 
 from vgate.logging_config import get_logger
+from vgate.worker_discovery import DnsWorkerDiscovery
 from vgate.worker_registry import WorkerRegistry
 
 logger = get_logger("vgate.health")
@@ -43,10 +44,16 @@ class WorkerHealthChecker:
         timeout_seconds: float = 2.0,
         api_key: Optional[str] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        discovery: Optional[DnsWorkerDiscovery] = None,
     ):
         self.registry = registry
         self.interval_seconds = interval_seconds
         self.timeout_seconds = timeout_seconds
+        # Membership refresh rides this loop rather than running its own task:
+        # discovery and probing answer adjacent questions on the same cadence,
+        # and a second timer would only add a way for the two to disagree about
+        # which workers exist.
+        self.discovery = discovery
         # Injectable so the polling loop can be exercised without real network
         # calls; None means httpx picks its default transport.
         self._transport = transport
@@ -90,11 +97,46 @@ class WorkerHealthChecker:
             headers=self._headers,
             transport=self._transport,
         ) as client:
+            # Resolve before the first sleep so a discovering gateway has a
+            # pool by the time the first request arrives, rather than answering
+            # 503 for one interval after startup.
+            await self.refresh_members()
             while self._running:
                 await asyncio.sleep(self.interval_seconds)
                 if not self._running:
                     break
+                await self.refresh_members()
                 await self.probe_once(client)
+
+    async def refresh_members(self) -> None:
+        """Re-resolve worker membership, if discovery is configured."""
+        if self.discovery is None:
+            return
+        # getaddrinfo blocks; on a slow or unreachable resolver it would stall
+        # the event loop and with it every in-flight request on this gateway.
+        loop = asyncio.get_running_loop()
+        try:
+            endpoints = await loop.run_in_executor(None, self.discovery.resolve)
+        except Exception as exc:  # resolver failures must not kill the loop
+            logger.warning(
+                "Worker discovery failed; keeping the current member set",
+                extra={"extra_data": {"error": str(exc), "error_type": type(exc).__name__}},
+            )
+            return
+
+        if not endpoints and self.registry.endpoints():
+            # Every name disappearing at once is far more likely to be a DNS
+            # hiccup than every worker being deleted between two ticks.
+            # Emptying the registry on that reading would turn a resolver blip
+            # into a total outage, and the health checker already handles
+            # workers that stop answering.
+            logger.warning(
+                "Worker discovery returned no endpoints; keeping the current member set",
+                extra={"extra_data": {"current": self.registry.endpoints()}},
+            )
+            return
+
+        self.registry.set_members(endpoints)
 
     async def probe_once(self, client: httpx.AsyncClient) -> None:
         """Probe every worker once, concurrently."""

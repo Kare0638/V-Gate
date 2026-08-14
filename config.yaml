@@ -35,6 +35,26 @@ server:
 worker:
   endpoints: []
   # endpoints: ["http://127.0.0.1:8001", "http://127.0.0.1:8002"]
+
+  # Membership from DNS instead of the list above. Point `dns_name` at a
+  # headless Service and the gateway re-resolves it on each health-check tick,
+  # so scaling the worker set reaches the gateway without a config change --
+  # which a static list cannot do: a new worker gets no traffic, and a removed
+  # one is probed forever.
+  #
+  # Endpoints are keyed by each pod's stable DNS name, obtained by reverse
+  # lookup of the resolved addresses. Addresses change on restart, and every
+  # vgate_worker_* metric is labelled by endpoint, so address identity would
+  # add a time series per restart. A cluster without PTR records falls back to
+  # addresses, and says so in the log.
+  #
+  # Leave `dns_name` null outside Kubernetes; docker-compose and bare processes
+  # use the list above.
+  discovery:
+    dns_name: null
+    # dns_name: "vgate-worker.vgate.svc.cluster.local"
+    port: 8000
+    scheme: "http"
   timeout_seconds: 120.0
   connect_timeout_seconds: 5.0
 

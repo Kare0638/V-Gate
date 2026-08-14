@@ -80,8 +80,8 @@ cleanup() {
         echo "  bound PVCs are the same point for storage: a single"
         echo "  \`ReadWriteOnce\` claim could not serve pods on two nodes."
         echo "- **Step 7** — the two DNS answers must be *different* addresses."
-        echo "  One shared address would mean the gateway cannot tell workers"
-        echo "  apart, which is what a non-headless Service would produce."
+        echo "  One shared address would leave the gateway unable to tell"
+        echo "  workers apart, and is what a load-balanced Service IP gives."
         echo "- **Step 10** — request counts should be split across both"
         echo "  workers. This is round-robin; it is not load-aware."
         echo "- **Step 11** — the status-code histogram is the real result."
@@ -95,7 +95,16 @@ cleanup() {
         echo "  client request must not cost two generations. The second class"
         echo "  reaching the client as a 500 is the policy working, not a bug."
         echo "  Removing that window needs draining — see ROADMAP.md."
-        echo "- **Step 12** — \`state_changes_total\` normally shows one extra"
+        echo "- **Step 12** — the point of DNS discovery. \`kubectl scale\` is"
+        echo "  run against the StatefulSet and the gateway is expected to pick"
+        echo "  the change up on its own. With the static endpoint list this"
+        echo "  replaced, a new pod received no traffic and a removed one was"
+        echo "  probed forever, and the only fix was editing the gateway's"
+        echo "  manifest. Endpoints must also read as \`vgate-worker-<n>.\`"
+        echo "  rather than as addresses: a restarted pod returns on a new IP,"
+        echo "  and every \`vgate_worker_*\` metric is labelled by endpoint, so"
+        echo "  address identity would add a time series per restart."
+        echo "- **Step 13** — \`state_changes_total\` normally shows one extra"
         echo "  removed/recovered pair per worker beyond the scripted one. That"
         echo "  is the cold start: the gateway passes its readiness probe and"
         echo "  begins probing before any worker is up. See the readiness gap"
@@ -339,14 +348,81 @@ claim "$([[ "$probe_503" -eq 0 ]] && echo 0 || echo 1)" \
 # requests were lost somewhere the retry policy was supposed to cover.
 claim "$([[ "$probe_other" -le "${request_errors%.*}" ]] && echo 0 || echo 1)" \
     "every non-200 is an un-retryable mid-flight failure (other: ${probe_other}, request_error: ${request_errors})"
-unhealthy="$(echo "$workers_json" | python3 -c '
+# What "the worker left rotation" means changed when discovery landed, and the
+# assertion had to change with it rather than be relaxed until it passed.
+#
+# With a static endpoint list, a scaled-away worker stayed a known member and
+# was marked unhealthy, so the check was `unhealthy == 1`. It is now dropped
+# from DNS, so the registry stops tracking it entirely — a strictly better
+# outcome, since nothing keeps probing a pod that is never coming back, and
+# nothing keeps a `vgate_worker_healthy` series alive for it.
+#
+# Health-based removal still exists for the case discovery cannot see: a pod
+# present in DNS whose server is not answering. That path is covered by
+# tests/test_worker_registry.py and by the cold-start transitions visible in
+# step 13's metrics, and is not forced into this script, where producing a
+# wedged-but-present pod reliably is more machinery than the coverage is worth.
+known="$(echo "$workers_json" | python3 -c '
+import json, sys
+print(len(json.load(sys.stdin).get("workers") or []))')"
+serving="$(echo "$workers_json" | python3 -c '
 import json, sys
 w = json.load(sys.stdin).get("workers") or []
-print(sum(1 for x in w if not x["healthy"]))')"
-claim "$([[ "$unhealthy" -eq 1 ]] && echo 0 || echo 1)" \
-    "the removed worker left rotation (unhealthy workers: ${unhealthy}, want 1)"
+print(sum(1 for x in w if x["healthy"]))')"
+claim "$([[ "$known" -eq 1 ]] && echo 0 || echo 1)" \
+    "the departed worker is forgotten, not probed forever (known workers: ${known}, want 1)"
+claim "$([[ "$serving" -eq 1 ]] && echo 0 || echo 1)" \
+    "the survivor is still serving (healthy workers: ${serving}, want 1)"
 
-step "12. Worker rejoins when it comes back"
+step "12. kubectl scale reaches the gateway"
+# The claim discovery exists to make true. With a static endpoint list, scaling
+# the StatefulSet changed nothing on the gateway: a new pod received no traffic
+# because the gateway had never been told about it, and the only way to inform
+# it was editing and reapplying its manifest.
+echo "--- registry before scaling out ---"
+before_count="$(curl -s "http://localhost:${PORT}/stats" -H "Authorization: Bearer ${API_KEY}" \
+    | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("workers") or []))')"
+echo "known workers: ${before_count}"
+
+kubectl -n "$NS" scale statefulset/vgate-worker --replicas=3
+kubectl -n "$NS" rollout status statefulset/vgate-worker --timeout=180s
+# One discovery tick rides the health-check interval; allow a couple.
+sleep 15
+
+workers_json="$(curl -s "http://localhost:${PORT}/stats" -H "Authorization: Bearer ${API_KEY}")"
+echo "$workers_json" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("workers"), indent=2))'
+after_count="$(echo "$workers_json" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("workers") or []))')"
+claim "$([[ "$after_count" -eq 3 ]] && echo 0 || echo 1)" \
+    "scaling out is picked up without editing the gateway (${before_count} -> ${after_count}, want 3)"
+
+# Identity must be the ordinal-stable pod name, not the pod address, or every
+# restart adds a new label to every vgate_worker_* metric.
+by_name="$(echo "$workers_json" | python3 -c '
+import json, re, sys
+w = json.load(sys.stdin).get("workers") or []
+print(sum(1 for x in w if re.search(r"vgate-worker-\d+\.", x["endpoint"])))')"
+claim "$([[ "$by_name" -eq "$after_count" ]] && echo 0 || echo 1)" \
+    "workers are identified by stable pod name, not address (${by_name}/${after_count})"
+
+echo "--- traffic reaches the newly discovered worker ---"
+for i in $(seq 1 9); do ask "scale probe $(date +%s) $i" >/dev/null; done
+curl -s "http://localhost:${PORT}/metrics" | grep '^vgate_worker_requests_total{outcome="success"' || true
+served="$(curl -s "http://localhost:${PORT}/metrics" \
+    | { grep '^vgate_worker_requests_total{outcome="success"' || true; } | wc -l)"
+claim "$([[ "$served" -eq 3 ]] && echo 0 || echo 1)" \
+    "all three workers served requests (${served}/3)"
+
+echo
+echo "--- scaling back in ---"
+kubectl -n "$NS" scale statefulset/vgate-worker --replicas=2
+kubectl -n "$NS" wait --for=delete pod/vgate-worker-2 --timeout=120s || true
+sleep 15
+shrunk="$(curl -s "http://localhost:${PORT}/stats" -H "Authorization: Bearer ${API_KEY}" \
+    | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("workers") or []))')"
+claim "$([[ "$shrunk" -eq 2 ]] && echo 0 || echo 1)" \
+    "a removed worker stops being tracked rather than probed forever (${shrunk}, want 2)"
+
+step "13. Worker rejoins when it comes back"
 kubectl -n "$NS" scale statefulset/vgate-worker --replicas=2
 kubectl -n "$NS" rollout status statefulset/vgate-worker --timeout=180s
 # success_threshold 2 at a 5s interval.
@@ -363,11 +439,30 @@ w = json.load(sys.stdin).get("workers") or []
 print(sum(1 for x in w if x["healthy"]))')"
 claim "$([[ "$healthy" -eq 2 ]] && echo 0 || echo 1)" \
     "both workers are back in rotation (healthy: ${healthy}, want 2)"
-recovered="$(metric_sum '^vgate_worker_state_changes_total\{transition="recovered".*vgate-worker-1')"
-claim "$([[ "${recovered%.*}" -ge 1 ]] && echo 0 || echo 1)" \
-    "the gateway recorded the rejoin (recovered transitions for worker-1: ${recovered})"
+# A returning worker rejoins as a new member rather than as a recovery, so
+# there is no "recovered" transition to count here — it was scaled away, which
+# removed it from DNS and from the registry, and it comes back as an arrival.
+# The assertion that matters is that it is usable again, which is what the
+# gateway's own served-request counters show.
+# The counter's VALUE, not how many series match it. Counting series passes
+# trivially here: worker-1 served requests earlier in this run, and its counter
+# survives the scale-away precisely because identity is the stable pod name —
+# so the series already exists before a single new request is sent. Comparing
+# values is what distinguishes "is being used again" from "was used once".
+served_before="$(metric_sum '^vgate_worker_requests_total\{outcome="success".*vgate-worker-1')"
+for i in $(seq 1 6); do ask "rejoin probe $(date +%s) $i" >/dev/null; done
+served_after="$(metric_sum '^vgate_worker_requests_total\{outcome="success".*vgate-worker-1')"
+claim "$(python3 -c "print(0 if float('${served_after}') > float('${served_before}') else 1)")" \
+    "the returned worker serves new requests (${served_before} -> ${served_after})"
 
-step "13. Gateway logs"
+echo "--- health transitions across the whole run ---"
+# Kept as context rather than as an assertion. Cold start usually produces one
+# removed/recovered pair per worker, because the gateway passes its readiness
+# probe and starts probing before any worker is up — the readiness gap recorded
+# in ROADMAP.md. That is a race, so its count is not something to assert on.
+curl -s "http://localhost:${PORT}/metrics" | grep '^vgate_worker_state_changes_total' || true
+
+step "14. Gateway logs"
 kubectl -n "$NS" logs deployment/vgate-gateway --tail=40
 
 step "Result"

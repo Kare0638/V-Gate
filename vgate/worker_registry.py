@@ -20,8 +20,11 @@ task on the event loop, and RemoteBackend.generate() running in the batcher's
 thread pool. That rules out asyncio.Lock -- a threading.Lock is what actually
 protects the state across both.
 
-Membership is static (read from config). This registry tracks which of those
-known workers are currently usable, not which workers exist.
+Membership can be static (read from config) or discovered (see
+vgate/worker_discovery.py). Either way this registry answers "which known
+workers are usable right now", which is a different question from "which
+workers exist" -- a worker failing its probes should leave rotation but stay
+known, while a worker that was scaled away should stop being probed at all.
 """
 
 import threading
@@ -65,8 +68,12 @@ class WorkerRegistry:
         endpoints: List[str],
         failure_threshold: int = 2,
         success_threshold: int = 2,
+        allow_empty: bool = False,
     ):
-        if not endpoints:
+        # A static registry with no endpoints is a misconfiguration worth
+        # failing on. A discovered one legitimately starts empty: the workers
+        # may not have been scheduled yet, and the first resolve fills it in.
+        if not endpoints and not allow_empty:
             raise ValueError("WorkerRegistry requires at least one endpoint")
 
         self.failure_threshold = failure_threshold
@@ -79,6 +86,69 @@ class WorkerRegistry:
 
         for ep in endpoints:
             WORKER_HEALTHY.labels(worker=ep).set(1)
+
+    # -- membership --------------------------------------------------------
+
+    def set_members(self, endpoints: List[str]) -> tuple:
+        """
+        Replace the known worker set, keeping health state for survivors.
+
+        Returns (added, removed) so the caller can log a membership change
+        without re-deriving it.
+
+        Survivors keep their state deliberately: a rediscovery tick must not
+        reset the failure counters of a worker that is midway through being
+        demoted, or a flapping worker would never accumulate enough
+        consecutive failures to leave rotation.
+
+        Arrivals start healthy, matching how the static registry treats
+        configured endpoints -- the first failed probe or request demotes them,
+        which costs at most one request and avoids a cold-start window where a
+        working pool looks empty.
+        """
+        with self._lock:
+            incoming = list(dict.fromkeys(endpoints))  # dedupe, keep order
+            current = set(self._states)
+            wanted = set(incoming)
+
+            added = [ep for ep in incoming if ep not in current]
+            removed = [ep for ep in self._order if ep not in wanted]
+            if not added and not removed:
+                return [], []
+
+            for ep in removed:
+                del self._states[ep]
+                # Drop the gauge: left behind, it reports a worker that no
+                # longer exists as healthy, which is worse than reporting
+                # nothing. The counters are intentionally kept -- they are
+                # cumulative, and a StatefulSet reuses ordinals, so the same
+                # name coming back should continue its own history rather than
+                # restart from zero.
+                try:
+                    WORKER_HEALTHY.remove(ep)
+                except KeyError:
+                    pass
+
+            for ep in added:
+                self._states[ep] = WorkerState(endpoint=ep)
+                WORKER_HEALTHY.labels(worker=ep).set(1)
+
+            # The cursor is deliberately left alone. It indexes into _order,
+            # which just changed length, but pick() reads it as
+            # `(cursor + offset) % len(order)`, so an out-of-range value only
+            # shifts where the next scan starts. Normalizing it here was tried
+            # and removed: the test written to justify it passed against an
+            # implementation that skipped the normalization entirely, which
+            # made it clear the code was defending against nothing.
+            self._order = incoming
+
+        logger.info(
+            "Worker membership changed",
+            extra={"extra_data": {
+                "added": added, "removed": removed, "total": len(incoming),
+            }},
+        )
+        return added, removed
 
     # -- selection ---------------------------------------------------------
 

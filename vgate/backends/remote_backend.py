@@ -62,14 +62,22 @@ class RemoteBackend:
     supports_streaming = False
 
     def __init__(self, worker_config: WorkerConfig, registry: Optional[WorkerRegistry] = None):
-        if not worker_config.endpoints:
-            raise ValueError("RemoteBackend requires at least one worker endpoint")
+        discovering = bool(worker_config.discovery.dns_name)
+        if not worker_config.endpoints and not discovering:
+            raise ValueError(
+                "RemoteBackend requires worker.endpoints or worker.discovery.dns_name"
+            )
 
         self.config = worker_config
         self.registry = registry or WorkerRegistry(
             worker_config.endpoints,
             failure_threshold=worker_config.failure_threshold,
             success_threshold=worker_config.success_threshold,
+            # With discovery configured, `endpoints` is only a seed and is
+            # usually empty: the pods may not exist yet, and the first resolve
+            # fills membership in. Refusing to start there would make the
+            # gateway depend on its workers being scheduled first.
+            allow_empty=discovering,
         )
 
         headers = {}
@@ -87,6 +95,7 @@ class RemoteBackend:
             "Remote backend initialized",
             extra={"extra_data": {
                 "endpoints": worker_config.endpoints,
+                "discovery_dns_name": worker_config.discovery.dns_name,
                 "timeout_seconds": worker_config.timeout_seconds,
                 "authenticated": bool(worker_config.api_key),
             }}

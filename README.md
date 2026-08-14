@@ -40,7 +40,7 @@ The evidence below is a measured snapshot of the current serving path. The vLLM 
 | **Container Deployment** | Implemented | Docker CPU/GPU targets, Compose stack, and Kubernetes manifests deploying the gateway and workers as separate components |
 | **Python Client SDK** | Implemented | Sync/async clients with deterministic streaming cleanup |
 | **Gateway/Worker Split** | Partial | Inference runs in separate `role: worker` processes reached over HTTP; streaming through a worker returns 501 |
-| **Worker Registry & Health** | Implemented | Static registry with background `/health` probing, threshold-based removal, and automatic rejoin on recovery |
+| **Worker Registry & Health** | Implemented | Membership from static config or headless-Service DNS discovery, with background `/health` probing, threshold-based removal, and automatic rejoin on recovery |
 | **Latency-Aware Routing** | Partial | Round-robin across healthy workers; least-inflight and EWMA are not implemented |
 | **Circuit Breaking & Recovery** | Partial | Failing workers leave rotation and rejoin after sustained health; connection failures retry on another worker |
 
@@ -48,7 +48,7 @@ The evidence below is a measured snapshot of the current serving path. The vLLM 
 
 ## Architecture
 
-Solid arrows are the current runtime; dashed arrows are not implemented yet. The gateway can either hold a backend in-process (the single-process default) or forward to one worker process — both paths exist today. Everything needed to run *more than one* worker is still missing.
+Solid arrows are the current runtime; dashed arrows are not implemented yet. The gateway either holds a backend in-process (the single-process default) or forwards to a pool of worker processes whose membership it discovers. Both paths exist today, and the pool has been exercised on a live Kubernetes cluster scaling between one and three workers.
 
 ```mermaid
 flowchart LR
@@ -73,6 +73,7 @@ flowchart LR
     HC[Health checker] -. probes /health .-> W1
     HC -. probes /health .-> W2
     HC --> Registry
+    DNS[Headless Service DNS] -. resolved each tick .-> HC
 
     W1 --> WEngine[Engine: vLLM or SGLang]
 
@@ -84,7 +85,7 @@ flowchart LR
 
 The boundary: the gateway owns admission control, deduplication, caching, and observability; a worker owns one engine instance and nothing else. Because `RemoteBackend` implements the same `InferenceBackend` protocol as the local engines, the batcher does not know whether inference is local or remote — adding the worker hop required no change to it.
 
-That split is what makes 1-vs-N worker scaling, health-aware failover, and independent GPU-node placement measurable rather than hypothetical. None of those are measured yet; the routing layer that would make them possible is the next step.
+That split is what makes 1-vs-N worker scaling, health-aware failover, and independent GPU-node placement measurable rather than hypothetical. Failover and scaling are now exercised on a live cluster; **throughput is still not measured**, and routing remains round-robin. The 1-vs-N benchmark is the next step.
 
 ---
 
@@ -294,11 +295,35 @@ EndpointSlice and CoreDNS serves per-pod records from that either way. This was
 measured, not assumed. Headless earns its place by suppressing the virtual IP,
 not by creating records it is often credited with.
 
-Because the endpoint list is static, **the worker replica count and the
-gateway's `VGATE_WORKER__ENDPOINTS` have to be changed together** — `kubectl
-scale` alone does not reach the gateway. `k8s/validate_manifests.py` fails the
-build when they disagree. Replacing the list with headless-Service DNS
-discovery is the next step in [Priority 2](#priority-2-distributed-inference-serving).
+**Worker membership is discovered, not configured.** The gateway resolves the
+headless Service on each health-check tick, so `kubectl scale
+statefulset/vgate-worker` reaches it with no manifest change. The kind run
+scales 1 → 3 → 2 and asserts the gateway follows each time.
+
+Endpoints are keyed by the pod's **stable DNS name**, not its address. Forward
+resolution yields IPs; a reverse lookup turns each back into
+`vgate-worker-<n>.vgate-worker.…`, which survives a restart because a
+StatefulSet reuses ordinals. Addresses do not — and since every
+`vgate_worker_*` metric is labelled by endpoint, address identity would add a
+new time series on every pod restart until the metrics endpoint buckles. Where
+a cluster serves no PTR records, discovery falls back to the address and logs
+that it did, because the cost is invisible until it is severe.
+
+Two behaviours worth knowing:
+
+- **An empty resolve is ignored** when the registry is already populated. Every
+  name vanishing between two ticks is far more likely to be a resolver blip
+  than every worker being deleted, and acting on it would turn a DNS hiccup
+  into a total outage.
+- **Health state survives a re-resolve.** Membership refreshes every few
+  seconds while demotion needs consecutive failures, so resetting counters on
+  refresh would mean a broken worker never accumulates enough to leave
+  rotation.
+
+`worker.endpoints` still works and is what a docker-compose or bare-process
+deployment uses; setting `worker.discovery.dns_name` switches to discovery.
+`k8s/validate_manifests.py` fails the build if the configured DNS name does not
+name the worker Service, or if both are set at once.
 
 Autoscaling covers the gateway only. CPU utilization is a false signal for a
 GPU worker — the GPU saturates while the CPU waits on it — so a CPU-triggered
@@ -888,10 +913,9 @@ The Priority sections below group work by area. This is the execution order, wit
 what each step unblocks or answers, so the sequence can be argued with rather
 than guessed at.
 
-**1. DNS-based worker discovery.** The gateway reads a static endpoint list, so
-`kubectl scale` does not reach it and the worker count cannot change without
-editing the gateway. Everything below needs N to be a variable. Resolving the
-headless Service instead makes the registry track membership as well as health.
+**1. DNS-based worker discovery.** — **done.** The gateway resolves the
+headless Service on each health-check tick, so `kubectl scale` reaches it and
+the worker count is now a variable the steps below can vary.
 
 **2. Measure 1 worker vs N.** The central claim of the architecture — that a
 pool serves better than a single process — has never been measured. Throughput,
@@ -943,7 +967,7 @@ work that is now overdue rather than upcoming.
 - [~] Add routing strategies — round-robin is implemented; least-inflight and EWMA latency are not
 - [~] Add worker circuit breakers, draining, and recovery on rejoin — failing workers leave rotation and rejoin after sustained health; there is no in-flight draining
 - [x] Redefine `RequestBatcher` as dedup/admission/fan-out so routing decisions are per request rather than per batch
-- [ ] Replace the static endpoint list with headless-Service DNS discovery, so worker membership follows the cluster
+- [x] Replace the static endpoint list with headless-Service DNS discovery, so worker membership follows the cluster
 - [ ] Measure 1-worker vs N-worker throughput, tail latency, and behavior under injected worker failure
 - [ ] Route on prompt-prefix affinity so a worker can reuse its KV cache across related requests
 
@@ -954,7 +978,7 @@ work that is now overdue rather than upcoming.
 - [x] Deploy the gateway and inference workers as separate components
 - [x] Add GPU node placement and independent CPU/GPU worker scaling
 - [x] Validate manifests in CI for schema and for architecture invariants
-- [~] Scale on pending resource demand and queue/inflight signals instead of CPU utilization alone — the gateway autoscales on CPU, which suits it; the worker has no autoscaler, because CPU is a false signal for a GPU process and the queue-depth signals that would work are not exported through the custom metrics API. Worker autoscaling is also blocked on DNS discovery, since a new replica gets no traffic while the endpoint list is static.
+- [~] Scale on pending resource demand and queue/inflight signals instead of CPU utilization alone — the gateway autoscales on CPU, which suits it; the worker has no autoscaler, because CPU is a false signal for a GPU process and the queue-depth signals that would work are not exported through the custom metrics API. Worker autoscaling is no longer blocked on discovery — a new replica is picked up within one health-check tick — so what remains is exporting the queue-depth signals through the custom metrics API.
 - [ ] Add worker-down, overload, and tail-latency alerts plus an operational runbook
 
 ### Optional Follow-ups
