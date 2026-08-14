@@ -20,8 +20,11 @@ task on the event loop, and RemoteBackend.generate() running in the batcher's
 thread pool. That rules out asyncio.Lock -- a threading.Lock is what actually
 protects the state across both.
 
-Membership is static (read from config). This registry tracks which of those
-known workers are currently usable, not which workers exist.
+Membership can be static (read from config) or discovered (see
+vgate/worker_discovery.py). Either way this registry answers "which known
+workers are usable right now", which is a different question from "which
+workers exist" -- a worker failing its probes should leave rotation but stay
+known, while a worker that was scaled away should stop being probed at all.
 """
 
 import threading
@@ -45,6 +48,12 @@ class WorkerState:
     consecutive_successes: int = 0
     last_change_at: float = field(default_factory=time.monotonic)
     total_failures: int = 0
+    # True for a worker that has never passed a probe, as opposed to one that
+    # passed and later failed. The two are both "not healthy" and need
+    # different treatment: a worker that was never proven good is admitted by
+    # a single success, because there is nothing to recover from, while one
+    # that was demoted must show sustained recovery before it is trusted again.
+    pending: bool = False
 
 
 class NoHealthyWorkersError(RuntimeError):
@@ -65,8 +74,12 @@ class WorkerRegistry:
         endpoints: List[str],
         failure_threshold: int = 2,
         success_threshold: int = 2,
+        allow_empty: bool = False,
     ):
-        if not endpoints:
+        # A static registry with no endpoints is a misconfiguration worth
+        # failing on. A discovered one legitimately starts empty: the workers
+        # may not have been scheduled yet, and the first resolve fills it in.
+        if not endpoints and not allow_empty:
             raise ValueError("WorkerRegistry requires at least one endpoint")
 
         self.failure_threshold = failure_threshold
@@ -79,6 +92,86 @@ class WorkerRegistry:
 
         for ep in endpoints:
             WORKER_HEALTHY.labels(worker=ep).set(1)
+
+    # -- membership --------------------------------------------------------
+
+    def set_members(self, endpoints: List[str]) -> tuple:
+        """
+        Replace the known worker set, keeping health state for survivors.
+
+        Returns (added, removed) so the caller can log a membership change
+        without re-deriving it.
+
+        Survivors keep their state deliberately: a rediscovery tick must not
+        reset the failure counters of a worker that is midway through being
+        demoted, or a flapping worker would never accumulate enough
+        consecutive failures to leave rotation.
+
+        Arrivals start healthy, matching how the static registry treats
+        configured endpoints -- the first failed probe or request demotes them,
+        which costs at most one request and avoids a cold-start window where a
+        working pool looks empty.
+        """
+        with self._lock:
+            incoming = list(dict.fromkeys(endpoints))  # dedupe, keep order
+            current = set(self._states)
+            wanted = set(incoming)
+
+            added = [ep for ep in incoming if ep not in current]
+            removed = [ep for ep in self._order if ep not in wanted]
+            if not added and not removed:
+                return [], []
+
+            for ep in removed:
+                del self._states[ep]
+                # Drop the gauge: left behind, it reports a worker that no
+                # longer exists as healthy, which is worse than reporting
+                # nothing. The counters are intentionally kept -- they are
+                # cumulative, and a StatefulSet reuses ordinals, so the same
+                # name coming back should continue its own history rather than
+                # restart from zero.
+                try:
+                    WORKER_HEALTHY.remove(ep)
+                except KeyError:
+                    pass
+
+            for ep in added:
+                # Discovered arrivals start OUT of rotation, unlike endpoints
+                # supplied at construction.
+                #
+                # The difference is what their presence tells us. A configured
+                # endpoint carries no information at all, so serving optimistically
+                # costs at most one request that a connection failure retries
+                # elsewhere. A discovered pod appears in DNS because the worker
+                # Service publishes not-ready addresses on purpose, so a pod
+                # still loading model weights is in the answer, and its presence
+                # is positive evidence that it may not be ready.
+                #
+                # Routing to it is not free: a connection refused is retried,
+                # but a worker that accepts the connection and then stalls
+                # while loading produces a request_error, which is deliberately
+                # not retried -- one client request must not cost two
+                # generations. That is a user-visible 500 caused by admitting a
+                # worker nobody had checked.
+                self._states[ep] = WorkerState(endpoint=ep, healthy=False, pending=True)
+                WORKER_HEALTHY.labels(worker=ep).set(0)
+
+            # The cursor is deliberately left alone. It indexes into _order,
+            # which just changed length, but pick() reads it as
+            # `(cursor + offset) % len(order)`, so an out-of-range value only
+            # shifts where the next scan starts. Normalizing it here was tried
+            # and removed: the test written to justify it passed against an
+            # implementation that skipped the normalization entirely, which
+            # made it clear the code was defending against nothing.
+            self._order = incoming
+
+        logger.info(
+            "Worker membership changed",
+            extra={"extra_data": {
+                "added": added, "removed": removed, "total": len(incoming),
+            }},
+        )
+        return added, removed
 
     # -- selection ---------------------------------------------------------
 
@@ -129,7 +222,18 @@ class WorkerRegistry:
                 self._on_change(endpoint, healthy=False)
 
     def record_success(self, endpoint: str) -> None:
-        """Count a successful interaction, restoring the worker at the threshold."""
+        """
+        Count a successful interaction, admitting or restoring the worker.
+
+        A pending worker -- discovered but never yet proven usable -- is
+        admitted on its first success. Requiring success_threshold there would
+        keep a healthy new pod out of rotation for several probe intervals for
+        no reason: there is no flapping to guard against, because it has never
+        been in rotation to flap out of.
+
+        A demoted worker still needs sustained recovery. It was proven bad
+        once, so a single good answer is not enough to trust it again.
+        """
         with self._lock:
             state = self._states.get(endpoint)
             if state is None:
@@ -138,20 +242,31 @@ class WorkerRegistry:
             if state.healthy:
                 state.consecutive_successes = 0
                 return
+
             state.consecutive_successes += 1
-            if state.consecutive_successes >= self.success_threshold:
+            needed = 1 if state.pending else self.success_threshold
+            if state.consecutive_successes >= needed:
                 state.healthy = True
                 state.last_change_at = time.monotonic()
-                self._on_change(endpoint, healthy=True)
+                self._on_change(endpoint, healthy=True, admitted=state.pending)
+                state.pending = False
 
-    def _on_change(self, endpoint: str, healthy: bool) -> None:
+    def _on_change(self, endpoint: str, healthy: bool, admitted: bool = False) -> None:
         """Emit metrics and a log line for a health transition. Caller holds the lock."""
         WORKER_HEALTHY.labels(worker=endpoint).set(1 if healthy else 0)
-        WORKER_STATE_CHANGES.labels(
-            worker=endpoint, transition="recovered" if healthy else "removed"
-        ).inc()
-        logger.warning(
-            "Worker %s" % ("recovered" if healthy else "removed from rotation"),
+        # "admitted" is kept distinct from "recovered": one is a new worker
+        # entering rotation for the first time, the other is a worker that was
+        # removed and came back. Collapsing them would make a pool that churns
+        # pods look identical to one whose workers keep failing.
+        if not healthy:
+            transition = "removed"
+        elif admitted:
+            transition = "admitted"
+        else:
+            transition = "recovered"
+        WORKER_STATE_CHANGES.labels(worker=endpoint, transition=transition).inc()
+        logger.info(
+            "Worker %s" % transition,
             extra={"extra_data": {"worker": endpoint, "healthy": healthy}},
         )
 
@@ -176,6 +291,9 @@ class WorkerRegistry:
                 {
                     "endpoint": ep,
                     "healthy": s.healthy,
+                    # Distinguishes "discovered, not yet proven usable" from
+                    # "was usable and failed"; both read as healthy: false.
+                    "pending": s.pending,
                     "consecutive_failures": s.consecutive_failures,
                     "total_failures": s.total_failures,
                     "seconds_in_state": round(now - s.last_change_at, 1),

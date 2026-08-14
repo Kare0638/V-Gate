@@ -25,19 +25,26 @@ tracer = get_tracer("vgate.engine")
 DRY_RUN = os.getenv("VGATE_DRY_RUN", "false").lower() in ("true", "1", "yes")
 
 
+def _is_remote(worker_config: WorkerConfig) -> bool:
+    """Whether this process forwards inference rather than running it."""
+    return bool(worker_config.endpoints) or bool(worker_config.discovery.dns_name)
+
+
 def _create_backend(
     engine_type: str, worker_config: Optional[WorkerConfig] = None
 ) -> InferenceBackend:
     """
     Factory function to create the appropriate inference backend.
 
-    A gateway configured with worker endpoints forwards inference instead of
-    running it, so that check comes before DRY_RUN and engine_type: those
-    describe how the *worker* runs a model, and are irrelevant to a process
-    that only forwards. Without any endpoints the historical single-process
-    behavior is preserved.
+    A gateway configured to reach workers forwards inference instead of running
+    it, so that check comes before DRY_RUN and engine_type: those describe how
+    the *worker* runs a model, and are irrelevant to a process that only
+    forwards. Configured means either a static endpoint list or a discovery
+    name — a discovering gateway is remote even before its first resolve, since
+    an empty pool is a pool with nothing in it yet, not a local backend.
+    Without either, the historical single-process behavior is preserved.
     """
-    if worker_config is not None and worker_config.endpoints:
+    if worker_config is not None and _is_remote(worker_config):
         from vgate.backends.remote_backend import RemoteBackend
         return RemoteBackend(worker_config)
     if DRY_RUN:
@@ -72,13 +79,14 @@ class VGateEngine:
         if worker_config is None:
             worker_config = config.worker
 
-        self.is_remote = bool(worker_config.endpoints)
+        self.is_remote = _is_remote(worker_config)
         self.backend: InferenceBackend = _create_backend(
             model_config.engine_type, worker_config
         )
 
         if self.is_remote:
-            print(f"V-Gate gateway forwarding inference to {worker_config.endpoints}")
+            target = worker_config.discovery.dns_name or worker_config.endpoints
+            print(f"V-Gate gateway forwarding inference to {target}")
         elif DRY_RUN:
             print("V-Gate starting in DRY-RUN mode (no GPU required)")
         else:

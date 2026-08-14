@@ -40,15 +40,41 @@ class ServerConfig(BaseModel):
     port: int = 8000
 
 
+class WorkerDiscoveryConfig(BaseModel):
+    """
+    DNS-based worker membership, for deployments where the worker set changes.
+
+    A static `worker.endpoints` list cannot follow a cluster: `kubectl scale`
+    adds a pod the gateway was never told about and removes one it will probe
+    forever. Pointing `dns_name` at a headless Service makes membership follow
+    the pods, re-resolved on each health-check tick.
+
+    Unset (`dns_name: null`) keeps the static list, which is what a
+    docker-compose or bare-process deployment wants.
+    """
+    dns_name: Optional[str] = None
+    port: int = 8000
+    scheme: str = "http"
+
+    @field_validator("scheme")
+    @classmethod
+    def validate_scheme(cls, v: str) -> str:
+        if v not in ("http", "https"):
+            raise ValueError(f"worker discovery scheme must be http or https, got {v!r}")
+        return v
+
+
 class WorkerConfig(BaseModel):
     """
     Remote inference worker settings, read by the gateway role.
 
-    When `endpoints` is empty the gateway keeps the historical behavior of
-    holding an in-process backend, so existing single-process deployments are
-    unaffected. Listing endpoints switches the gateway to RemoteBackend.
+    When `endpoints` is empty and no discovery is configured, the gateway keeps
+    the historical behavior of holding an in-process backend, so existing
+    single-process deployments are unaffected. Either listing endpoints or
+    setting `discovery.dns_name` switches the gateway to RemoteBackend.
     """
     endpoints: list[str] = Field(default_factory=list)
+    discovery: WorkerDiscoveryConfig = Field(default_factory=WorkerDiscoveryConfig)
     # Generous by default: a cold worker may still be loading model weights
     # when the first request arrives.
     timeout_seconds: float = 120.0

@@ -39,6 +39,7 @@ Current gaps:
 - Kubernetes manifests deploy the gateway and workers as separate components, are validated in CI for both schema and architecture invariants, and have been exercised on a live 3-node kind cluster — see [K8S_SPLIT_VERIFICATION.md](docs/reports/K8S_SPLIT_VERIFICATION.md). Only the dry-run overlay has been run; the GPU overlay is validated but unexercised.
 - Upgrading a cluster that ran the pre-split manifests requires `k8s/migrate-from-monolith.sh`; `kubectl apply` alone leaves the old `Deployment/vgate` behind the new `Service/vgate` and most traffic fails. Reproduced and fixed in [K8S_MIGRATION_VERIFICATION.md](docs/reports/K8S_MIGRATION_VERIFICATION.md). The general mechanism — `kubectl apply --prune` — is still Alpha, so any future rename of a manifest object has the same hazard and needs the same kind of explicit migration step.
 - Container images are referenced by version tag (`vgate:0.3.2-cpu`, `vgate:0.3.2-gpu`), not by digest. A tag is a convention the registry does not enforce, so it is weaker than it looks; digest pinning plus a release process that produces them is not done.
+- DNS resolution is not interruptible. Discovery runs `getaddrinfo` on a dedicated single-thread executor with a bounded await, so a hung resolver cannot stall health probing or take a thread from the default executor that `RequestBatcher` uses for inference. It still cannot be cancelled: abandoning the future leaves the OS call blocked until it returns on its own, so membership refresh is paused rather than broken while that happens. Making resolution genuinely interruptible needs an async resolver (`aiodns` or similar), which is a new dependency and is not taken on yet.
 - The gateway's readiness probe does not reflect whether it can serve. `/health` returns `ok` unconditionally, without consulting the worker registry, so Kubernetes marks a gateway Ready and routes traffic to it while it holds zero healthy workers — those requests get `503`. The kind run makes this visible: both workers record an extra removed/recovered pair at cold start, because the gateway begins probing before any worker is up. Splitting liveness from readiness (a `/ready` that fails when no worker is in rotation) is not done, and cannot simply reuse `/health`, which the worker health checker polls with different intent.
 - Backpressure, request timeout, circuit breaking, and worker failure handling are incomplete.
 - The embedding endpoint is currently a mock MVP implementation.
@@ -128,7 +129,7 @@ The `Phase` numbers below are areas of work, not a schedule, and they have not
 been executed in order — Phases 4 and 5 landed while Phase 3 stayed untouched.
 The current execution sequence lives in README's **Next Up** section:
 
-1. Worker discovery — Phase 4, task 10
+1. ~~Worker discovery — Phase 4, task 10~~ (done)
 2. 1-vs-N measurement — Phase 4, task 8
 3. Backpressure and readiness — Phase 3
 4. Load-aware routing — Phase 4, task 5
@@ -455,10 +456,10 @@ Tasks:
 7. [x] Add worker recovery — sustained successful probes return a worker to rotation automatically.
 8. [ ] Add multi-worker benchmarks — **nothing is measured yet**; no 1-vs-N throughput or tail-latency numbers exist.
 9. [x] Add minimal gateway-to-worker authentication — bearer token on both generate calls and health probes; `/internal/generate` is not an exempt path.
-10. [ ] Replace static endpoint configuration with discovery. The registry currently tracks usability only; membership is fixed at startup from `worker.endpoints`. On Kubernetes this means `kubectl scale` does not reach the gateway, so a new replica receives nothing and a removed one is probed forever. Resolving the headless Service's DNS on the health-check tick makes membership follow the cluster, and is what unblocks worker autoscaling in Phase 5.
+10. [x] Replace static endpoint configuration with discovery. The registry currently tracks usability only; membership is fixed at startup from `worker.endpoints`. On Kubernetes this means `kubectl scale` does not reach the gateway, so a new replica receives nothing and a removed one is probed forever. Resolving the headless Service's DNS on the health-check tick makes membership follow the cluster, and is what unblocks worker autoscaling in Phase 5.
 
 **Execution order for the remaining tasks** (README's Next Up section is authoritative):
-task 10, then task 8, then Phase 3, then the load-aware strategies in task 5.
+task 10 is done; next is task 8, then Phase 3, then the load-aware strategies in task 5.
 
 Task 5's remaining strategies are unblocked at the seam: `RequestBatcher` fans out, so each request is routed on its own and a load-aware policy can act on the signal it reads. Least-inflight needs per-worker in-flight counters; EWMA needs per-worker latency tracking with exponential decay, and `RemoteBackend` already records a per-worker `vgate_worker_latency_seconds` histogram it can be built from.
 
@@ -500,7 +501,7 @@ Acceptance criteria:
 - [x] When the worker recovers, it can receive traffic again.
 - [x] `/stats` shows failure counts, health, and time-in-state for each worker.
 - [x] Gateway-worker calls use a minimal authentication mechanism. mTLS and audit logging are deferred to governance/security hardening.
-- [ ] Worker membership follows the cluster rather than a startup config (task 10).
+- [x] Worker membership follows the cluster rather than a startup config (task 10). Verified on a live cluster: `kubectl scale` 1 -> 3 -> 2 is followed within one health-check tick, with workers identified by ordinal-stable pod name rather than by address.
 - [ ] Benchmarks show throughput improvement with multiple workers. Specifically: throughput and p50/p95/p99 at N = 1, 2, 4 under fixed concurrency, plus the same run with a worker killed mid-flight. Two things have to be reported honestly for the numbers to mean anything — whether the load generator or the gateway is the bottleneck at high N, and whether dry-run workers were used, since those measure how well the gateway feeds N backends rather than how much GPU throughput N GPUs provide.
 - [ ] `/stats` reports per-worker in-flight counts and latency, which least-inflight and EWMA both need as their input signal.
 

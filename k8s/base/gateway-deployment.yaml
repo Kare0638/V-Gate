@@ -47,19 +47,23 @@ spec:
           env:
             - name: VGATE_ROLE
               value: "gateway"
-            # Stable per-pod DNS names, which only a StatefulSet provides. A
-            # Deployment's pods get random names and no individual records, so
-            # a static registry could not address them one by one.
+            # Membership comes from resolving the headless Service, not from a
+            # list. The gateway re-resolves on each health-check tick, so
+            # `kubectl scale statefulset/vgate-worker` reaches it without this
+            # manifest being edited — which a static list could not do: a new
+            # vgate-worker-2 received no traffic, and a removed one was probed
+            # forever.
             #
-            # The cost of listing them statically is that scaling the worker
-            # StatefulSet does not reach the gateway: a new vgate-worker-2
-            # would receive no traffic until this value is edited. Replacing
-            # this list with headless-Service DNS discovery is tracked as the
-            # next step in README.md's Priority 2.
-            - name: VGATE_WORKER__ENDPOINTS
-              value: >-
-                ["http://vgate-worker-0.vgate-worker:8000",
-                 "http://vgate-worker-1.vgate-worker:8000"]
+            # Endpoints are keyed by the pod's stable DNS name rather than its
+            # address. A reverse lookup turns each resolved IP back into
+            # vgate-worker-<n>.vgate-worker..., which survives restarts because
+            # a StatefulSet reuses ordinals. Addresses do not, and every
+            # vgate_worker_* metric is labelled by endpoint, so IP-keyed
+            # membership would add a time series on every pod restart.
+            - name: VGATE_WORKER__DISCOVERY__DNS_NAME
+              value: "vgate-worker.vgate.svc.cluster.local"
+            - name: VGATE_WORKER__DISCOVERY__PORT
+              value: "8000"
             # /internal/generate is not an exempt path, so the gateway must
             # present the same key the workers validate against.
             - name: VGATE_WORKER__API_KEY

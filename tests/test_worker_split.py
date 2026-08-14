@@ -89,8 +89,8 @@ def test_remote_backend_accepts_multiple_endpoints():
         backend.shutdown()
 
 
-def test_remote_backend_requires_an_endpoint():
-    with pytest.raises(ValueError, match="at least one worker endpoint"):
+def test_remote_backend_requires_endpoints_or_discovery():
+    with pytest.raises(ValueError, match="worker.endpoints or worker.discovery.dns_name"):
         RemoteBackend(WorkerConfig())
 
 

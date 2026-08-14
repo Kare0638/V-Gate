@@ -83,6 +83,27 @@ def find(docs: list[dict], kind: str, name: str) -> dict:
     raise Failure(f"{kind}/{name} is missing from the rendered output")
 
 
+def find_by_component(docs: list[dict], kind: str, component: str) -> dict:
+    """
+    Locate a resource by its role rather than its name.
+
+    Checks that exist to catch a rename cannot look the resource up by name:
+    the lookup fails first, and the build breaks with "missing from the
+    rendered output" instead of the message that would point at the rename.
+    """
+    matches = [
+        d for d in docs
+        if d.get("kind") == kind
+        and d["metadata"].get("labels", {}).get("app.kubernetes.io/component") == component
+    ]
+    if not matches:
+        raise Failure(f"no {kind} labelled component={component} in the rendered output")
+    if len(matches) > 1:
+        names = ", ".join(m["metadata"]["name"] for m in matches)
+        raise Failure(f"more than one {kind} labelled component={component}: {names}")
+    return matches[0]
+
+
 def container_of(workload: dict) -> dict:
     containers = workload["spec"]["template"]["spec"]["containers"]
     if len(containers) != 1:
@@ -122,7 +143,7 @@ def check_gateway_holds_no_model(docs: list[dict]) -> None:
 
 
 def check_worker_service_is_headless(docs: list[dict]) -> None:
-    svc = find(docs, "Service", "vgate-worker")
+    svc = find_by_component(docs, "Service", "worker")
     if svc["spec"].get("clusterIP") != "None":
         raise Failure(
             "worker Service is not headless; kube-proxy would load balance the "
@@ -141,32 +162,65 @@ def check_gateway_service_excludes_workers(docs: list[dict]) -> None:
         )
 
 
-def check_endpoints_match_workers(docs: list[dict]) -> None:
+def check_discovery_targets_the_worker_service(docs: list[dict]) -> None:
+    """
+    The gateway must discover workers through the Service that actually fronts
+    them, in the namespace they are deployed into.
+
+    This replaces an earlier check that compared a static endpoint list against
+    the replica count. That coupling is gone — membership is resolved at
+    runtime, so scaling no longer requires editing the gateway — but a new one
+    took its place: the DNS name is a string, and nothing else in the manifests
+    forces it to name the worker Service. Renaming the Service, or moving the
+    deployment to another namespace, would leave the gateway resolving a name
+    that does not exist and reporting an empty pool.
+    """
     gw = find(docs, "Deployment", "vgate-gateway")
-    sts = find(docs, "StatefulSet", "vgate-worker")
+    # By label, not by name: this check exists to catch a Service rename, and a
+    # name lookup would fail on that case before reaching the comparison.
+    sts = find_by_component(docs, "StatefulSet", "worker")
+    svc = find_by_component(docs, "Service", "worker")
+    container = container_of(gw)
 
-    raw = env_value(container_of(gw), "VGATE_WORKER__ENDPOINTS")
-    if not raw:
-        raise Failure("gateway does not set VGATE_WORKER__ENDPOINTS")
-    endpoints = yaml.safe_load(raw)
-
-    replicas = sts["spec"]["replicas"]
-    if len(endpoints) != replicas:
+    dns_name = env_value(container, "VGATE_WORKER__DISCOVERY__DNS_NAME")
+    if not dns_name:
         raise Failure(
-            f"gateway lists {len(endpoints)} worker endpoints but the "
-            f"StatefulSet runs {replicas} replicas; the extra worker gets no "
-            "traffic, or the gateway probes a pod that never exists"
+            "gateway sets no VGATE_WORKER__DISCOVERY__DNS_NAME, so worker "
+            "membership cannot follow the cluster"
         )
 
-    sts_name = sts["metadata"]["name"]
-    service_name = sts["spec"]["serviceName"]
-    expected = {
-        f"http://{sts_name}-{i}.{service_name}:8000" for i in range(replicas)
-    }
-    if set(endpoints) != expected:
+    # A static list alongside discovery is only a startup seed, and one that
+    # disagrees with the Service would put endpoints in the registry that
+    # discovery then removes on its first tick — churn that looks like workers
+    # flapping.
+    if env_value(container, "VGATE_WORKER__ENDPOINTS"):
         raise Failure(
-            "gateway endpoints do not match the StatefulSet's per-pod DNS "
-            f"names.\n  configured: {sorted(endpoints)}\n  expected:   {sorted(expected)}"
+            "gateway sets both VGATE_WORKER__ENDPOINTS and a discovery name; "
+            "the static list would be replaced on the first resolve"
+        )
+
+    namespace = svc["metadata"].get("namespace")
+    expected = f"{svc['metadata']['name']}.{namespace}.svc.cluster.local"
+    if dns_name != expected:
+        raise Failure(
+            f"gateway discovers workers at {dns_name!r}, which is not the "
+            f"worker Service's name. Expected {expected!r}."
+        )
+
+    # The Service must front the StatefulSet's pods, or the name resolves to
+    # the wrong set.
+    if sts["spec"]["serviceName"] != svc["metadata"]["name"]:
+        raise Failure(
+            f"StatefulSet serviceName is {sts['spec']['serviceName']!r} but the "
+            f"discovered Service is {svc['metadata']['name']!r}"
+        )
+
+    port = env_value(container, "VGATE_WORKER__DISCOVERY__PORT")
+    svc_port = svc["spec"]["ports"][0]["port"]
+    if port and int(port) != svc_port:
+        raise Failure(
+            f"gateway discovers workers on port {port} but the worker Service "
+            f"exposes {svc_port}"
         )
 
 
@@ -248,7 +302,7 @@ CHECKS = [
     ("gateway holds no model resources", check_gateway_holds_no_model),
     ("worker Service is headless", check_worker_service_is_headless),
     ("gateway Service excludes workers", check_gateway_service_excludes_workers),
-    ("endpoint list matches worker replicas", check_endpoints_match_workers),
+    ("discovery targets the worker Service", check_discovery_targets_the_worker_service),
     ("no unresolved $(VAR) interpolation", check_no_unresolved_interpolation),
     ("images are pinned with an explicit pull policy", check_images_are_pinned),
 ]

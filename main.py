@@ -35,6 +35,7 @@ from vgate.metrics import (
 from vgate.security import SecurityMiddleware
 from vgate.tracing import init_tracing, shutdown_tracing, get_current_trace_id
 from vgate.health_checker import WorkerHealthChecker
+from vgate.worker_discovery import DnsWorkerDiscovery
 from vgate.worker_registry import NoHealthyWorkersError
 from vgate import worker_api
 
@@ -105,12 +106,21 @@ async def lifespan(app: FastAPI):
 
     # Probe workers in the background so recovery is noticed on an idle
     # gateway too, not only when a request happens to retry a dead worker.
+    # The same loop refreshes membership when discovery is configured.
     if engine.is_remote:
+        discovery = None
+        if config.worker.discovery.dns_name:
+            discovery = DnsWorkerDiscovery(
+                dns_name=config.worker.discovery.dns_name,
+                port=config.worker.discovery.port,
+                scheme=config.worker.discovery.scheme,
+            )
         health_checker = WorkerHealthChecker(
             registry=engine.backend.registry,
             interval_seconds=config.worker.health_check_interval_seconds,
             timeout_seconds=config.worker.health_check_timeout_seconds,
             api_key=config.worker.api_key,
+            discovery=discovery,
         )
         await health_checker.start()
 
