@@ -129,6 +129,29 @@ def _terminate(proc: Optional[subprocess.Popen]) -> None:
         pass
 
 
+def _proc_cpu_seconds(pid: int) -> Optional[float]:
+    """User+system CPU consumed by a process, in seconds."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+    ticks = os.sysconf("SC_CLK_TCK")
+    return (int(fields[11]) + int(fields[12])) / ticks  # utime, stime
+
+
+def _system_cpu_seconds() -> Optional[tuple]:
+    """(busy, total) CPU seconds across all cores since boot."""
+    try:
+        parts = Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]
+    except OSError:
+        return None
+    values = [int(v) for v in parts]
+    ticks = os.sysconf("SC_CLK_TCK")
+    total = sum(values) / ticks
+    idle = (values[3] + (values[4] if len(values) > 4 else 0)) / ticks
+    return total - idle, total
+
+
 def _port_is_free(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(("127.0.0.1", port)) != 0
@@ -389,14 +412,43 @@ async def run_saturation(args: argparse.Namespace) -> Dict[str, Any]:
             # fixed total that could itself be the ceiling.
             per_proc = args.concurrency
             requests = args.requests
-            results = await _run_client_processes(
+
+            # CPU accounting around the window. "The gateway is the ceiling" is
+            # a claim about one process, but client, gateway, and workers all
+            # share this host and its loopback, so a flat curve is also
+            # consistent with the machine being out of capacity. Comparing the
+            # gateway's own CPU against the host's total distinguishes them:
+            # a gateway pinned near one full core while the machine still has
+            # idle cores is a limit in that process, not in the box.
+            gw_before = _proc_cpu_seconds(topo.gateway.pid)
+            sys_before = _system_cpu_seconds()
+            measured = await _run_client_processes(
                 topo.base_url, procs, per_proc, requests, f"sat-{procs}"
             )
+            gw_after = _proc_cpu_seconds(topo.gateway.pid)
+            sys_after = _system_cpu_seconds()
+
+            results = measured["results"]
+            window = measured["window_s"]
+            gateway_cores = None
+            host_cores_busy = None
+            if None not in (gw_before, gw_after) and window > 0:
+                gateway_cores = round((gw_after - gw_before) / window, 2)
+            if sys_before and sys_after and window > 0:
+                host_cores_busy = round(
+                    (sys_after[0] - sys_before[0]) / window, 2
+                )
+
             rows.append({
                 "client_processes": procs,
                 "concurrency_each": per_proc,
                 "offered_concurrency": per_proc * procs,
-                "total_rps": round(sum(r["requests_per_second"] for r in results), 1),
+                "total_rps": measured["total_rps"],
+                "window_s": window,
+                "start_skew_s": measured["start_skew_s"],
+                "gateway_cores": gateway_cores,
+                "host_cores_busy": host_cores_busy,
+                "host_cores_total": os.cpu_count(),
                 "p95_s": max(r["p95_s"] for r in results),
                 "failures": sum(r["failures"] for r in results),
                 "cache_hits": sum(r["cache_hits"] for r in results),
@@ -407,9 +459,26 @@ async def run_saturation(args: argparse.Namespace) -> Dict[str, Any]:
 
 async def _run_client_processes(
     url: str, count: int, concurrency: int, requests: int, tag: str
-) -> List[Dict[str, Any]]:
-    """Run `count` independent load-generator processes and collect their JSON."""
+) -> Dict[str, Any]:
+    """
+    Run `count` independent load-generator processes over a shared window.
+
+    Throughput is computed by this parent over one wall-clock interval, not by
+    summing each process's own rate. Those are different quantities: each child
+    reports requests over *its* window, and adding rates measured over windows
+    that do not coincide gives a number that corresponds to no real interval.
+    The error is not symmetric either -- a process that starts before the others
+    have finished booting briefly has the server to itself, records a higher
+    rate for that stretch, and inflates the sum. That bias grows with the
+    process count, which is precisely the axis the experiment varies.
+
+    The start barrier removes most of the skew and the common window absorbs
+    the rest: total is every request completed divided by the span from the
+    first client starting to the last one finishing.
+    """
     stamp = int(time.time() * 1000)
+    # Enough lead time for `count` interpreters to boot and reach the barrier.
+    start_at = time.time() + 1.0 + 0.3 * count
     procs = [
         await asyncio.create_subprocess_exec(
             sys.executable, "-m", "benchmarks._load_client",
@@ -417,6 +486,7 @@ async def _run_client_processes(
             "--concurrency", str(concurrency),
             "--requests", str(requests),
             "--tag", f"{tag}-{stamp}-{i}",
+            "--start-at", f"{start_at:.3f}",
             cwd=str(REPO_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -431,7 +501,75 @@ async def _run_client_processes(
                 f"load client exited {proc.returncode}: {err.decode()[-500:]}"
             )
         results.append(json.loads(out.decode()))
-    return results
+
+    window = max(r["ended_at"] for r in results) - min(r["started_at"] for r in results)
+    total_requests = sum(r["requests"] for r in results)
+    if window <= 0:
+        # Refuse rather than degrade. An earlier version returned 0.0 req/s for
+        # a nonsensical window, which is indistinguishable in the report from a
+        # server that served nothing -- and the cause was a wall-clock jump, so
+        # it would have appeared at random and been read as a result.
+        raise RuntimeError(
+            f"measurement window is {window:.2f}s; timestamps are unusable "
+            f"({len(results)} client process(es))"
+        )
+    # Skew is reported rather than assumed away: a large value means the
+    # processes were not really loading the server together, and the total
+    # below is then an average over a ragged interval.
+    skew = max(r["started_at"] for r in results) - min(r["started_at"] for r in results)
+    return {
+        "results": results,
+        "total_rps": round(total_requests / window, 1) if window > 0 else 0.0,
+        "window_s": round(window, 3),
+        "start_skew_s": round(skew, 3),
+    }
+
+
+async def run_ceiling_source(args: argparse.Namespace) -> Dict[str, Any]:
+    """
+    Identify *what* limits the gateway, not just that something does.
+
+    Knowing the ceiling is ~180 req/s is only useful with its cause attached,
+    and the obvious guess -- the gateway is out of CPU -- is wrong: it sits at
+    0.6 of one core while the host has fourteen idle. Varying the generation
+    cost separates the candidates, because a thread-bound ceiling moves with it
+    and a CPU-bound one does not.
+
+    RemoteBackend.generate is a synchronous httpx call dispatched through
+    run_in_executor, so the gateway's outbound concurrency is capped by the
+    default thread pool -- min(32, cpu_count + 4). That predicts
+    threads/latency, and it is testable against a second ceiling further up
+    where the event loop itself saturates.
+    """
+    threads = min(32, (os.cpu_count() or 1) + 4)
+    rows = []
+    for latency in args.ceiling_source_latencies:
+        # Pool capacity kept far above every prediction, so it is never the
+        # binding constraint in any row.
+        async with Topology(
+            args.saturation_workers * 2, latency, args.capacity, args.admission * 4
+        ) as topo:
+            before = _proc_cpu_seconds(topo.gateway.pid)
+            measured = await _run_client_processes(
+                topo.base_url, 2, args.concurrency * 3,
+                args.requests, f"src-{latency}",
+            )
+            after = _proc_cpu_seconds(topo.gateway.pid)
+        cores = None
+        if None not in (before, after) and measured["window_s"] > 0:
+            cores = round((after - before) / measured["window_s"], 2)
+        rows.append({
+            "latency_ms": latency,
+            "pool_capacity_rps": args.saturation_workers * 2 * args.capacity
+            / (latency / 1000.0),
+            "thread_bound_prediction_rps": threads / (latency / 1000.0),
+            "measured_rps": measured["total_rps"],
+            "gateway_cores": cores,
+            "failures": sum(r["failures"] for r in measured["results"]),
+            "cache_hits": sum(r["cache_hits"] for r in measured["results"]),
+            "deduplicated": sum(r["deduplicated"] for r in measured["results"]),
+        })
+    return {"executor_threads": threads, "rows": rows}
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +585,7 @@ def format_report(
     runs: List[Dict[str, Any]],
     ceiling: List[Dict[str, Any]],
     saturation: Optional[Dict[str, Any]] = None,
+    source: Optional[Dict[str, Any]] = None,
 ) -> str:
     per_worker_ideal = args.capacity / (args.latency_ms / 1000.0)
     counts = sorted({r["workers"] for r in runs})
@@ -631,24 +770,69 @@ def format_report(
             f"{args.saturation_workers} workers — {cap:.0f} req/s of declared pool",
             "capacity, well above anything reached above:",
             "",
-            "| Client processes | Concurrency each | Offered concurrency | Total req/s | p95 |",
-            "|---:|---:|---:|---:|---:|",
+            "Throughput here is computed by the parent over one wall-clock window",
+            "— every request completed, divided by the span from the first client",
+            "starting to the last finishing — not by summing each process's own",
+            "rate. Those are different quantities, and summing rates measured over",
+            "windows that do not coincide biases *upward* with the process count,",
+            "which is the axis being varied. A shared start barrier removes most",
+            "of the skew; the residual is reported below so it can be judged",
+            "rather than assumed away.",
+            "",
+            "| Client processes | Offered concurrency | Total req/s | Window | Start skew | Gateway CPU | Host CPU busy | p95 |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
         for row in rows:
+            gw = f"{row['gateway_cores']:.2f} cores" if row.get("gateway_cores") else "—"
+            host = (
+                f"{row['host_cores_busy']:.1f} / {row['host_cores_total']}"
+                if row.get("host_cores_busy") else "—"
+            )
             lines.append(
-                f"| {row['client_processes']} | {row['concurrency_each']} | "
-                f"{row['offered_concurrency']} | {row['total_rps']:.1f} | "
+                f"| {row['client_processes']} | {row['offered_concurrency']} | "
+                f"{row['total_rps']:.1f} | {row['window_s']:.1f} s | "
+                f"{row['start_skew_s'] * 1000:.0f} ms | {gw} | {host} | "
                 f"{row['p95_s'] * 1000:.0f} ms |"
             )
         spread = (best - min(r["total_rps"] for r in rows)) / best * 100
+        top = max(rows, key=lambda r: r["offered_concurrency"])
         lines += [
             "",
             f"Quadrupling both the number of client processes and the offered",
-            f"concurrency moves the total by {spread:.0f}%, so **the gateway is the",
-            f"ceiling, at roughly {best:.0f} req/s on this host** — not the",
-            f"harness. A pool larger than that is buying capacity the gateway",
-            f"cannot hand out.",
+            f"concurrency moves the total by {spread:.0f}%. The pool has "
+            f"{cap:.0f} req/s of capacity and is not the limit, and the load",
+            f"generators are separate processes that cannot be limited by a",
+            f"shared interpreter, so the ceiling is around "
+            f"**{best:.0f} req/s** on this host.",
             "",
+        ]
+        if top.get("gateway_cores") and top.get("host_cores_busy"):
+            headroom = top["host_cores_total"] - top["host_cores_busy"]
+            lines += [
+                f"The CPU columns rule out the obvious explanation. At the widest",
+                f"point the gateway uses {top['gateway_cores']:.2f} of one core",
+                f"while the host runs {top['host_cores_busy']:.1f} of "
+                f"{top['host_cores_total']} cores busy, leaving about "
+                f"{headroom:.1f} idle — so **the gateway is not out of CPU, and",
+                f"neither is the machine**. Something else is binding, and the",
+                f"next section identifies it.",
+                "",
+                "**What this still does not rule out.** Client, gateway, and",
+                "workers share one host and its loopback interface, so a shared",
+                "resource other than aggregate CPU is not excluded by these",
+                "numbers alone. Settling that completely needs a load generator",
+                "on another machine.",
+                "",
+            ]
+        else:
+            lines += [
+                "**Scope.** CPU accounting was unavailable, so these numbers do",
+                "not separate a limit in the gateway process from one in the",
+                "machine.",
+                "",
+            ]
+
+        lines += [
             "That number is the practical use of this whole report: it is the",
             "point where scaling gateway replicas starts to matter more than",
             "scaling workers, and until now there was nothing to set that",
@@ -656,6 +840,59 @@ def format_report(
             "workload — a real backend changes the per-request cost on both",
             "sides — so it is an operating envelope for this configuration, not",
             "a property of the software.",
+            "",
+        ]
+
+    if source:
+        srows = source["rows"]
+        threads = source["executor_threads"]
+        lines += [
+            "## What the ceiling actually is",
+            "",
+            "A ceiling is only useful with its cause attached, and the obvious",
+            "guess was wrong — the gateway is nowhere near CPU-bound at the rate",
+            "above. Varying the generation cost separates the candidates: a",
+            "thread-bound limit moves with it, a CPU-bound one does not.",
+            "",
+            "`RemoteBackend.generate` is a **synchronous** httpx call dispatched",
+            "through `run_in_executor`, so the gateway's outbound concurrency is",
+            "capped by the default thread pool — `min(32, cpu_count + 4)`, which",
+            f"is **{threads}** on this host. That predicts `threads / latency`.",
+            "",
+            "| Generation cost | Pool capacity | Threads ÷ latency | Measured | Gateway CPU |",
+            "|---:|---:|---:|---:|---:|",
+        ]
+        for row in srows:
+            gw = f"{row['gateway_cores']:.2f} cores" if row.get("gateway_cores") else "—"
+            lines.append(
+                f"| {row['latency_ms']} ms | {row['pool_capacity_rps']:.0f} | "
+                f"{row['thread_bound_prediction_rps']:.0f} | "
+                f"{row['measured_rps']:.1f} | {gw} |"
+            )
+        slowest, fastest = srows[0], srows[-1]
+        lines += [
+            "",
+            "Two different ceilings, and which binds depends on the workload:",
+            "",
+            f"- At **{slowest['latency_ms']} ms** the measurement tracks the",
+            f"  thread prediction ({slowest['measured_rps']:.0f} against",
+            f"  {slowest['thread_bound_prediction_rps']:.0f}) while CPU sits at",
+            f"  {slowest['gateway_cores']:.2f} cores. The **thread pool** binds.",
+            f"- At **{fastest['latency_ms']} ms** the pool would allow",
+            f"  {fastest['thread_bound_prediction_rps']:.0f} but only",
+            f"  {fastest['measured_rps']:.0f} arrives, with CPU up at",
+            f"  {fastest['gateway_cores']:.2f} cores. The **event loop** binds.",
+            "",
+            "This changes what the earlier number means. The ~180 req/s figure is",
+            f"not a property of the gateway — it is `{threads} threads / 100 ms`,",
+            "and that thread count comes from `os.cpu_count()`. It moves with the",
+            "host: exactly the dependency this report eliminates for worker",
+            "capacity, and had quietly left in place for the gateway.",
+            "",
+            "The fix is a design change rather than a tuning knob. An **async**",
+            "HTTP client in `RemoteBackend` would take the thread pool out of the",
+            "path entirely, leaving the event-loop ceiling as the only one. That",
+            "is recorded in ROADMAP.md, not done here.",
             "",
         ]
 
@@ -669,6 +906,7 @@ def format_report(
         ("scaling runs", runs),
         ("admission ceiling", ceiling),
         ("saturation", saturation["rows"] if saturation else []),
+        ("ceiling source", source["rows"] if source else []),
     ]
     lines += ["## Sanity checks", ""]
     total_bad = 0
@@ -742,9 +980,22 @@ async def main_async(args: argparse.Namespace) -> int:
     saturation = await run_saturation(args)
     for row in saturation["rows"]:
         print(
-            f"    {row['client_processes']} client process(es), "
-            f"offered concurrency {row['offered_concurrency']}: "
-            f"{row['total_rps']:.1f} req/s, {row['failures']} failed",
+            f"    {row['client_processes']} proc(s), offered "
+            f"{row['offered_concurrency']}: {row['total_rps']:.1f} req/s "
+            f"(window {row['window_s']:.1f}s, skew {row['start_skew_s']*1000:.0f}ms, "
+            f"gw {row['gateway_cores']} cores, host "
+            f"{row['host_cores_busy']}/{row['host_cores_total']}), "
+            f"{row['failures']} failed",
+            flush=True,
+        )
+
+    print("--- what the ceiling actually is ---", flush=True)
+    source = await run_ceiling_source(args)
+    for row in source["rows"]:
+        print(
+            f"    {row['latency_ms']}ms: measured {row['measured_rps']:.1f} vs "
+            f"thread-bound {row['thread_bound_prediction_rps']:.0f}, "
+            f"gw {row['gateway_cores']} cores, {row['failures']} failed",
             flush=True,
         )
 
@@ -759,11 +1010,12 @@ async def main_async(args: argparse.Namespace) -> int:
         )
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    report = format_report(args, runs, ceiling, saturation)
+    report = format_report(args, runs, ceiling, saturation, source)
     (RESULTS_DIR / "scaling.md").write_text(report, encoding="utf-8")
     (RESULTS_DIR / "scaling.json").write_text(
         json.dumps(
-            {"runs": runs, "ceiling": ceiling, "saturation": saturation}, indent=2
+            {"runs": runs, "ceiling": ceiling, "saturation": saturation,
+             "ceiling_source": source}, indent=2
         ),
         encoding="utf-8",
     )
@@ -787,6 +1039,10 @@ def main() -> int:
                    help="worker count for the admission-ceiling comparison")
     p.add_argument("--saturation-workers", type=int, default=8,
                    help="worker count for the gateway-vs-harness comparison")
+    p.add_argument("--ceiling-source-latencies", type=int, nargs="+",
+                   default=[100, 50, 25],
+                   help="generation costs used to separate a thread-bound "
+                        "ceiling from a CPU-bound one")
     args = p.parse_args()
     return asyncio.run(main_async(args))
 

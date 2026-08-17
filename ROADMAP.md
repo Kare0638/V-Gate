@@ -10,7 +10,7 @@
 
 ## 1. Project Positioning
 
-The target is a distributed LLM inference system: a gateway tier that owns admission, batching, caching, and routing, in front of a pool of inference workers. Both tiers exist today, and the pool is now measured to help: 1.99x at two workers and 3.89x at four ([scaling.md](benchmarks/results/scaling.md)). What does not exist is load-aware routing to make it help more, or any evidence about real GPUs.
+The target is a distributed LLM inference system: a gateway tier that owns admission, batching, caching, and routing, in front of a pool of inference workers. Both tiers exist today, and the pool is now measured to help: 2.00x at two workers and 3.89x at four ([scaling.md](benchmarks/results/scaling.md)). What does not exist is load-aware routing to make it help more, or any evidence about real GPUs.
 
 What is implemented is an OpenAI-style LLM gateway with:
 
@@ -30,7 +30,7 @@ Current gaps:
 
 - OpenAI API compatibility is still shallow. Streaming (`stream: true`, SSE) now works end-to-end for the dry-run backend and real vLLM (verified on GPU); SGLang still raises a clear `NotImplementedError` until its async engine path lands (Phase 2 task 8).
 - Streaming still bypasses `RequestBatcher` entirely (`_stream_chat_completion` calls the backend directly), so streamed requests get no cache lookup, no deduplication, and no admission control. Folding streaming into the same admission path is the remaining half of task 9.
-- Multi-worker serving is measured but routing is not load-aware. Throughput scales 1.99x/3.89x at two and four workers, at 96-99% of the declared ideal; the gateway itself saturates near 188 req/s on the benchmark host, which is where scaling gateway replicas starts to matter more than scaling workers. Routing remains round-robin.
+- Multi-worker serving is measured but routing is not load-aware. Throughput scales 2.00x/3.89x at two and four workers, at 96-99% of the declared ideal; the gateway itself saturates near 180 req/s on the benchmark host, which is where scaling gateway replicas starts to matter more than scaling workers. Routing remains round-robin.
 - Routing is per request now that `RequestBatcher` fans out, so least-inflight and EWMA are unblocked — but neither is implemented, and routing remains round-robin.
 - Streaming does not work through a remote worker; the gateway returns 501 rather than opening a stream it cannot serve.
 - Dry-run and single-GPU vLLM reports are checked in, but they predate parts of the current async serving path, and only the scaling report reports repeat-run spread. A refreshed streaming baseline is still missing.
@@ -454,7 +454,7 @@ Tasks:
    - [ ] prompt-prefix affinity
 6. [x] Add worker circuit breakers — threshold-based removal from rotation; no in-flight draining.
 7. [x] Add worker recovery — sustained successful probes return a worker to rotation automatically.
-8. [x] Add multi-worker benchmarks — [scaling.md](benchmarks/results/scaling.md). 1.99x at two workers and 3.89x at four, 96-99% of ideal, three repeats per point, zero failures. Per-worker capacity is declared (`VGATE_DRYRUN_MAX_CONCURRENCY` x `VGATE_DRYRUN_SIMULATED_LATENCY_MS`) rather than inherited from the host's core count, so the ideal is arithmetic and the numbers reproduce off this machine.
+8. [x] Add multi-worker benchmarks — [scaling.md](benchmarks/results/scaling.md). 2.00x at two workers and 3.89x at four, 96-99% of ideal, three repeats per point, zero failures. Per-worker capacity is declared (`VGATE_DRYRUN_MAX_CONCURRENCY` x `VGATE_DRYRUN_SIMULATED_LATENCY_MS`) rather than inherited from the host's core count, so the ideal is arithmetic and the numbers reproduce off this machine.
 9. [x] Add minimal gateway-to-worker authentication — bearer token on both generate calls and health probes; `/internal/generate` is not an exempt path.
 10. [x] Replace static endpoint configuration with discovery. The registry currently tracks usability only; membership is fixed at startup from `worker.endpoints`. On Kubernetes this means `kubectl scale` does not reach the gateway, so a new replica receives nothing and a removed one is probed forever. Resolving the headless Service's DNS on the health-check tick makes membership follow the cluster, and is what unblocks worker autoscaling in Phase 5.
 
@@ -909,15 +909,21 @@ specific to the benchmark host and a synthetic workload, so they are an
 operating envelope for that configuration rather than properties of the
 software.
 
-- **The gateway saturates near 188 req/s.** Quadrupling both the number of
-  independent load-generating processes and the offered concurrency moves the
-  total by 5%, and adding workers does not move it either, so the limit is the
-  gateway process. Separate processes rather than coroutine groups matter here:
-  groups inside one interpreter share an event loop and a GIL, so a flat total
-  across them would have been equally consistent with the client being the
-  bottleneck. This is the threshold above which scaling gateway replicas
-  matters more than scaling the worker pool — previously there was nothing to
-  set that from.
+- **The gateway saturates near 180 req/s, and the cause is its thread pool,
+  not CPU.** Quadrupling both the number of independent load-generating
+  processes and the offered concurrency moves the total by 2%, and adding
+  workers does not move it either. But the gateway sits at 0.6 of one core with
+  fourteen idle on the host, so CPU is not what binds. `RemoteBackend.generate`
+  is a synchronous httpx call dispatched through `run_in_executor`, capping
+  outbound concurrency at the default pool of `min(32, cpu_count + 4)` — 20
+  here, which predicts 20/latency. Halving the generation cost nearly doubles
+  the ceiling, confirming it; a second ceiling near 290 req/s appears when the
+  event loop itself saturates at about 1.1 cores.
+
+  This means the 180 figure is host-dependent through `os.cpu_count()`, which is
+  the same dependency the report removes for worker capacity. Replacing
+  `RemoteBackend`'s synchronous client with an async one would take the thread
+  pool out of the path and leave only the event-loop ceiling. Not done.
 - **`batch.max_batch_size` is a scaling ceiling, and its default hides it.** It
   bounds concurrent inferences on the gateway regardless of pool size. At the
   shipped default of 8, four workers serve 74 req/s against 153 with the limit

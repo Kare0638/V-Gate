@@ -43,6 +43,26 @@ from benchmarks.bench_load import run_load_test  # noqa: E402
 async def main_async(args: argparse.Namespace) -> None:
     stamp = int(time.time() * 1000)
     prompts = [f"{args.tag} {stamp} {i}" for i in range(args.requests)]
+
+    # Wait for a shared wall-clock start, so every client is loading the server
+    # over the same window. Without it, interpreter startup alone staggers the
+    # processes by hundreds of milliseconds, and a client that runs while the
+    # others are still booting sees an uncontended server -- which inflates its
+    # own rate and, once the parent sums per-process rates, inflates the total
+    # for exactly the runs that have the most processes.
+    if args.start_at:
+        delay = args.start_at - time.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    # CLOCK_MONOTONIC, not time.time(), for the interval. On Linux this clock is
+    # system-wide, so the parent can compare timestamps taken in different
+    # processes -- and unlike the wall clock it cannot jump. It did jump: a
+    # measured window came back as -53 seconds on this host, because WSL2
+    # resynchronises its clock after the machine sleeps. The barrier above must
+    # stay on the wall clock, since that is the only epoch the processes share
+    # before they start, but nothing else here may.
+    started_at = time.clock_gettime(time.CLOCK_MONOTONIC)
     result = await run_load_test(
         base_url=args.url,
         concurrency=args.concurrency,
@@ -50,9 +70,17 @@ async def main_async(args: argparse.Namespace) -> None:
         prompts=prompts,
         max_tokens=args.max_tokens,
     )
+    ended_at = time.clock_gettime(time.CLOCK_MONOTONIC)
+
     json.dump(
         {
+            # Kept for reference. The parent does NOT sum these: each is
+            # requests over that process's own window, and summing windows that
+            # do not coincide does not give throughput over any real interval.
             "requests_per_second": result["throughput"]["requests_per_second"],
+            "requests": args.requests,
+            "started_at": started_at,
+            "ended_at": ended_at,
             "p95_s": result["latency"]["p95_s"],
             "failures": result["failures"],
             "cache_hits": result["cache"]["hits"],
@@ -70,6 +98,8 @@ def main() -> int:
     p.add_argument("--requests", type=int, required=True)
     p.add_argument("--tag", required=True)
     p.add_argument("--max-tokens", type=int, default=0)
+    p.add_argument("--start-at", type=float, default=0.0,
+                   help="unix timestamp to begin sending at, shared by all clients")
     asyncio.run(main_async(p.parse_args()))
     return 0
 

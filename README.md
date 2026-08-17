@@ -9,9 +9,9 @@
 
 The gateway tier is implemented — an OpenAI-shaped Chat Completions subset with streaming, dynamic micro-batching, result caching, observability, security, benchmarking, and container/Kubernetes deployment artifacts. The [vLLM](https://github.com/vllm-project/vllm) path has been exercised against a live GPU; the [SGLang](https://github.com/sgl-project/sglang) path is currently a unit-tested non-streaming adapter and has not yet been validated against a live SGLang engine.
 
-**Multi-worker serving is measured: 1.99x at two workers, 3.89x at four** ([scaling.md](benchmarks/results/scaling.md)). Inference happens in separate `role: worker` processes whose membership the gateway discovers from DNS; it routes across them round-robin, probes their health in the background, removes failing workers from rotation, and lets them rejoin once they recover. A killed worker does not fail requests — traffic shifts to the survivors, and `503` with `Retry-After` is returned only when every worker is down.
+**Multi-worker serving is measured: 2.00x at two workers, 3.89x at four** ([scaling.md](benchmarks/results/scaling.md)). Inference happens in separate `role: worker` processes whose membership the gateway discovers from DNS; it routes across them round-robin, probes their health in the background, removes failing workers from rotation, and lets them rejoin once they recover. A killed worker does not fail requests — traffic shifts to the survivors, and `503` with `Retry-After` is returned only when every worker is down.
 
-Two limits that measurement made concrete rather than theoretical. The gateway itself saturates near **188 req/s** on the benchmark host — quadrupling client processes and offered concurrency moves the total by 5% — so past that point a bigger pool is capacity it cannot hand out and gateway replicas are what matter. And `batch.max_batch_size` caps concurrent inferences on the gateway regardless of pool size: **left at its default of 8, four workers serve 74 req/s where they could serve 153**, and nothing reports why. Routing is round-robin only (least-inflight and EWMA are [Phase 4](ROADMAP.md#phase-4-multi-worker-serving)). Streaming through a worker returns 501. Multimodal requests are a separate planned milestone. Live-GPU validation has been performed on one NVIDIA GeForce RTX 3060 Laptop GPU with 6GB VRAM; no RTX 4060 or multi-GPU validation is claimed.
+Two limits that measurement made concrete rather than theoretical. The gateway itself saturates near **180 req/s** on the benchmark host — quadrupling independent client processes and offered concurrency moves the total by 2% — so past that point a bigger pool is capacity it cannot hand out. The cause is not CPU (the gateway sits at 0.6 of one core): `RemoteBackend` makes a **synchronous** HTTP call through `run_in_executor`, so outbound concurrency is capped by the default thread pool, `min(32, cpu_count + 4)`. Halving the generation cost nearly doubles the ceiling, which is what identifies it; an async client would remove that limit and leave the event-loop ceiling near 290 req/s. And `batch.max_batch_size` caps concurrent inferences on the gateway regardless of pool size: **left at its default of 8, four workers serve 74 req/s where they could serve 153**, and nothing reports why. Routing is round-robin only (least-inflight and EWMA are [Phase 4](ROADMAP.md#phase-4-multi-worker-serving)). Streaming through a worker returns 501. Multimodal requests are a separate planned milestone. Live-GPU validation has been performed on one NVIDIA GeForce RTX 3060 Laptop GPU with 6GB VRAM; no RTX 4060 or multi-GPU validation is claimed.
 
 ## Validated Evidence
 
@@ -21,7 +21,7 @@ The evidence below is a measured snapshot of the current serving path. The vLLM 
 |------|----------|-------|
 | **vLLM live GPU** | [`Qwen/Qwen2.5-1.5B-Instruct-AWQ`](benchmarks/results/vllm_baseline.md) via vLLM 0.26 on an RTX 3060 Laptop GPU: **294.09 generated tokens/s**, **6.47 requests/s**, **1.5264s p95 latency** | 40 requests at concurrency 8, from one small benchmark run; a directional baseline, not a capacity claim |
 | **SGLang adapter** | Non-streaming adapter behavior is covered by [`tests/test_backends.py`](tests/test_backends.py) | Unit tests use stubs; no live-engine or live-GPU SGLang benchmark is claimed |
-| **1-vs-N worker scaling** | [1.99x at 2 workers, 3.89x at 4](benchmarks/results/scaling.md), 96–99% of ideal, 3 repeats per point, 0 failures | Dry-run workers with declared capacity: measures how well one gateway feeds N backends, **not** GPU throughput |
+| **1-vs-N worker scaling** | [2.00x at 2 workers, 3.89x at 4](benchmarks/results/scaling.md), 96–99% of ideal, 3 repeats per point, 0 failures across all 18 runs | Dry-run workers with declared capacity: measures how well one gateway feeds N backends, **not** GPU throughput |
 | **Split topology on Kubernetes** | [3-node kind cluster](docs/reports/K8S_SPLIT_VERIFICATION.md): 19 assertions covering per-pod routing, `kubectl scale` 1↔3↔0, and failover under live traffic | Dry-run workers; the GPU overlay is validated but unexercised |
 
 ---
@@ -946,9 +946,9 @@ headless Service on each health-check tick, so `kubectl scale` reaches it and
 the worker count is now a variable the steps below can vary.
 
 **2. Measure 1 worker vs N.** — **done.** [scaling.md](benchmarks/results/scaling.md):
-1.99x at two workers and 3.89x at four, against a gateway that saturates near
-188 req/s on this host. That ceiling is the number step 4 will be measured
-against.
+2.00x at two workers and 3.89x at four, against a gateway that saturates near
+180 req/s on this host — a thread-pool limit rather than a CPU one, which
+is the number step 4 will be measured against.
 
 **3. Backpressure: bounded queues, request deadlines, stable overload
 responses.** Priority 1 below has stayed unstarted while Priorities 2 and 3
