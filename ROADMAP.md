@@ -30,7 +30,7 @@ Current gaps:
 
 - OpenAI API compatibility is still shallow. Streaming (`stream: true`, SSE) now works end-to-end for the dry-run backend and real vLLM (verified on GPU); SGLang still raises a clear `NotImplementedError` until its async engine path lands (Phase 2 task 8).
 - Streaming still bypasses `RequestBatcher` entirely (`_stream_chat_completion` calls the backend directly), so streamed requests get no cache lookup, no deduplication, and no admission control. Folding streaming into the same admission path is the remaining half of task 9.
-- Multi-worker serving is measured but routing is not load-aware. Throughput scales 1.99x/3.89x at two and four workers, at 96-99% of the declared ideal; the gateway itself saturates near 184 req/s on the benchmark host, which is where scaling gateway replicas starts to matter more than scaling workers. Routing remains round-robin.
+- Multi-worker serving is measured but routing is not load-aware. Throughput scales 1.99x/3.89x at two and four workers, at 96-99% of the declared ideal; the gateway itself saturates near 188 req/s on the benchmark host, which is where scaling gateway replicas starts to matter more than scaling workers. Routing remains round-robin.
 - Routing is per request now that `RequestBatcher` fans out, so least-inflight and EWMA are unblocked — but neither is implemented, and routing remains round-robin.
 - Streaming does not work through a remote worker; the gateway returns 501 rather than opening a stream it cannot serve.
 - Dry-run and single-GPU vLLM reports are checked in, but they predate parts of the current async serving path, and only the scaling report reports repeat-run spread. A refreshed streaming baseline is still missing.
@@ -909,13 +909,20 @@ specific to the benchmark host and a synthetic workload, so they are an
 operating envelope for that configuration rather than properties of the
 software.
 
-- **The gateway saturates near 184 req/s.** Adding client concurrency past that
-  point does not move the total, and neither does adding workers, so it is the
-  gateway process itself. This is the threshold above which scaling gateway
-  replicas matters more than scaling the worker pool — previously there was
-  nothing to set that from.
+- **The gateway saturates near 188 req/s.** Quadrupling both the number of
+  independent load-generating processes and the offered concurrency moves the
+  total by 5%, and adding workers does not move it either, so the limit is the
+  gateway process. Separate processes rather than coroutine groups matter here:
+  groups inside one interpreter share an event loop and a GIL, so a flat total
+  across them would have been equally consistent with the client being the
+  bottleneck. This is the threshold above which scaling gateway replicas
+  matters more than scaling the worker pool — previously there was nothing to
+  set that from.
 - **`batch.max_batch_size` is a scaling ceiling, and its default hides it.** It
   bounds concurrent inferences on the gateway regardless of pool size. At the
-  default of 8, four workers serve what one worker serves: 38 req/s against 153
-  with the limit raised. A deployment that scales its pool without touching this
-  gets nothing for the extra workers, and nothing in the system reports why.
+  shipped default of 8, four workers serve 74 req/s against 153 with the limit
+  raised — a 2.1x shortfall, and roughly what two workers would give rather than
+  four. A deployment that scales its pool without touching this pays for workers
+  it cannot use, and nothing in the system reports why. The default is measured
+  rather than interpolated: an earlier version of this report tested 4 and 64 and
+  then made a claim about 8, overstating the hazard as total rather than partial.

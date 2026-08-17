@@ -75,6 +75,12 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from benchmarks.bench_load import run_load_test  # noqa: E402
 
+from vgate.config import BatchConfig  # noqa: E402
+
+# Read from the config model rather than hardcoded, so this cannot drift from
+# the value a deployment actually gets.
+DEFAULT_MAX_BATCH_SIZE = BatchConfig().max_batch_size
+
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results"
 GATEWAY_PORT = 8110
 WORKER_PORT_BASE = 8111
@@ -194,6 +200,19 @@ class Topology:
         ]
 
     async def __aenter__(self) -> "Topology":
+        # Everything after the first spawn runs under try/except. If __aenter__
+        # raises, Python never calls __aexit__ -- the `async with` body was
+        # never entered -- so a health check that times out would leave the
+        # whole process group running and holding the ports, and every later
+        # topology in the same run would then attach to those orphans.
+        try:
+            await self._start()
+        except BaseException:
+            await self._stop()
+            raise
+        return self
+
+    async def _start(self) -> None:
         # Nothing from a previous topology may still be listening, or its
         # /health answer will be mistaken for this one's.
         await _wait_ports_free(self._all_ports())
@@ -228,12 +247,16 @@ class Topology:
         # Let the gateway's first health probe land, so the first measured
         # request is not the one that discovers a worker.
         await asyncio.sleep(1.0)
-        return self
 
     async def __aexit__(self, *exc) -> None:
+        await self._stop()
+
+    async def _stop(self) -> None:
         _terminate(self.gateway)
+        self.gateway = None
         for w in self.workers:
             _terminate(w)
+        self.workers = []
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +326,14 @@ async def run_admission_ceiling(args: argparse.Namespace) -> List[Dict[str, Any]
     gateway's own permit count.
     """
     out = []
-    for admission in (args.capacity, args.admission):
+    # The shipped default is measured, not extrapolated from a neighbouring
+    # point. An earlier version of this report tested 4 and 64 and then wrote a
+    # claim about 8 -- that at the default a four-worker pool serves what one
+    # worker serves. Arithmetic says otherwise: 8 permits at 100 ms is about 80
+    # req/s, which is 2x a single worker, not 1x. The hazard is real and the
+    # stated size of it was wrong, so the value that matters is now a row.
+    sweep = sorted({args.capacity, DEFAULT_MAX_BATCH_SIZE, args.admission})
+    for admission in sweep:
         async with Topology(
             args.ceiling_workers, args.latency_ms, args.capacity, admission
         ) as topo:
@@ -315,11 +345,17 @@ async def run_admission_ceiling(args: argparse.Namespace) -> List[Dict[str, Any]
                 prompts=prompts,
                 max_tokens=0,
             )
+        pool_capacity = args.ceiling_workers * args.capacity
         out.append({
             "admission": admission,
             "workers": args.ceiling_workers,
+            "is_shipped_default": admission == DEFAULT_MAX_BATCH_SIZE,
+            "binding": admission < pool_capacity,
             "throughput_rps": result["throughput"]["requests_per_second"],
             "p95_s": result["latency"]["p95_s"],
+            "failures": result["failures"],
+            "cache_hits": result["cache"]["hits"],
+            "deduplicated": result["batching"]["deduplicated"],
         })
     return out
 
@@ -340,28 +376,62 @@ async def run_saturation(args: argparse.Namespace) -> Dict[str, Any]:
     async with Topology(
         args.saturation_workers, args.latency_ms, args.capacity, args.admission * 2
     ) as topo:
-        for groups in (1, 2, 4):
-            per_group = args.concurrency * 2 // groups
-            requests = args.requests * 2 // groups
-            results = await asyncio.gather(*[
-                run_load_test(
-                    base_url=topo.base_url,
-                    concurrency=per_group,
-                    total_requests=requests,
-                    prompts=_unique_prompts(requests, f"sat-{groups}-{g}"),
-                    max_tokens=0,
-                )
-                for g in range(groups)
-            ])
+        for procs in (1, 2, 4):
+            # Separate OS processes, not coroutine groups. Groups inside one
+            # interpreter share an event loop and a GIL, so a flat total across
+            # them is equally consistent with "the gateway is saturated" and
+            # "this Python process is" -- which is the exact ambiguity the
+            # experiment exists to remove. Separate processes get their own
+            # loop and can occupy other cores.
+            #
+            # Offered concurrency grows with the process count rather than
+            # being split between them, so the client side is never held at a
+            # fixed total that could itself be the ceiling.
+            per_proc = args.concurrency
+            requests = args.requests
+            results = await _run_client_processes(
+                topo.base_url, procs, per_proc, requests, f"sat-{procs}"
+            )
             rows.append({
-                "client_groups": groups,
-                "concurrency_each": per_group,
-                "total_rps": round(
-                    sum(r["throughput"]["requests_per_second"] for r in results), 1
-                ),
-                "p95_s": max(r["latency"]["p95_s"] for r in results),
+                "client_processes": procs,
+                "concurrency_each": per_proc,
+                "offered_concurrency": per_proc * procs,
+                "total_rps": round(sum(r["requests_per_second"] for r in results), 1),
+                "p95_s": max(r["p95_s"] for r in results),
+                "failures": sum(r["failures"] for r in results),
+                "cache_hits": sum(r["cache_hits"] for r in results),
+                "deduplicated": sum(r["deduplicated"] for r in results),
             })
     return {"pool_capacity_rps": capacity, "rows": rows}
+
+
+async def _run_client_processes(
+    url: str, count: int, concurrency: int, requests: int, tag: str
+) -> List[Dict[str, Any]]:
+    """Run `count` independent load-generator processes and collect their JSON."""
+    stamp = int(time.time() * 1000)
+    procs = [
+        await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "benchmarks._load_client",
+            "--url", url,
+            "--concurrency", str(concurrency),
+            "--requests", str(requests),
+            "--tag", f"{tag}-{stamp}-{i}",
+            cwd=str(REPO_ROOT),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        for i in range(count)
+    ]
+    outputs = await asyncio.gather(*(p.communicate() for p in procs))
+    results = []
+    for (out, err), proc in zip(outputs, procs):
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"load client exited {proc.returncode}: {err.decode()[-500:]}"
+            )
+        results.append(json.loads(out.decode()))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -492,24 +562,50 @@ def format_report(
             "pool looks like it does not scale, when what is saturated is the",
             "gateway's permit count.",
             "",
-            f"Both rows below run {args.ceiling_workers} workers "
-            f"({per_worker_ideal * args.ceiling_workers:.0f} req/s of capacity):",
+            f"Every row runs {args.ceiling_workers} workers "
+            f"({per_worker_ideal * args.ceiling_workers:.0f} req/s of capacity). "
+            f"The predicted column is `max_batch_size / latency`, which is what",
+            f"the limit allows when it is the binding constraint:",
             "",
-            "| `max_batch_size` | Median req/s | p95 |",
-            "|---:|---:|---:|",
+            "| `max_batch_size` | Predicted req/s | Measured req/s | p95 | |",
+            "|---:|---:|---:|---:|---|",
         ]
         for row in ceiling:
+            predicted = row["admission"] / (args.latency_ms / 1000.0)
+            note = " **shipped default**" if row["is_shipped_default"] else ""
+            if not row["binding"]:
+                predicted_s = "—"
+                note += " (above pool capacity; not binding)"
+            else:
+                predicted_s = f"{predicted:.0f}"
             lines.append(
-                f"| {row['admission']} | {row['throughput_rps']:.1f} | "
-                f"{row['p95_s'] * 1000:.0f} ms |"
+                f"| {row['admission']} | {predicted_s} | "
+                f"{row['throughput_rps']:.1f} | {row['p95_s'] * 1000:.0f} ms |"
+                f"{note} |"
             )
-        lines += [
-            "",
-            "This is a real configuration hazard, not an artefact of the harness:",
-            "the default is 8, so a deployment that scales its worker pool without",
-            "raising it gets nothing for the extra workers.",
-            "",
-        ]
+
+        default_row = next((r for r in ceiling if r["is_shipped_default"]), None)
+        best_row = max(ceiling, key=lambda r: r["throughput_rps"])
+        lines += ["", "This is a real configuration hazard: a deployment that scales"]
+        if default_row:
+            ratio = best_row["throughput_rps"] / default_row["throughput_rps"]
+            lines += [
+                f"its pool without raising `max_batch_size` gets "
+                f"{default_row['throughput_rps']:.0f} req/s where the pool could",
+                f"serve {best_row['throughput_rps']:.0f} — a "
+                f"{ratio:.1f}x shortfall — and nothing in the system reports why.",
+                "",
+                "The default is measured here rather than inferred from a",
+                "neighbouring point. An earlier version of this report tested 4 and",
+                "64 and then wrote a claim about 8, asserting that at the default a",
+                "four-worker pool serves what one worker serves. It does not: 8",
+                "permits at this latency allows about 80 req/s, which is twice a",
+                "single worker, not the same. The hazard was real and the stated",
+                "size of it was wrong.",
+                "",
+            ]
+        else:
+            lines += ["", ""]
 
     if saturation:
         rows = saturation["rows"]
@@ -518,27 +614,37 @@ def format_report(
         lines += [
             "## Where scaling stops, and which side the limit is on",
             "",
-            f"An efficiency figure is not worth much without this. A shortfall at",
-            f"high N is equally consistent with *the gateway is saturated* and",
-            f"*the load generator cannot go faster*, and those have opposite",
-            f"implications. Splitting the same offered load across more client",
-            f"tasks separates them: if more clients push more traffic, the",
-            f"generator was the limit.",
+            "An efficiency figure is not worth much without this. A shortfall at",
+            "high N is equally consistent with *the gateway is saturated* and",
+            "*the load generator cannot go faster*, and those have opposite",
+            "implications.",
+            "",
+            "The load generators are **separate OS processes**, and offered",
+            "concurrency grows with their number rather than being divided among",
+            "them. Both matter. Coroutine groups inside one interpreter share an",
+            "event loop and a GIL, so a flat total across them would be equally",
+            "consistent with that one process being saturated; and holding total",
+            "concurrency fixed would leave the offered load itself as a possible",
+            "ceiling. Separate processes get their own loop and can occupy other",
+            "cores, so a flat total across them is evidence about the server.",
             "",
             f"{args.saturation_workers} workers — {cap:.0f} req/s of declared pool",
-            f"capacity, well above anything reached above:",
+            "capacity, well above anything reached above:",
             "",
-            "| Client groups | Concurrency each | Total req/s | p95 |",
-            "|---:|---:|---:|---:|",
+            "| Client processes | Concurrency each | Offered concurrency | Total req/s | p95 |",
+            "|---:|---:|---:|---:|---:|",
         ]
         for row in rows:
             lines.append(
-                f"| {row['client_groups']} | {row['concurrency_each']} | "
-                f"{row['total_rps']:.1f} | {row['p95_s'] * 1000:.0f} ms |"
+                f"| {row['client_processes']} | {row['concurrency_each']} | "
+                f"{row['offered_concurrency']} | {row['total_rps']:.1f} | "
+                f"{row['p95_s'] * 1000:.0f} ms |"
             )
+        spread = (best - min(r["total_rps"] for r in rows)) / best * 100
         lines += [
             "",
-            f"Adding clients does not add throughput, so **the gateway is the",
+            f"Quadrupling both the number of client processes and the offered",
+            f"concurrency moves the total by {spread:.0f}%, so **the gateway is the",
             f"ceiling, at roughly {best:.0f} req/s on this host** — not the",
             f"harness. A pool larger than that is buying capacity the gateway",
             f"cannot hand out.",
@@ -553,19 +659,46 @@ def format_report(
             "",
         ]
 
-    failures = sum(r["failures"] for r in runs)
-    cache_hits = sum(r.get("cache_hits", 0) for r in runs)
-    dedup = sum(r.get("deduplicated", 0) for r in runs)
-    dirty = [r for r in runs if r["failures"]]
+    # Every scenario, not just the nine scaling runs. bench_load computes
+    # throughput as requests over wall time and counts failures in the
+    # numerator, so a single request that sits out the 120s worker timeout
+    # corrupts whatever scenario it lands in. Checking only the main runs left
+    # the two headline conclusions -- the admission ceiling and the saturation
+    # point -- able to be quietly wrong.
+    scopes = [
+        ("scaling runs", runs),
+        ("admission ceiling", ceiling),
+        ("saturation", saturation["rows"] if saturation else []),
+    ]
+    lines += ["## Sanity checks", ""]
+    total_bad = 0
+    for name, rows_ in scopes:
+        if not rows_:
+            continue
+        f = sum(r.get("failures", 0) for r in rows_)
+        c = sum(r.get("cache_hits", 0) for r in rows_)
+        d = sum(r.get("deduplicated", 0) for r in rows_)
+        total_bad += f + c + d
+        mark = "" if (f or c or d) == 0 else "  ← **not clean**"
+        lines.append(
+            f"- **{name}** ({len(rows_)} run(s)): {f} failed, {c} cache hit(s), "
+            f"{d} deduplicated.{mark}"
+        )
     lines += [
-        "## Sanity checks",
         "",
-        f"- **{failures}** failed request(s) across {len(runs)} runs.",
-        f"- **{cache_hits}** cache hit(s) and **{dedup}** deduplicated request(s).",
-        "  Both must be zero: a cache hit or a coalesced duplicate is throughput",
-        "  the pool did not actually produce, and would inflate every number here.",
+        "All three counts must be zero in every scenario. A failed request",
+        "inflates nothing but still divides into wall time; a cache hit or a",
+        "coalesced duplicate is throughput the pool did not actually produce.",
         "",
     ]
+    if total_bad:
+        lines += [
+            "> **This run is not clean.** The numbers above should not be quoted",
+            "> until it is re-run without failures.",
+            "",
+        ]
+
+    dirty = [r for r in runs if r["failures"]]
     if dirty:
         lines += [
             "Runs with a failed request are **excluded from the medians above and",
@@ -609,17 +742,19 @@ async def main_async(args: argparse.Namespace) -> int:
     saturation = await run_saturation(args)
     for row in saturation["rows"]:
         print(
-            f"    {row['client_groups']} client group(s): "
-            f"{row['total_rps']:.1f} req/s",
+            f"    {row['client_processes']} client process(es), "
+            f"offered concurrency {row['offered_concurrency']}: "
+            f"{row['total_rps']:.1f} req/s, {row['failures']} failed",
             flush=True,
         )
 
     print("--- admission ceiling ---", flush=True)
     ceiling = await run_admission_ceiling(args)
     for row in ceiling:
+        tag = "  <- shipped default" if row["is_shipped_default"] else ""
         print(
             f"    max_batch_size={row['admission']}: "
-            f"{row['throughput_rps']:.1f} req/s",
+            f"{row['throughput_rps']:.1f} req/s, {row['failures']} failed{tag}",
             flush=True,
         )
 

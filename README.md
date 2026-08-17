@@ -11,7 +11,7 @@ The gateway tier is implemented — an OpenAI-shaped Chat Completions subset wit
 
 **Multi-worker serving is measured: 1.99x at two workers, 3.89x at four** ([scaling.md](benchmarks/results/scaling.md)). Inference happens in separate `role: worker` processes whose membership the gateway discovers from DNS; it routes across them round-robin, probes their health in the background, removes failing workers from rotation, and lets them rejoin once they recover. A killed worker does not fail requests — traffic shifts to the survivors, and `503` with `Retry-After` is returned only when every worker is down.
 
-Two limits that measurement made concrete rather than theoretical. The gateway itself saturates near **184 req/s** on the benchmark host, so past that point a bigger pool is capacity it cannot hand out and gateway replicas are what matter. And `batch.max_batch_size` caps concurrent inferences on the gateway regardless of pool size — left at its default of 8, four workers serve exactly what one does. Routing is round-robin only (least-inflight and EWMA are [Phase 4](ROADMAP.md#phase-4-multi-worker-serving)). Streaming through a worker returns 501. Multimodal requests are a separate planned milestone. Live-GPU validation has been performed on one NVIDIA GeForce RTX 3060 Laptop GPU with 6GB VRAM; no RTX 4060 or multi-GPU validation is claimed.
+Two limits that measurement made concrete rather than theoretical. The gateway itself saturates near **188 req/s** on the benchmark host — quadrupling client processes and offered concurrency moves the total by 5% — so past that point a bigger pool is capacity it cannot hand out and gateway replicas are what matter. And `batch.max_batch_size` caps concurrent inferences on the gateway regardless of pool size: **left at its default of 8, four workers serve 74 req/s where they could serve 153**, and nothing reports why. Routing is round-robin only (least-inflight and EWMA are [Phase 4](ROADMAP.md#phase-4-multi-worker-serving)). Streaming through a worker returns 501. Multimodal requests are a separate planned milestone. Live-GPU validation has been performed on one NVIDIA GeForce RTX 3060 Laptop GPU with 6GB VRAM; no RTX 4060 or multi-GPU validation is claimed.
 
 ## Validated Evidence
 
@@ -947,7 +947,7 @@ the worker count is now a variable the steps below can vary.
 
 **2. Measure 1 worker vs N.** — **done.** [scaling.md](benchmarks/results/scaling.md):
 1.99x at two workers and 3.89x at four, against a gateway that saturates near
-184 req/s on this host. That ceiling is the number step 4 will be measured
+188 req/s on this host. That ceiling is the number step 4 will be measured
 against.
 
 **3. Backpressure: bounded queues, request deadlines, stable overload
