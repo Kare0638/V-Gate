@@ -10,7 +10,7 @@
 
 ## 1. Project Positioning
 
-The target is a distributed LLM inference system: a gateway tier that owns admission, batching, caching, and routing, in front of a pool of inference workers. Both tiers exist today. What does not exist is evidence that the pool helps — no 1-vs-N measurement has been taken — or load-aware routing to make it help more.
+The target is a distributed LLM inference system: a gateway tier that owns admission, batching, caching, and routing, in front of a pool of inference workers. Both tiers exist today, and the pool is now measured to help: 1.99x at two workers and 3.89x at four ([scaling.md](benchmarks/results/scaling.md)). What does not exist is load-aware routing to make it help more, or any evidence about real GPUs.
 
 What is implemented is an OpenAI-style LLM gateway with:
 
@@ -30,10 +30,10 @@ Current gaps:
 
 - OpenAI API compatibility is still shallow. Streaming (`stream: true`, SSE) now works end-to-end for the dry-run backend and real vLLM (verified on GPU); SGLang still raises a clear `NotImplementedError` until its async engine path lands (Phase 2 task 8).
 - Streaming still bypasses `RequestBatcher` entirely (`_stream_chat_completion` calls the backend directly), so streamed requests get no cache lookup, no deduplication, and no admission control. Folding streaming into the same admission path is the remaining half of task 9.
-- Multi-worker serving runs but is unmeasured: the gateway routes round-robin across healthy workers with health-based failover, yet no 1-vs-N throughput or tail-latency evidence exists, and routing is not load-aware.
+- Multi-worker serving is measured but routing is not load-aware. Throughput scales 1.99x/3.89x at two and four workers, at 96-99% of the declared ideal; the gateway itself saturates near 184 req/s on the benchmark host, which is where scaling gateway replicas starts to matter more than scaling workers. Routing remains round-robin.
 - Routing is per request now that `RequestBatcher` fans out, so least-inflight and EWMA are unblocked — but neither is implemented, and routing remains round-robin.
 - Streaming does not work through a remote worker; the gateway returns 501 rather than opening a stream it cannot serve.
-- Dry-run and single-GPU vLLM reports are checked in, but they predate parts of the current async serving path. A refreshed streaming baseline, repeat-run variance analysis, and 1-vs-N-worker evidence are still missing.
+- Dry-run and single-GPU vLLM reports are checked in, but they predate parts of the current async serving path, and only the scaling report reports repeat-run spread. A refreshed streaming baseline is still missing.
 - All live-GPU evidence comes from one 6GB laptop GPU running a 1.5B AWQ model. That is enough to prove the vLLM path works and not enough to say anything about the problems this project claims to be near: tensor parallelism, KV-cache pressure at realistic context lengths, and scheduling behaviour when a single model does not fit on one device are all untested. Any statement about multi-GPU behaviour here would be extrapolation, so none is made. A single rented two-GPU run would replace the assumption with a measurement.
 - Cache is RAM-only. There is no persistent local disk cache layer, and cache value depends on process lifetime. This is an intentional, benchmark-gated decision (Phase 1.5), not an oversight — current traffic shows no L1 eviction pressure.
 - Kubernetes manifests deploy the gateway and workers as separate components, are validated in CI for both schema and architecture invariants, and have been exercised on a live 3-node kind cluster — see [K8S_SPLIT_VERIFICATION.md](docs/reports/K8S_SPLIT_VERIFICATION.md). Only the dry-run overlay has been run; the GPU overlay is validated but unexercised.
@@ -197,7 +197,7 @@ Producing the real GPU baseline surfaced and fixed three bugs that only show up 
 **Remaining, and the reason this phase is not closed:**
 
 1. [ ] **Multi-GPU baseline.** Every live-GPU number here comes from one 6GB laptop GPU running a 1.5B AWQ model. That establishes the vLLM path works; it establishes nothing about the regime this project positions itself near. One rented two-GPU run, comparing `tensor_parallel_size` 1 against 2 on a model that does not comfortably fit on one device, would produce the first evidence about KV-cache pressure and multi-device scheduling here. Until it exists, no claim about multi-GPU behaviour should appear anywhere in this repo.
-2. [ ] **Repeat-run variance.** Single runs are reported without spread, so a difference between two numbers cannot currently be distinguished from noise.
+2. [~] **Repeat-run variance.** [scaling.md](benchmarks/results/scaling.md) reports three repeats per point with the spread; the earlier dry-run and GPU baselines still report single runs.
 3. [ ] **Refreshed streaming baseline.** The checked-in reports predate parts of the current async serving path.
 
 Priority: highest.
@@ -435,7 +435,7 @@ Expected outcome:
 
 ### Phase 4: Multi-Worker Serving
 
-**Status: mostly implemented; unmeasured.** Role separation, the internal generate API, a static registry with background health probing, round-robin routing, failover, recovery, and bearer authentication are in `main`, and the topology has been exercised on a live Kubernetes cluster ([K8S_SPLIT_VERIFICATION.md](docs/reports/K8S_SPLIT_VERIFICATION.md)). What is missing is the part that would justify calling it good: discovery instead of a fixed endpoint list, load-aware routing, and any throughput measurement at all.
+**Status: implemented and measured; routing is not load-aware.** Role separation, the internal generate API, DNS-based membership discovery with background health probing, round-robin routing, failover, recovery, and bearer authentication are in `main`. The topology is exercised on a live Kubernetes cluster ([K8S_SPLIT_VERIFICATION.md](docs/reports/K8S_SPLIT_VERIFICATION.md)) and the pool is measured to scale ([scaling.md](benchmarks/results/scaling.md)). What remains is load-aware routing — which the scaling harness now makes falsifiable, since a policy that cannot be shown to beat round-robin is a change nobody can defend.
 
 Priority: highest for distributed serving.
 
@@ -454,7 +454,7 @@ Tasks:
    - [ ] prompt-prefix affinity
 6. [x] Add worker circuit breakers — threshold-based removal from rotation; no in-flight draining.
 7. [x] Add worker recovery — sustained successful probes return a worker to rotation automatically.
-8. [ ] Add multi-worker benchmarks — **nothing is measured yet**; no 1-vs-N throughput or tail-latency numbers exist.
+8. [x] Add multi-worker benchmarks — [scaling.md](benchmarks/results/scaling.md). 1.99x at two workers and 3.89x at four, 96-99% of ideal, three repeats per point, zero failures. Per-worker capacity is declared (`VGATE_DRYRUN_MAX_CONCURRENCY` x `VGATE_DRYRUN_SIMULATED_LATENCY_MS`) rather than inherited from the host's core count, so the ideal is arithmetic and the numbers reproduce off this machine.
 9. [x] Add minimal gateway-to-worker authentication — bearer token on both generate calls and health probes; `/internal/generate` is not an exempt path.
 10. [x] Replace static endpoint configuration with discovery. The registry currently tracks usability only; membership is fixed at startup from `worker.endpoints`. On Kubernetes this means `kubectl scale` does not reach the gateway, so a new replica receives nothing and a removed one is probed forever. Resolving the headless Service's DNS on the health-check tick makes membership follow the cluster, and is what unblocks worker autoscaling in Phase 5.
 
@@ -502,7 +502,7 @@ Acceptance criteria:
 - [x] `/stats` shows failure counts, health, and time-in-state for each worker.
 - [x] Gateway-worker calls use a minimal authentication mechanism. mTLS and audit logging are deferred to governance/security hardening.
 - [x] Worker membership follows the cluster rather than a startup config (task 10). Verified on a live cluster: `kubectl scale` 1 -> 3 -> 2 is followed within one health-check tick, with workers identified by ordinal-stable pod name rather than by address.
-- [ ] Benchmarks show throughput improvement with multiple workers. Specifically: throughput and p50/p95/p99 at N = 1, 2, 4 under fixed concurrency, plus the same run with a worker killed mid-flight. Two things have to be reported honestly for the numbers to mean anything — whether the load generator or the gateway is the bottleneck at high N, and whether dry-run workers were used, since those measure how well the gateway feeds N backends rather than how much GPU throughput N GPUs provide.
+- [x] Benchmarks show throughput improvement with multiple workers. Both honesty conditions are met in the report rather than assumed: dry-run workers are used and labelled as measuring gateway fan-out rather than GPU throughput, and the bottleneck question is answered by experiment — splitting the same offered load across one, two, and four client groups moves the total by under 3%, so the ceiling is the gateway and not the harness. Behaviour under a worker killed mid-flight is covered separately by [K8S_SPLIT_VERIFICATION.md](docs/reports/K8S_SPLIT_VERIFICATION.md).
 - [ ] `/stats` reports per-worker in-flight counts and latency, which least-inflight and EWMA both need as their input signal.
 
 Expected outcome:
@@ -899,3 +899,23 @@ The optimal route is not to start with the hardest component. It is:
 9. Add C++/CUDA lower-level performance work after bottlenecks are measured.
 
 This sequencing lets every phase improve the project independently while keeping the architecture story coherent from single-node gateway to distributed inference serving.
+
+---
+
+## 9. Measured Limits
+
+Numbers that exist because something was run, not reasoned about. Both are
+specific to the benchmark host and a synthetic workload, so they are an
+operating envelope for that configuration rather than properties of the
+software.
+
+- **The gateway saturates near 184 req/s.** Adding client concurrency past that
+  point does not move the total, and neither does adding workers, so it is the
+  gateway process itself. This is the threshold above which scaling gateway
+  replicas matters more than scaling the worker pool — previously there was
+  nothing to set that from.
+- **`batch.max_batch_size` is a scaling ceiling, and its default hides it.** It
+  bounds concurrent inferences on the gateway regardless of pool size. At the
+  default of 8, four workers serve what one worker serves: 38 req/s against 153
+  with the limit raised. A deployment that scales its pool without touching this
+  gets nothing for the extra workers, and nothing in the system reports why.
