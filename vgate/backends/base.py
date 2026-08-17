@@ -14,6 +14,7 @@
 
 import asyncio
 import os
+import threading
 import time
 from typing import Any, AsyncIterator, Dict, List, Protocol, runtime_checkable
 
@@ -24,12 +25,41 @@ from vgate.config import ModelConfig
 # compute cost to amortize. Unset (0) by default, so it never affects tests.
 _DRYRUN_LATENCY_MS = float(os.getenv("VGATE_DRYRUN_SIMULATED_LATENCY_MS", "0"))
 
+# Optional synthetic capacity limit, used only by benchmarks/bench_scaling.py.
+#
+# A GPU worker is a bounded resource: past some point more concurrent requests
+# queue rather than run. The dry-run backend has no such bound -- it sleeps,
+# and the worker runs those sleeps on an executor whose size comes from the
+# machine's core count. That makes a scaling measurement meaningless in two
+# ways. A single worker absorbs everything the load generator sends until the
+# executor fills, so 1 worker and 4 workers look identical; and the point where
+# it does fill depends on the CPU of whoever ran it, so a checked-in number
+# cannot be reproduced elsewhere.
+#
+# Setting this gives each worker process a declared capacity of N concurrent
+# generations, standing in for the bound a GPU imposes. Combined with the
+# latency knob it makes per-worker throughput exactly N/latency, which is a
+# property of the experiment rather than of the host.
+#
+# Unset (0) by default: never applied to vLLM/SGLang, never active in tests.
+_DRYRUN_MAX_CONCURRENCY = int(os.getenv("VGATE_DRYRUN_MAX_CONCURRENCY", "0"))
+_dryrun_capacity = (
+    threading.Semaphore(_DRYRUN_MAX_CONCURRENCY) if _DRYRUN_MAX_CONCURRENCY > 0 else None
+)
+
 
 def _simulate_batch_compute(sampling_params: Any) -> None:
     if _DRYRUN_LATENCY_MS <= 0:
         return
     max_tokens = sampling_params.get("max_tokens", 0) if isinstance(sampling_params, dict) else 0
-    time.sleep((_DRYRUN_LATENCY_MS + max_tokens * 2) / 1000.0)
+    duration = (_DRYRUN_LATENCY_MS + max_tokens * 2) / 1000.0
+    # threading, not asyncio: generate() is called from the worker's executor
+    # thread, not from the event loop.
+    if _dryrun_capacity is None:
+        time.sleep(duration)
+        return
+    with _dryrun_capacity:
+        time.sleep(duration)
 
 
 @runtime_checkable

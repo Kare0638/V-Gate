@@ -9,7 +9,9 @@
 
 The gateway tier is implemented — an OpenAI-shaped Chat Completions subset with streaming, dynamic micro-batching, result caching, observability, security, benchmarking, and container/Kubernetes deployment artifacts. The [vLLM](https://github.com/vllm-project/vllm) path has been exercised against a live GPU; the [SGLang](https://github.com/sgl-project/sglang) path is currently a unit-tested non-streaming adapter and has not yet been validated against a live SGLang engine.
 
-**Multi-worker serving runs, but has not been benchmarked.** Inference happens in separate `role: worker` processes; the gateway routes across them round-robin, probes their health in the background, removes failing workers from rotation, and lets them rejoin once they recover. A killed worker does not fail requests — traffic shifts to the survivors, and `503` with `Retry-After` is returned only when every worker is down. What is missing is the evidence: no 1-vs-N throughput or tail-latency measurement exists yet, and routing is round-robin only (least-inflight and EWMA are [Phase 4](ROADMAP.md#phase-4-multi-worker-serving)). Streaming through a worker returns 501. Multimodal requests are a separate planned milestone. Live-GPU validation has been performed on one NVIDIA GeForce RTX 3060 Laptop GPU with 6GB VRAM; no RTX 4060 or multi-GPU validation is claimed.
+**Multi-worker serving is measured: 2.00x at two workers, 3.89x at four** ([scaling.md](benchmarks/results/scaling.md)). Inference happens in separate `role: worker` processes whose membership the gateway discovers from DNS; it routes across them round-robin, probes their health in the background, removes failing workers from rotation, and lets them rejoin once they recover. A killed worker does not fail requests — traffic shifts to the survivors, and `503` with `Retry-After` is returned only when every worker is down.
+
+Two limits that measurement made concrete rather than theoretical. The gateway itself saturates near **180 req/s** on the benchmark host — quadrupling independent client processes and offered concurrency moves the total by 2% — so past that point a bigger pool is capacity it cannot hand out. The cause is not CPU (the gateway sits at 0.6 of one core): `RemoteBackend` makes a **synchronous** HTTP call through `run_in_executor`, so outbound concurrency is capped by the default thread pool, `min(32, cpu_count + 4)`. Halving the generation cost nearly doubles the ceiling, which is what identifies it; an async client would remove that limit and leave the event-loop ceiling near 290 req/s. And `batch.max_batch_size` caps concurrent inferences on the gateway regardless of pool size: **left at its default of 8, four workers serve 74 req/s where they could serve 153**, and nothing reports why. Routing is round-robin only (least-inflight and EWMA are [Phase 4](ROADMAP.md#phase-4-multi-worker-serving)). Streaming through a worker returns 501. Multimodal requests are a separate planned milestone. Live-GPU validation has been performed on one NVIDIA GeForce RTX 3060 Laptop GPU with 6GB VRAM; no RTX 4060 or multi-GPU validation is claimed.
 
 ## Validated Evidence
 
@@ -19,6 +21,8 @@ The evidence below is a measured snapshot of the current serving path. The vLLM 
 |------|----------|-------|
 | **vLLM live GPU** | [`Qwen/Qwen2.5-1.5B-Instruct-AWQ`](benchmarks/results/vllm_baseline.md) via vLLM 0.26 on an RTX 3060 Laptop GPU: **294.09 generated tokens/s**, **6.47 requests/s**, **1.5264s p95 latency** | 40 requests at concurrency 8, from one small benchmark run; a directional baseline, not a capacity claim |
 | **SGLang adapter** | Non-streaming adapter behavior is covered by [`tests/test_backends.py`](tests/test_backends.py) | Unit tests use stubs; no live-engine or live-GPU SGLang benchmark is claimed |
+| **1-vs-N worker scaling** | [2.00x at 2 workers, 3.89x at 4](benchmarks/results/scaling.md), 96–99% of ideal, 3 repeats per point, 0 failures across all 18 runs | Dry-run workers with declared capacity: measures how well one gateway feeds N backends, **not** GPU throughput |
+| **Split topology on Kubernetes** | [3-node kind cluster](docs/reports/K8S_SPLIT_VERIFICATION.md): 19 assertions covering per-pod routing, `kubectl scale` 1↔3↔0, and failover under live traffic | Dry-run workers; the GPU overlay is validated but unexercised |
 
 ---
 
@@ -85,7 +89,7 @@ flowchart LR
 
 The boundary: the gateway owns admission control, deduplication, caching, and observability; a worker owns one engine instance and nothing else. Because `RemoteBackend` implements the same `InferenceBackend` protocol as the local engines, the batcher does not know whether inference is local or remote — adding the worker hop required no change to it.
 
-That split is what makes 1-vs-N worker scaling, health-aware failover, and independent GPU-node placement measurable rather than hypothetical. Failover and scaling are now exercised on a live cluster; **throughput is still not measured**, and routing remains round-robin. The 1-vs-N benchmark is the next step.
+That split is what makes 1-vs-N worker scaling, health-aware failover, and independent GPU-node placement measurable rather than hypothetical — and they are now measured: [scaling.md](benchmarks/results/scaling.md) for throughput, [K8S_SPLIT_VERIFICATION.md](docs/reports/K8S_SPLIT_VERIFICATION.md) for failover on a live cluster. Routing is still round-robin; the scaling harness is what makes a load-aware policy falsifiable.
 
 ---
 
@@ -941,10 +945,10 @@ than guessed at.
 headless Service on each health-check tick, so `kubectl scale` reaches it and
 the worker count is now a variable the steps below can vary.
 
-**2. Measure 1 worker vs N.** The central claim of the architecture — that a
-pool serves better than a single process — has never been measured. Throughput,
-p50/p95/p99, and behaviour under injected worker failure, at N = 1, 2, 4. This
-is also the harness step 4 needs.
+**2. Measure 1 worker vs N.** — **done.** [scaling.md](benchmarks/results/scaling.md):
+2.00x at two workers and 3.89x at four, against a gateway that saturates near
+180 req/s on this host — a thread-pool limit rather than a CPU one, which
+is the number step 4 will be measured against.
 
 **3. Backpressure: bounded queues, request deadlines, stable overload
 responses.** Priority 1 below has stayed unstarted while Priorities 2 and 3
@@ -992,7 +996,7 @@ work that is now overdue rather than upcoming.
 - [~] Add worker circuit breakers, draining, and recovery on rejoin — failing workers leave rotation and rejoin after sustained health; there is no in-flight draining
 - [x] Redefine `RequestBatcher` as dedup/admission/fan-out so routing decisions are per request rather than per batch
 - [x] Replace the static endpoint list with headless-Service DNS discovery, so worker membership follows the cluster
-- [ ] Measure 1-worker vs N-worker throughput, tail latency, and behavior under injected worker failure
+- [x] Measure 1-worker vs N-worker throughput and tail latency — [scaling.md](benchmarks/results/scaling.md); behaviour under injected worker failure is covered separately by [K8S_SPLIT_VERIFICATION.md](docs/reports/K8S_SPLIT_VERIFICATION.md)
 - [ ] Route on prompt-prefix affinity so a worker can reuse its KV cache across related requests
 
 `[~]` marks partial items. Least-inflight and EWMA are unblocked — `RequestBatcher` now fans out, so each request is routed on its own and a load-aware policy can act on the signal it reads. What is missing is not the seam but the evidence: under uniform load these policies are indistinguishable from round-robin, so implementing one without the 1-vs-N harness would produce a change nobody can show is an improvement.
