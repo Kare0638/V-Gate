@@ -381,7 +381,11 @@ class TestSecurityConfigModels:
         config = SecurityConfig()
         assert config.enabled is False
         assert config.api_keys == []
-        assert config.exempt_paths == ["/health", "/metrics"]
+        # /ready joins the exempt set because kubelet probes carry no bearer
+        # token: a gated readiness endpoint never passes, and the pod is then
+        # never routed to. The exemption is safe -- /ready reports only whether
+        # this process has become able to serve.
+        assert config.exempt_paths == ["/health", "/ready", "/metrics"]
 
     def test_security_config_with_api_keys(self):
         """Test SecurityConfig with API keys."""

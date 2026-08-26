@@ -178,4 +178,5 @@ security:
   # Paths exempt from authentication / 免认证路径
   exempt_paths:
     - "/health"
+    - "/ready"
     - "/metrics"

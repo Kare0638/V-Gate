@@ -81,15 +81,29 @@ spec:
                   key: api-keys-json
             - name: VGATE_CONFIG_PATH
               value: "/app/config.yaml"
+          # Startup and readiness ask "can this serve"; liveness asks "is the
+          # process alive". They are deliberately different endpoints.
+          #
+          # /ready is false until the gateway has had a usable worker at least
+          # once, which is what stops Kubernetes routing to a gateway whose
+          # pool has not come up yet -- previously it passed on /health, which
+          # returns ok unconditionally, and the first requests could only be
+          # answered with 503.
+          #
+          # /ready latches, so a gateway that later loses every worker stays
+          # Ready and reports the loss as 503 with Retry-After. Failing
+          # readiness there would remove every replica from the Service at
+          # once -- they share one pool -- turning a retryable 503 into a
+          # connection refused with no retry hint and nothing gained.
           startupProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: http
             failureThreshold: 10
             periodSeconds: 3
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: http
             periodSeconds: 10
           livenessProbe:

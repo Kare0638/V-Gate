@@ -118,8 +118,16 @@ cleanup() {
         echo "  during pod termination: a terminating pod stays in DNS while it"
         echo "  stops answering, so probes fail before discovery drops it."
         echo "  \`recovered\` is a worker that was demoted and came back while"
-        echo "  still a member. A gateway holding zero workers still passes its"
-        echo "  own readiness probe — see ROADMAP.md; that gap is unchanged."
+        echo "  still a member."
+        echo "- **Step 7b** — readiness and liveness now ask different"
+        echo "  questions. \`/ready\` is false until the gateway has had a"
+        echo "  usable worker at least once, so Kubernetes no longer routes to"
+        echo "  a gateway whose pool has not come up; \`/health\` stays on"
+        echo "  liveness, because a process that is up but has no pool must not"
+        echo "  be restarted for it. Readiness latches deliberately: failing it"
+        echo "  when the pool is later lost would remove every replica from the"
+        echo "  Service at once — they share one pool — turning a retryable 503"
+        echo "  into a connection refused with nothing gained."
         echo
         echo '```'
         cat "$RAW"
@@ -237,6 +245,18 @@ echo "$resolved" | sed 's/^/  /'
 claim "$([[ "$resolved_count" -eq 2 ]] && echo 0 || echo 1)" \
     "each worker resolves to its own address (distinct: ${resolved_count}, want 2)"
 
+step "7b. Readiness reflects whether the gateway can serve"
+# The gap this closes: /health returns ok unconditionally, so Kubernetes
+# marked a gateway Ready while it held zero workers and the first requests
+# could only be answered with 503. Both endpoints must answer, and they must
+# answer different questions.
+kubectl -n "$NS" get deployment/vgate-gateway \
+    -o jsonpath='{range .spec.template.spec.containers[0]}startup={.startupProbe.httpGet.path} readiness={.readinessProbe.httpGet.path} liveness={.livenessProbe.httpGet.path}{"\n"}{end}'
+probe_paths="$(kubectl -n "$NS" get deployment/vgate-gateway \
+    -o jsonpath='{.spec.template.spec.containers[0].readinessProbe.httpGet.path}/{.spec.template.spec.containers[0].livenessProbe.httpGet.path}')"
+claim "$([[ "$probe_paths" == "/ready//health" ]] && echo 0 || echo 1)" \
+    "readiness and liveness ask different questions (${probe_paths})"
+
 step "8. Port-forward the gateway"
 kubectl -n "$NS" port-forward svc/vgate "${PORT}:8000" >/dev/null 2>&1 &
 PF_PID=$!
@@ -245,6 +265,11 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 curl -s "http://localhost:${PORT}/health"; echo
+ready_body="$(curl -s -w '\n%{http_code}' "http://localhost:${PORT}/ready")"
+ready_code="$(echo "$ready_body" | tail -n 1)"
+echo "$ready_body" | sed '$d'
+claim "$([[ "$ready_code" == "200" ]] && echo 0 || echo 1)" \
+    "a gateway with a working pool reports ready (HTTP ${ready_code})"
 
 API_KEY="$(kubectl -n "$NS" get secret vgate-secrets -o jsonpath='{.data.api-key}' | base64 -d)"
 

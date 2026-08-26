@@ -64,4 +64,5 @@ data:
         window_seconds: 60
       exempt_paths:
         - "/health"
+        - "/ready"
         - "/metrics"

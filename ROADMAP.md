@@ -40,7 +40,7 @@ Current gaps:
 - Upgrading a cluster that ran the pre-split manifests requires `k8s/migrate-from-monolith.sh`; `kubectl apply` alone leaves the old `Deployment/vgate` behind the new `Service/vgate` and most traffic fails. Reproduced and fixed in [K8S_MIGRATION_VERIFICATION.md](docs/reports/K8S_MIGRATION_VERIFICATION.md). The general mechanism — `kubectl apply --prune` — is still Alpha, so any future rename of a manifest object has the same hazard and needs the same kind of explicit migration step.
 - Container images are referenced by version tag (`vgate:0.3.2-cpu`, `vgate:0.3.2-gpu`), not by digest. A tag is a convention the registry does not enforce, so it is weaker than it looks; digest pinning plus a release process that produces them is not done.
 - DNS resolution is not interruptible. Discovery runs `getaddrinfo` on a dedicated single-thread executor with a bounded await, so a hung resolver cannot stall health probing or take a thread from the default executor that `RequestBatcher` uses for inference. It still cannot be cancelled: abandoning the future leaves the OS call blocked until it returns on its own, so membership refresh is paused rather than broken while that happens. Making resolution genuinely interruptible needs an async resolver (`aiodns` or similar), which is a new dependency and is not taken on yet.
-- The gateway's readiness probe does not reflect whether it can serve. `/health` returns `ok` unconditionally, without consulting the worker registry, so Kubernetes marks a gateway Ready and routes traffic to it while it holds zero healthy workers — those requests get `503`. The kind run makes this visible: both workers record an extra removed/recovered pair at cold start, because the gateway begins probing before any worker is up. Splitting liveness from readiness (a `/ready` that fails when no worker is in rotation) is not done, and cannot simply reuse `/health`, which the worker health checker polls with different intent.
+- Readiness is a startup gate, not a continuous dependency check, and that is a deliberate narrowing of what this document previously specified. `/ready` is false until the gateway has had a usable worker at least once, which closes the cold start where Kubernetes routed to a gateway holding zero workers; `/health` stays on liveness, since a process that is up but has no pool must not be restarted for it. The earlier plan here — "a `/ready` that fails when no worker is in rotation" — was wrong: every replica shares one worker pool, so failing readiness on pool loss removes all of them from the Service simultaneously, and clients get a connection refused instead of `503` with `Retry-After`. Less information, and no replica is better placed to take over.
 - Backpressure is incomplete. A request deadline exists (`reliability.request_timeout_seconds`, default 120s) and bounds the admission wait as well as the inference, so the queue is bounded in *time*; it is not bounded in *length*, and there is no load shedding, so an overloaded gateway still accepts work it will only ever answer with 504. Circuit breaking beyond health-based worker removal is also not done.
 - The embedding endpoint is currently a mock MVP implementation.
 - C++/CUDA lower-level performance work (Phase 7-8) is deliberately gated behind measured bottlenecks and has not been started.
@@ -391,11 +391,12 @@ Tasks:
 5. [~] Define 429/503/504 behavior. 429 is per-key rate limiting, 503 with `Retry-After` is "no healthy workers", and 504 is a request that missed its own deadline. What is missing is 503 for shedding, which needs a bounded queue to shed from.
 6. Improve graceful shutdown.
 7. Add overload metrics.
-8. Split readiness from liveness on the gateway. `/health` currently returns `ok`
-   without consulting the worker registry, so Kubernetes marks a gateway Ready
-   while it holds zero healthy workers and routes traffic that can only return
-   `503`. It cannot simply be changed in place: the worker health checker polls
-   the same endpoint with different intent.
+8. [x] Split readiness from liveness on the gateway. `/ready` reports whether
+   this process has become able to serve and backs the startup and readiness
+   probes; `/health` keeps answering "the process is alive" and backs liveness
+   and the gateway's own worker probing. Readiness latches once satisfied --
+   see the positioning note above for why a continuous check on the pool would
+   make a partial outage into a total one.
 9. Drain in-flight work on worker shutdown. The gateway addresses worker pods by
    DNS name rather than through a Service, so removing a pod from a Service's
    endpoints — the mechanism Kubernetes normally uses to stop traffic during
