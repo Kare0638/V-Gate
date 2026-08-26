@@ -5,6 +5,13 @@
 > Goal: evolve from a single-node LLM gateway into distributed inference serving with reliable behavior, observability, routing, and measurable performance evidence.
 >
 > Strategy: fix correctness and measurement first, then add production reliability, then distributed serving, and only then lower-level performance modules. Jumping directly to C++/CUDA would make the system harder to evaluate unless the main request path, benchmark story, and failure model are already solid.
+>
+> **Status: this document outlives the current iteration.** What has been built
+> is a distributed inference gateway that is deployed, verified by assertion on
+> a live cluster, and measured. Everything still open here is recorded with the
+> reason it is open — see [README.md](README.md)'s *Scope of this iteration* —
+> and none of it is load-bearing for that claim. Phases below are areas of
+> work, not a schedule, and they were not executed in order.
 
 ---
 

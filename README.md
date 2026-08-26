@@ -40,6 +40,9 @@ The evidence below is a measured snapshot of the current serving path. The vLLM 
 | **Built-in Benchmarking** | Implemented | Concurrent load tools, report generation, and `/v1/benchmark` |
 | **Observability** | Implemented | Prometheus metrics, structured logs, and optional OpenTelemetry tracing |
 | **Security** | Implemented | Bearer API keys and per-key sliding-window rate limits |
+| **Request Deadlines** | Implemented | `reliability.request_timeout_seconds` bounds a request end to end — the wait for an admission permit as well as the inference — and returns `504` |
+| **Backpressure** | Partial | The queue is bounded in *time* by the deadline above, not in *length*: nothing rejects the thousandth waiter, and there is no load shedding |
+| **Readiness vs Liveness** | Implemented | `/ready` gates startup on having had a usable worker; `/health` answers "the process is alive". Readiness latches, so pool loss returns `503` rather than emptying the Service |
 | **Configuration as Code** | Implemented | YAML configuration with environment-variable overrides |
 | **Container Deployment** | Implemented | Docker CPU/GPU targets, Compose stack, and Kubernetes manifests deploying the gateway and workers as separate components |
 | **Python Client SDK** | Implemented | Sync/async clients with deterministic streaming cleanup |
@@ -393,9 +396,10 @@ mid-flight failure". Other runs came out 77/77 and 81/81 with no failure at
 all; whether the window catches a request in flight is timing. Closing it needs
 draining, listed as a gap in [ROADMAP.md](ROADMAP.md).
 
-One gap the run exposed: the gateway passes its readiness probe while holding
-zero healthy workers, because `/health` never consults the registry. See
-[ROADMAP.md](ROADMAP.md).
+One gap the run exposed, since fixed: the gateway passed its readiness probe
+while holding zero healthy workers, because `/health` never consulted the
+registry. `/ready` now gates startup on having had a usable worker, and the run
+asserts that readiness and liveness point at different endpoints.
 
 Both live scripts **assert** rather than print. Every claim they make is a
 `[PASS]`/`[FAIL]` line and the script exits non-zero on any failure, so a wrong
@@ -973,12 +977,36 @@ GPU running a 1.5B model, so tensor parallelism, KV-cache pressure, and
 multi-GPU scheduling are entirely untested. Renting two A100s for a single
 run would replace an assumption with a measurement.
 
+### Scope of this iteration
+
+The work below is **not planned for this iteration**, and each item says why
+rather than being left to read as "not got to yet". The distinction matters:
+a gap with a known shape and a known reason is a decision, and one without is
+an oversight.
+
+The line was drawn where the next step stopped being *code* and started being
+either a multi-part rewrite or a hardware purchase:
+
+| Not done | Why not |
+|---|---|
+| Bounded queues and load shedding | Only meaningful together with unified streaming admission — shedding non-streaming traffic while streams enter unchecked locks the front door and leaves the back one open. That is a sequence of changes, not one. |
+| Unified streaming admission | `_stream_chat_completion` calls the backend directly, so folding it in touches the cache, dedup, and admission paths at once. |
+| Prompt-prefix affinity routing | Needs a load generator that can produce *heterogeneous* traffic; under the uniform load this repo can generate, it is indistinguishable from round-robin and therefore unfalsifiable. |
+| Async `RemoteBackend` | Measured as the cause of the 180 req/s gateway ceiling, so its value is known — but it changes the transport for every worker call and belongs with the backpressure work, not ahead of it. |
+| Multi-GPU validation | Not a code problem. Needs rented hardware; nothing in the repo claims multi-GPU behaviour until it exists. |
+| In-flight draining on worker shutdown | Requires a worker to fail its own `/health` while still serving what it accepted — application state the current health endpoint does not carry. |
+
+What *is* finished is a distributed inference gateway that has been deployed,
+verified by assertion on a live cluster, and measured. The remaining items make
+it better under overload; none of them are load-bearing for that claim.
+
 ### Priority 1: Backpressure And Reliability
 
 Originally framed as a prerequisite — a single node should fail predictably
 before N nodes do. That ordering was not followed: the split, the routing
-rewrite, and the Kubernetes work all landed first, so this section describes
-work that is now overdue rather than upcoming.
+rewrite, and the Kubernetes work all landed first. Two items landed late
+(a request deadline, and readiness that reflects capability); the rest is
+future work, scoped above.
 
 - [ ] Unify streaming and non-streaming admission control
 - [ ] Add bounded queues, deadlines, and stable overload responses
