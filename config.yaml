@@ -82,6 +82,25 @@ model:
   enforce_eager: true
   engine_type: "vllm"  # "vllm" or "sglang" / 推理后端引擎
 
+# Reliability / 可靠性
+#
+# request_timeout_seconds bounds a single client request end to end, covering
+# the wait for an admission permit as well as the inference. Without it a
+# request queues indefinitely -- the batcher has always supported a deadline,
+# but nothing supplied one.
+#
+# It intentionally matches worker.timeout_seconds. When the gateway forwards to
+# workers, the worker's own timeout usually fires first and gives a more
+# specific error; what this adds is a bound on the queue wait, which starts
+# before the request is ever sent and so is not covered there.
+#
+# Exceeding it returns 504 (this request did not finish), not 503 (the service
+# cannot take work) -- clients act on those differently. Set to 0 to disable.
+#
+# Bounded queues and load shedding are NOT implemented; see ROADMAP.md Phase 3.
+reliability:
+  request_timeout_seconds: 120.0
+
 # Request batching / 请求批处理
 batch:
   # Maximum concurrent inferences (admission control).

@@ -121,6 +121,35 @@ class ModelConfig(BaseModel):
         return v
 
 
+class ReliabilityConfig(BaseModel):
+    """
+    How the service behaves when it cannot keep up.
+
+    Only the request deadline exists so far. Bounded queues and load shedding
+    belong here too and are not implemented -- see ROADMAP.md Phase 3.
+    """
+    # Upper bound on how long one client request may take, covering BOTH the
+    # wait for an admission permit and the inference itself. Without it a
+    # request waits indefinitely: RequestBatcher.submit() has always accepted a
+    # timeout, but nothing passed one, so the queue was unbounded in time as
+    # well as in length.
+    #
+    # Defaults to worker.timeout_seconds. For a gateway forwarding to workers
+    # the worker's own timeout usually fires first and produces a more specific
+    # error; what this adds is a bound on the queue wait, which the worker
+    # timeout does not cover because it only starts once the request is sent.
+    #
+    # Set to 0 to disable, restoring the previous unbounded behaviour.
+    request_timeout_seconds: float = 120.0
+
+    @field_validator("request_timeout_seconds")
+    @classmethod
+    def validate_timeout(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("request_timeout_seconds must be >= 0 (0 disables)")
+        return v
+
+
 class BatchConfig(BaseModel):
     """Request batching configuration."""
     max_batch_size: int = 8
@@ -259,6 +288,7 @@ class VGateConfig(BaseSettings):
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
     batch: BatchConfig = Field(default_factory=BatchConfig)
+    reliability: ReliabilityConfig = Field(default_factory=ReliabilityConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
