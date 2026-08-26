@@ -285,6 +285,69 @@ def gateway_only() -> None:
         )
 
 
+# Latched once this process has been able to serve at least once. Readiness
+# gates startup, not ongoing dependency health -- see /ready.
+_has_been_ready = False
+
+
+def _readiness() -> tuple:
+    """(ready, reason). Latches: once ready, this process stays ready."""
+    global _has_been_ready
+    if _has_been_ready:
+        return True, "ready"
+
+    if IS_WORKER:
+        if getattr(worker_api, "_engine", None) is None:
+            return False, "engine not initialized"
+    elif batcher is None:
+        return False, "batcher not started"
+    elif getattr(engine, "is_remote", False):
+        # A discovering gateway starts with an empty pool and admits workers
+        # only after a probe proves them usable, so this is false for the first
+        # few seconds of a cold start -- which is the window this exists to
+        # close.
+        registry = engine.backend.registry
+        if not registry.has_healthy():
+            known = len(registry.endpoints())
+            return False, (
+                f"no healthy worker yet ({known} known)" if known
+                else "no workers discovered yet"
+            )
+
+    _has_been_ready = True
+    return True, "ready"
+
+
+@app.get("/ready", summary="Readiness Check")
+async def readiness_check(response: Response):
+    """
+    Whether this process has become able to serve. Point Kubernetes'
+    readinessProbe and startupProbe here; leave livenessProbe on /health.
+
+    Readiness LATCHES on purpose, and this is the part worth reading.
+
+    The obvious design -- fail readiness whenever no worker is in rotation --
+    is the "readiness gating on a downstream dependency" antipattern, and this
+    topology shows exactly why. Every gateway replica shares one worker pool,
+    so losing the pool makes *all* of them unready at once. Kubernetes then
+    removes every one from the Service, the Service has no endpoints, and
+    clients get a connection refused instead of `503` with `Retry-After`. That
+    is strictly less useful: it carries no retry hint and looks like the
+    service is gone rather than temporarily out of capacity. No replica is in a
+    better position either, so nothing is gained in exchange.
+
+    What actually needed fixing was the cold start: the gateway passed its
+    probe before any worker was up, so the first requests could only be
+    answered with 503. That is a startup condition, and a startup gate is what
+    this is. Once the pool has worked once, losing it is reported through the
+    request path, where the response can say `Retry-After`.
+    """
+    ready, reason = _readiness()
+    if not ready:
+        response.status_code = 503
+    return {"ready": ready, "reason": reason, "role": config.role}
+
+
 @app.get("/health", summary="Health Check")
 async def health_check():
     """

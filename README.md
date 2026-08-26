@@ -984,7 +984,7 @@ work that is now overdue rather than upcoming.
 - [ ] Add bounded queues, deadlines, and stable overload responses
 - [ ] Abort backend work on client cancellation instead of computing orphaned tokens
 - [~] Add request timeouts and per-backend error classification — a request deadline (`reliability.request_timeout_seconds`, default 120s) now bounds the admission wait as well as the inference, returning `504`; per-backend error classification exists for worker calls (connect vs mid-flight vs non-200) but not as a general scheme
-- [ ] Make gateway readiness reflect whether it can serve — `/health` returns `ok` without consulting the worker registry, so Kubernetes routes traffic to a gateway holding zero healthy workers and those requests get `503`
+- [x] Make gateway readiness reflect whether it can serve — `/ready` gates startup on having had a usable worker, `/health` stays on liveness; readiness latches on purpose, because failing it on pool loss would empty the Service and downgrade a retryable `503` to a connection refused
 - [ ] Drain in-flight work on worker shutdown — the gateway addresses pods directly, so removing a pod from a Service's endpoints does not stop traffic to it; a terminating worker must fail its own `/health` while still finishing what it has
 
 ### Priority 2: Distributed Inference Serving

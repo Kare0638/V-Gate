@@ -221,7 +221,7 @@ class SecurityConfig(BaseModel):
     enabled: bool = False  # Disabled by default for development
     api_keys: list[APIKeyConfig] = Field(default_factory=list)
     rate_limiting: RateLimitConfig = Field(default_factory=RateLimitConfig)
-    exempt_paths: list[str] = Field(default_factory=lambda: ["/health", "/metrics"])
+    exempt_paths: list[str] = Field(default_factory=lambda: ["/health", "/ready", "/metrics"])
 
 
 class YamlConfigSettingsSource(PydanticBaseSettingsSource):
