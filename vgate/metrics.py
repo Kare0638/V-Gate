@@ -119,6 +119,12 @@ ABANDONED_INFERENCES = _safe_metric(
     "Queued inferences cancelled because every waiting caller left before admission"
 )
 
+REQUEST_TIMEOUTS = _safe_metric(
+    Counter,
+    "vgate_request_timeouts_total",
+    "Client requests that exceeded reliability.request_timeout_seconds"
+)
+
 TOTAL_BATCHES = _safe_metric(
     Counter,
     "vgate_batches_total",

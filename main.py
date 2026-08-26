@@ -28,7 +28,7 @@ from vgate.batcher import RequestBatcher
 from vgate.logging_config import setup_logging, get_logger
 from vgate.metrics import (
     REQUEST_COUNT, REQUEST_LATENCY, REQUEST_IN_PROGRESS,
-    TOKENS_GENERATED, INFERENCE_ERRORS,
+    TOKENS_GENERATED, INFERENCE_ERRORS, REQUEST_TIMEOUTS,
     STREAM_TTFT, STREAM_TPOT, STREAM_DURATION, STREAM_TOKENS, STREAM_REQUESTS,
     init_app_info
 )
@@ -445,11 +445,17 @@ async def create_chat_completion(request: ChatCompletionRequest):
         prompt = messages_to_prompt(request.messages)
 
         # Submit to batcher for batched processing
+        # A deadline covering the admission wait as well as the inference.
+        # submit() has always accepted one; nothing passed it, so a request
+        # could wait indefinitely for a permit and no configuration could stop
+        # it. 0 disables, restoring that behaviour explicitly.
+        timeout = config.reliability.request_timeout_seconds or None
         response = await batcher.submit(
             prompt,
             max_tokens=request.max_tokens,
             temperature=request.temperature,
-            top_p=request.top_p
+            top_p=request.top_p,
+            timeout=timeout,
         )
 
         # Adapt engine's response to OpenAI-like format
@@ -474,6 +480,32 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 "total_tokens": response.get("total_tokens", 0) + response.get("prompt_tokens", 0),
             },
         }
+    except asyncio.TimeoutError:
+        # 504, not 503. The two say different things and clients act on them
+        # differently: 503 with Retry-After means "capacity is unavailable,
+        # come back", while 504 means this request was accepted and the work
+        # behind it did not finish in time. Retry-After is deliberately absent
+        # -- nothing here knows that retrying sooner would help.
+        #
+        # The inference itself is not necessarily cancelled. If no other caller
+        # is waiting on it and it has not started, it is abandoned; if it has
+        # started it runs to completion, because a thread-pool call cannot be
+        # interrupted and its result still populates the cache. See
+        # RequestBatcher's abandonment policy.
+        REQUEST_TIMEOUTS.inc()
+        app_logger.warning(
+            "Request exceeded its deadline",
+            extra={"extra_data": {
+                "timeout_seconds": config.reliability.request_timeout_seconds,
+            }}
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Request did not complete within "
+                f"{config.reliability.request_timeout_seconds}s"
+            ),
+        )
     except NoHealthyWorkersError as e:
         # Every worker is out of rotation. This is capacity unavailable, not a
         # bad request or a gateway bug, so it is a 503 with Retry-After rather
