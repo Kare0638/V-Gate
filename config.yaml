@@ -82,6 +82,20 @@ model:
   enforce_eager: true
   engine_type: "vllm"  # "vllm" or "sglang" / 推理后端引擎
 
+  # Shard the model across this many GPUs. 1 keeps it on one device.
+  #
+  # Splitting the weights frees device memory, and that memory becomes KV
+  # cache -- which is what bounds concurrency once a model is loaded. So the
+  # effect is not only "the model fits".
+  #
+  # The cost is an all-reduce after every layer, on the critical path of every
+  # token. That makes the GPU-to-GPU link matter more than raw GPU speed
+  # (NVLink is roughly 10x PCIe), and it means a SINGLE request usually gets
+  # slower even as total throughput rises. Measure both before concluding.
+  #
+  # See docs/runbooks/MULTI_GPU_BENCHMARK.md.
+  tensor_parallel_size: 1
+
 # Reliability / 可靠性
 #
 # request_timeout_seconds bounds a single client request end to end, covering

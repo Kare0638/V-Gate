@@ -69,7 +69,12 @@ class VLLMBackend:
         # engine calls back to the loop that owns the engine.
         self._loop = asyncio.get_event_loop()
 
-        print(f"Loading {model_config.model_id} with {model_config.quantization} quantization (vLLM AsyncLLMEngine)...")
+        print(
+            f"Loading {model_config.model_id} "
+            f"(quantization={model_config.quantization}, "
+            f"tensor_parallel_size={model_config.tensor_parallel_size}) "
+            "with vLLM AsyncLLMEngine..."
+        )
         engine_args = AsyncEngineArgs(
             model=model_config.model_id,
             quantization=model_config.quantization,
@@ -77,6 +82,10 @@ class VLLMBackend:
             max_model_len=model_config.max_model_len,
             enforce_eager=model_config.enforce_eager,
             trust_remote_code=model_config.trust_remote_code,
+            # 1 is a single device; above that vLLM shards the model and adds
+            # an all-reduce per layer, so this is the flag that decides whether
+            # the interconnect is on the critical path.
+            tensor_parallel_size=model_config.tensor_parallel_size,
             # AsyncEngineArgs defaults this to False already, unlike the
             # offline LLM() class — kept explicit as a guard against that
             # default flipping again (see vllm_backend.py history: this bit

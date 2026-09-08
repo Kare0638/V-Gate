@@ -993,7 +993,7 @@ either a multi-part rewrite or a hardware purchase:
 | Unified streaming admission | `_stream_chat_completion` calls the backend directly, so folding it in touches the cache, dedup, and admission paths at once. |
 | Prompt-prefix affinity routing | Needs a load generator that can produce *heterogeneous* traffic; under the uniform load this repo can generate, it is indistinguishable from round-robin and therefore unfalsifiable. |
 | Async `RemoteBackend` | Measured as the cause of the 180 req/s gateway ceiling, so its value is known — but it changes the transport for every worker call and belongs with the backpressure work, not ahead of it. |
-| Multi-GPU validation | Not a code problem. Needs rented hardware; nothing in the repo claims multi-GPU behaviour until it exists. |
+| Multi-GPU validation | Not a code problem. Needs rented hardware; nothing in the repo claims multi-GPU behaviour until it exists. The harness and procedure are ready — [`bench_tensor_parallel.py`](benchmarks/bench_tensor_parallel.py) and [the runbook](docs/runbooks/MULTI_GPU_BENCHMARK.md) — and self-test on CPU, so only the measurement is outstanding. |
 | In-flight draining on worker shutdown | Requires a worker to fail its own `/health` while still serving what it accepted — application state the current health endpoint does not carry. |
 
 What *is* finished is a distributed inference gateway that has been deployed,
