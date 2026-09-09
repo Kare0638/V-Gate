@@ -16,6 +16,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import json
 import time
@@ -100,6 +101,33 @@ async def lifespan(app: FastAPI):
         shutdown_tracing()
         app_logger.info("V-Gate worker stopped")
         return
+
+    # Size the default executor to the admission limit before anything uses it.
+    #
+    # RemoteBackend.generate is a synchronous httpx call dispatched through
+    # run_in_executor, so outbound concurrency is capped by that pool --
+    # min(32, cpu_count + 4) by default. Whenever that is smaller than the
+    # admission limit, the permit count is not what actually bounds the system
+    # and nothing reports the discrepancy.
+    #
+    # It is invisible until generations are slow. On a laptop with 100ms
+    # synthetic work the ceiling was ~180 req/s and looked like headroom; on
+    # two A100s generating 128 tokens of a 32B model, 32 threads over ~6s per
+    # request is 5.3 req/s -- and no number of GPUs moves it, because the
+    # gateway will not have more than 32 requests outstanding.
+    #
+    # A bigger pool is a bound, not a fix: threads blocked on HTTP are pure
+    # overhead, and an async client would remove them from the path entirely.
+    # That is recorded in ROADMAP.md.
+    if engine.is_remote:
+        outbound = max(config.batch.max_batch_size, 32)
+        asyncio.get_running_loop().set_default_executor(
+            ThreadPoolExecutor(max_workers=outbound, thread_name_prefix="vgate-out")
+        )
+        app_logger.info(
+            "Sized outbound executor to the admission limit",
+            extra={"extra_data": {"threads": outbound}},
+        )
 
     # Initialize the RequestBatcher (uses config defaults)
     batcher = RequestBatcher(engine=engine)
