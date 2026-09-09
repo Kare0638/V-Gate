@@ -203,6 +203,25 @@ async def _wait_healthy(url: str, timeout_s: float = 30.0) -> None:
     raise RuntimeError(f"{url} did not become healthy within {timeout_s}s")
 
 
+async def _wait_ready(url: str, timeout_s: float) -> None:
+    """Block until the gateway reports it can actually serve."""
+    deadline = time.monotonic() + timeout_s
+    async with aiohttp.ClientSession() as session:
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                async with session.get(
+                    f"{url}/ready", timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    if resp.status == 200:
+                        return
+                    last = (await resp.json()).get("reason")
+            except Exception as exc:
+                last = str(exc)
+            await asyncio.sleep(1.0)
+    raise RuntimeError(f"{url} not ready within {timeout_s}s: {last}")
+
+
 class Topology:
     """One gateway in front of N worker processes, torn down together."""
 
@@ -310,9 +329,16 @@ class Topology:
                 f"http://127.0.0.1:{WORKER_PORT_BASE + i}", worker_timeout
             )
         await _wait_healthy(self.base_url)
-        # Let the gateway's first health probe land, so the first measured
-        # request is not the one that discovers a worker.
-        await asyncio.sleep(1.0)
+        # Wait for the gateway to have ADMITTED a worker, not merely to be
+        # answering. A fixed sleep was not enough and produced a run where all
+        # 96 requests failed with "no healthy worker": the gateway starts
+        # alongside the workers, so during a multi-minute model load its probes
+        # fail and the worker is demoted, and re-admission then needs
+        # success_threshold consecutive probes after the load finishes.
+        #
+        # /ready is exactly this question -- it reports whether this gateway has
+        # had a usable worker -- so it is what to wait on.
+        await _wait_ready(self.base_url, 300.0 if self.engine else 30.0)
 
     async def __aexit__(self, *exc) -> None:
         await self._stop()
@@ -651,7 +677,23 @@ def format_report(
         # and the gap is what the gateway and the pool cost together.
         base_rows = [r["throughput_rps"] for r in runs
                      if r["workers"] == counts[0] and r["failures"] == 0]
-        per_worker_ideal = _median(base_rows) / counts[0] if base_rows else 0.0
+        if not base_rows:
+            # Every baseline run had failures, so there is nothing to compare
+            # against. Say so instead of dividing by zero -- and note that the
+            # rate those runs reported is the rate of FAILING, since throughput
+            # counts requests over wall time regardless of outcome.
+            failed = sum(r["failures"] for r in runs)
+            return (
+                "# 1-vs-N Worker Scaling\n\n"
+                f"**No usable data: {failed} request(s) failed across "
+                f"{len(runs)} run(s), including every run at the baseline "
+                f"worker count.**\n\n"
+                "Throughput is requests over wall time and counts failures in "
+                "the numerator, so the per-run rates printed during the sweep "
+                "describe how fast requests were rejected, not served. Check "
+                "the gateway log for the cause before re-running.\n"
+            )
+        per_worker_ideal = _median(base_rows) / counts[0]
     else:
         per_worker_ideal = args.capacity / (args.latency_ms / 1000.0)
 
