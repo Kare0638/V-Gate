@@ -203,23 +203,34 @@ async def _wait_healthy(url: str, timeout_s: float = 30.0) -> None:
     raise RuntimeError(f"{url} did not become healthy within {timeout_s}s")
 
 
-async def _wait_ready(url: str, timeout_s: float) -> None:
-    """Block until the gateway reports it can actually serve."""
+async def _wait_all_admitted(url: str, expected: int, timeout_s: float) -> None:
+    """
+    Block until the gateway has admitted every worker.
+
+    Not /ready, which answers "is there a usable worker" -- correct for
+    Kubernetes, insufficient for a measurement. Starting a sweep when one of
+    two workers is still pending produced an 80/16 request split and a
+    two-worker run that showed no speedup, because the second GPU sat idle for
+    most of it. Nothing in the numbers said so; only the distribution did.
+    """
     deadline = time.monotonic() + timeout_s
     async with aiohttp.ClientSession() as session:
-        last = None
+        healthy = 0
         while time.monotonic() < deadline:
             try:
                 async with session.get(
-                    f"{url}/ready", timeout=aiohttp.ClientTimeout(total=5)
+                    f"{url}/stats", timeout=aiohttp.ClientTimeout(total=5)
                 ) as resp:
-                    if resp.status == 200:
+                    workers = (await resp.json()).get("workers") or []
+                    healthy = sum(1 for w in workers if w.get("healthy"))
+                    if healthy >= expected:
                         return
-                    last = (await resp.json()).get("reason")
-            except Exception as exc:
-                last = str(exc)
+            except Exception:
+                pass
             await asyncio.sleep(1.0)
-    raise RuntimeError(f"{url} not ready within {timeout_s}s: {last}")
+    raise RuntimeError(
+        f"only {healthy}/{expected} worker(s) admitted within {timeout_s}s"
+    )
 
 
 class Topology:
@@ -338,7 +349,15 @@ class Topology:
         #
         # /ready is exactly this question -- it reports whether this gateway has
         # had a usable worker -- so it is what to wait on.
-        await _wait_ready(self.base_url, 300.0 if self.engine else 30.0)
+        # ALL workers, not just one. /ready reports whether the gateway has a
+        # usable worker, which is the right question for Kubernetes and the
+        # wrong one here: it returned as soon as the first worker was admitted,
+        # the sweep started against a half-available pool, and a two-worker run
+        # split 80/16 instead of 48/48 -- reporting no speedup, because the
+        # second GPU was idle for most of it.
+        await _wait_all_admitted(
+            self.base_url, self.num_workers, 300.0 if self.engine else 30.0
+        )
 
     async def __aexit__(self, *exc) -> None:
         await self._stop()
