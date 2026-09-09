@@ -90,6 +90,41 @@ WORKER_PORT_BASE = 8111
 # Process management
 # ---------------------------------------------------------------------------
 
+def _nvidia_smi(args: List[str]) -> Optional[str]:
+    try:
+        out = subprocess.run(["nvidia-smi", *args], capture_output=True,
+                             text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None
+
+
+def _gpu_inventory() -> Optional[str]:
+    return _nvidia_smi(["--query-gpu=index,name,memory.total,driver_version",
+                        "--format=csv"])
+
+
+def _gpu_topology() -> Optional[str]:
+    """
+    Device-to-device links.
+
+    Not decoration even for data parallelism, where nothing crosses between
+    GPUs: the row says which devices were involved and how they sit relative to
+    the host, and it is what lets someone tell this run from one on a different
+    machine. For a sharded run it is load-bearing -- NVLink against PCIe is
+    roughly tenfold.
+    """
+    return _nvidia_smi(["topo", "-m"])
+
+
+def _fp16_config_path() -> Path:
+    """A config whose `quantization` is a real null; see bench_tensor_parallel."""
+    path = RESULTS_DIR / "logs" / "fp16-config.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("model:\n  quantization: null\n", encoding="utf-8")
+    return path
+
+
 def _spawn(env_overrides: Dict[str, str], log_path: Path) -> subprocess.Popen:
     env = os.environ.copy()
     env.update({
@@ -195,14 +230,49 @@ async def _wait_healthy(url: str, timeout_s: float = 30.0) -> None:
     raise RuntimeError(f"{url} did not become healthy within {timeout_s}s")
 
 
+async def _wait_all_admitted(url: str, expected: int, timeout_s: float) -> None:
+    """
+    Block until the gateway has admitted every worker.
+
+    Not /ready, which answers "is there a usable worker" -- correct for
+    Kubernetes, insufficient for a measurement. Starting a sweep when one of
+    two workers is still pending produced an 80/16 request split and a
+    two-worker run that showed no speedup, because the second GPU sat idle for
+    most of it. Nothing in the numbers said so; only the distribution did.
+    """
+    deadline = time.monotonic() + timeout_s
+    async with aiohttp.ClientSession() as session:
+        healthy = 0
+        while time.monotonic() < deadline:
+            try:
+                async with session.get(
+                    f"{url}/stats", timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
+                    workers = (await resp.json()).get("workers") or []
+                    healthy = sum(1 for w in workers if w.get("healthy"))
+                    if healthy >= expected:
+                        return
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+    raise RuntimeError(
+        f"only {healthy}/{expected} worker(s) admitted within {timeout_s}s"
+    )
+
+
 class Topology:
     """One gateway in front of N worker processes, torn down together."""
 
-    def __init__(self, num_workers: int, latency_ms: int, capacity: int, admission: int):
+    def __init__(self, num_workers: int, latency_ms: int, capacity: int,
+                 admission: int, engine: Optional[Dict[str, Any]] = None):
         self.num_workers = num_workers
         self.latency_ms = latency_ms
         self.capacity = capacity
         self.admission = admission
+        # None keeps the synthetic dry-run worker. A dict switches every worker
+        # to a real engine, one GPU each -- which is what turns this from "how
+        # well does one gateway feed N backends" into a throughput measurement.
+        self.engine = engine
         self.gateway: Optional[subprocess.Popen] = None
         self.workers: List[subprocess.Popen] = []
         self.log_dir = RESULTS_DIR / "logs"
@@ -241,14 +311,40 @@ class Topology:
         await _wait_ports_free(self._all_ports())
         for i in range(self.num_workers):
             port = WORKER_PORT_BASE + i
-            self.workers.append(_spawn(
-                {
+            if self.engine is None:
+                worker_env = {
                     "VGATE_ROLE": "worker",
                     "VGATE_DRY_RUN": "true",
                     "VGATE_SERVER__PORT": str(port),
                     "VGATE_DRYRUN_SIMULATED_LATENCY_MS": str(self.latency_ms),
                     "VGATE_DRYRUN_MAX_CONCURRENCY": str(self.capacity),
-                },
+                }
+            else:
+                worker_env = {
+                    "VGATE_ROLE": "worker",
+                    "VGATE_DRY_RUN": "false",
+                    "VGATE_SERVER__PORT": str(port),
+                    "VGATE_MODEL__ENGINE_TYPE": "vllm",
+                    "VGATE_MODEL__MODEL_ID": self.engine["model"],
+                    "VGATE_MODEL__MAX_MODEL_LEN": str(self.engine["max_model_len"]),
+                    "VGATE_MODEL__GPU_MEMORY_UTILIZATION":
+                        str(self.engine["gpu_memory_utilization"]),
+                    "VGATE_MODEL__ENFORCE_EAGER": "false",
+                    # One device per worker. Without this every worker would
+                    # load onto GPU 0 and the second one would either OOM or
+                    # contend with the first -- and a contended pair reports a
+                    # scaling result that describes an accident.
+                    "CUDA_VISIBLE_DEVICES": str(i),
+                }
+                if self.engine.get("quantization"):
+                    worker_env["VGATE_MODEL__QUANTIZATION"] = self.engine["quantization"]
+                else:
+                    # The environment cannot express a null for an Optional[str]
+                    # -- "null" arrives as the four-character string and vLLM
+                    # looks for a quantization method by that name. YAML can.
+                    worker_env["VGATE_CONFIG_PATH"] = str(_fp16_config_path())
+            self.workers.append(_spawn(
+                worker_env,
                 self.log_dir / f"scaling-worker-{self.num_workers}w-{i}.log",
             ))
         self.gateway = _spawn(
@@ -264,12 +360,31 @@ class Topology:
             self.log_dir / f"scaling-gateway-{self.num_workers}w.log",
         )
 
+        # A real engine downloads and loads weights before it answers.
+        worker_timeout = 1800.0 if self.engine else 30.0
         for i in range(self.num_workers):
-            await _wait_healthy(f"http://127.0.0.1:{WORKER_PORT_BASE + i}")
+            await _wait_healthy(
+                f"http://127.0.0.1:{WORKER_PORT_BASE + i}", worker_timeout
+            )
         await _wait_healthy(self.base_url)
-        # Let the gateway's first health probe land, so the first measured
-        # request is not the one that discovers a worker.
-        await asyncio.sleep(1.0)
+        # Wait for the gateway to have ADMITTED a worker, not merely to be
+        # answering. A fixed sleep was not enough and produced a run where all
+        # 96 requests failed with "no healthy worker": the gateway starts
+        # alongside the workers, so during a multi-minute model load its probes
+        # fail and the worker is demoted, and re-admission then needs
+        # success_threshold consecutive probes after the load finishes.
+        #
+        # /ready is exactly this question -- it reports whether this gateway has
+        # had a usable worker -- so it is what to wait on.
+        # ALL workers, not just one. /ready reports whether the gateway has a
+        # usable worker, which is the right question for Kubernetes and the
+        # wrong one here: it returned as soon as the first worker was admitted,
+        # the sweep started against a half-available pool, and a two-worker run
+        # split 80/16 instead of 48/48 -- reporting no speedup, because the
+        # second GPU was idle for most of it.
+        await _wait_all_admitted(
+            self.base_url, self.num_workers, 300.0 if self.engine else 30.0
+        )
 
     async def __aexit__(self, *exc) -> None:
         await self._stop()
@@ -302,6 +417,18 @@ async def _worker_distribution(base_url: str) -> Dict[str, int]:
     return out
 
 
+def _engine_spec(args: argparse.Namespace) -> Optional[Dict[str, Any]]:
+    """Real-engine settings, or None to keep the synthetic dry-run worker."""
+    if not getattr(args, "model", None):
+        return None
+    return {
+        "model": args.model,
+        "quantization": args.quantization,
+        "max_model_len": args.max_model_len,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+    }
+
+
 def _unique_prompts(count: int, tag: str) -> List[str]:
     """All-distinct prompts, so neither the cache nor in-flight dedup can
     stand in for work the pool actually did."""
@@ -313,7 +440,8 @@ async def run_one(
     num_workers: int, args: argparse.Namespace, repeat: int
 ) -> Dict[str, Any]:
     async with Topology(
-        num_workers, args.latency_ms, args.capacity, args.admission
+        num_workers, args.latency_ms, args.capacity, args.admission,
+        engine=_engine_spec(args),
     ) as topo:
         prompts = _unique_prompts(args.requests, f"{num_workers}w-r{repeat}")
         result = await run_load_test(
@@ -321,7 +449,11 @@ async def run_one(
             concurrency=args.concurrency,
             total_requests=args.requests,
             prompts=prompts,
-            max_tokens=0,  # keep the synthetic cost equal to latency_ms exactly
+            # 0 with the dry-run backend keeps the synthetic cost exactly
+            # equal to latency_ms. A real engine rejects it -- vLLM requires
+            # max_tokens >= 1 -- so the real-engine path must generate
+            # something, and how much it generates is itself the workload.
+            max_tokens=args.max_tokens,
         )
         distribution = await _worker_distribution(topo.base_url)
 
@@ -366,7 +498,7 @@ async def run_admission_ceiling(args: argparse.Namespace) -> List[Dict[str, Any]
                 concurrency=args.concurrency,
                 total_requests=args.requests,
                 prompts=prompts,
-                max_tokens=0,
+                max_tokens=args.max_tokens,
             )
         pool_capacity = args.ceiling_workers * args.capacity
         out.append({
@@ -423,7 +555,8 @@ async def run_saturation(args: argparse.Namespace) -> Dict[str, Any]:
             gw_before = _proc_cpu_seconds(topo.gateway.pid)
             sys_before = _system_cpu_seconds()
             measured = await _run_client_processes(
-                topo.base_url, procs, per_proc, requests, f"sat-{procs}"
+                topo.base_url, procs, per_proc, requests, f"sat-{procs}",
+                max_tokens=args.max_tokens,
             )
             gw_after = _proc_cpu_seconds(topo.gateway.pid)
             sys_after = _system_cpu_seconds()
@@ -458,7 +591,8 @@ async def run_saturation(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 async def _run_client_processes(
-    url: str, count: int, concurrency: int, requests: int, tag: str
+    url: str, count: int, concurrency: int, requests: int, tag: str,
+    max_tokens: int = 0,
 ) -> Dict[str, Any]:
     """
     Run `count` independent load-generator processes over a shared window.
@@ -486,6 +620,7 @@ async def _run_client_processes(
             "--concurrency", str(concurrency),
             "--requests", str(requests),
             "--tag", f"{tag}-{stamp}-{i}",
+            "--max-tokens", str(max_tokens),
             "--start-at", f"{start_at:.3f}",
             cwd=str(REPO_ROOT),
             stdout=asyncio.subprocess.PIPE,
@@ -587,8 +722,33 @@ def format_report(
     saturation: Optional[Dict[str, Any]] = None,
     source: Optional[Dict[str, Any]] = None,
 ) -> str:
-    per_worker_ideal = args.capacity / (args.latency_ms / 1000.0)
     counts = sorted({r["workers"] for r in runs})
+    real_engine = bool(getattr(args, "model", None))
+    if real_engine:
+        # A real engine has no declared capacity, so the only honest baseline
+        # is the measured single-worker rate. Linear scaling is then the ideal,
+        # and the gap is what the gateway and the pool cost together.
+        base_rows = [r["throughput_rps"] for r in runs
+                     if r["workers"] == counts[0] and r["failures"] == 0]
+        if not base_rows:
+            # Every baseline run had failures, so there is nothing to compare
+            # against. Say so instead of dividing by zero -- and note that the
+            # rate those runs reported is the rate of FAILING, since throughput
+            # counts requests over wall time regardless of outcome.
+            failed = sum(r["failures"] for r in runs)
+            return (
+                "# 1-vs-N Worker Scaling\n\n"
+                f"**No usable data: {failed} request(s) failed across "
+                f"{len(runs)} run(s), including every run at the baseline "
+                f"worker count.**\n\n"
+                "Throughput is requests over wall time and counts failures in "
+                "the numerator, so the per-run rates printed during the sweep "
+                "describe how fast requests were rejected, not served. Check "
+                "the gateway log for the cause before re-running.\n"
+            )
+        per_worker_ideal = _median(base_rows) / counts[0]
+    else:
+        per_worker_ideal = args.capacity / (args.latency_ms / 1000.0)
 
     lines = [
         "# 1-vs-N Worker Scaling",
@@ -601,25 +761,67 @@ def format_report(
         "",
         "One gateway in front of N worker processes, same load at each N.",
         "",
-        "**Dry-run workers do no inference.** This measures how well one gateway",
-        "feeds N backends -- routing, admission, fan-out, and the HTTP hop. It says",
-        "nothing about how much GPU throughput N GPUs provide; that needs real GPUs",
-        "and is a separate unstarted item in ROADMAP.md. No claim about multi-GPU",
-        "performance is made from these numbers.",
-        "",
-        "Each worker's capacity is declared rather than inherited from the host, so",
-        "the ideal is arithmetic rather than a guess:",
-        "",
-        f"| Parameter | Value |",
-        f"|---|---|",
-        f"| Generation cost per request | {args.latency_ms} ms |",
-        f"| Concurrent generations per worker | {args.capacity} |",
-        f"| **Ideal throughput per worker** | **{per_worker_ideal:.0f} req/s** |",
-        f"| Client concurrency | {args.concurrency} |",
-        f"| Requests per run | {args.requests} |",
-        f"| Repeats per point | {args.repeats} |",
-        f"| Gateway admission limit (`batch.max_batch_size`) | {args.admission} |",
-        "",
+    ]
+
+    if real_engine:
+        lines += [
+            "Each worker runs a **real vLLM engine on its own GPU**, so this is",
+            "throughput the hardware actually produced — not the synthetic",
+            "dry-run backend the earlier report used. The gateway holds no model;",
+            "it routes.",
+            "",
+            "There is no declared per-worker capacity to measure against here, so",
+            "the baseline is the **measured** single-worker rate and the ideal is",
+            "linear scaling from it. The gap is what the gateway and the pool cost",
+            "together.",
+            "",
+            "| Parameter | Value |",
+            "|---|---|",
+            f"| Model | `{args.model}` |",
+            f"| Quantization | {args.quantization or 'none (native precision)'} |",
+            f"| Max model length | {args.max_model_len} |",
+            f"| GPU memory utilization | {args.gpu_memory_utilization} |",
+            "| GPUs per worker | 1 (`CUDA_VISIBLE_DEVICES` pinned per process) |",
+            f"| Client concurrency | {args.concurrency} |",
+            f"| Requests per run | {args.requests} |",
+            f"| Repeats per point | {args.repeats} |",
+            f"| Gateway admission limit | {args.admission} |",
+            f"| **Measured single-worker rate** | **{per_worker_ideal:.2f} req/s** |",
+            "",
+            "The hardware, captured rather than described. A throughput figure",
+            "without it cannot be reproduced or compared to a run anywhere else:",
+            "",
+            "```",
+            (_gpu_inventory() or "nvidia-smi unavailable").strip(),
+            "```",
+            "",
+            "```",
+            (_gpu_topology() or "nvidia-smi topo -m unavailable").strip(),
+            "```",
+            "",
+        ]
+    else:
+        lines += [
+            "**Dry-run workers do no inference.** This measures how well one gateway",
+            "feeds N backends -- routing, admission, fan-out, and the HTTP hop. It says",
+            "nothing about how much GPU throughput N GPUs provide.",
+            "",
+            "Each worker's capacity is declared rather than inherited from the host, so",
+            "the ideal is arithmetic rather than a guess:",
+            "",
+            "| Parameter | Value |",
+            "|---|---|",
+            f"| Generation cost per request | {args.latency_ms} ms |",
+            f"| Concurrent generations per worker | {args.capacity} |",
+            f"| **Ideal throughput per worker** | **{per_worker_ideal:.0f} req/s** |",
+            f"| Client concurrency | {args.concurrency} |",
+            f"| Requests per run | {args.requests} |",
+            f"| Repeats per point | {args.repeats} |",
+            f"| Gateway admission limit (`batch.max_batch_size`) | {args.admission} |",
+            "",
+        ]
+
+    lines += [
         "Prompts are all distinct, so neither the result cache nor in-flight",
         "deduplication can stand in for work the pool actually did.",
         "",
@@ -672,10 +874,23 @@ def format_report(
 
     lines += [
         "",
-        f"At client concurrency {args.concurrency}, a pool of N workers has",
-        f"{args.capacity}xN concurrent slots. Below that the queue is short and",
-        "latency is close to one generation; above it, requests wait, and the wait",
-        "is what the tail reports.",
+    ]
+    if real_engine:
+        lines += [
+            f"At client concurrency {args.concurrency}, how much of that a pool",
+            "can hold is set by KV cache, not by a configured number: a worker",
+            "admits sequences until its cache is full and queues the rest. So the",
+            "latency below is mostly queueing, and halving the queue per GPU is",
+            "what halves it.",
+        ]
+    else:
+        lines += [
+            f"At client concurrency {args.concurrency}, a pool of N workers has",
+            f"{args.capacity}xN concurrent slots. Below that the queue is short and",
+            "latency is close to one generation; above it, requests wait, and the wait",
+            "is what the tail reports.",
+        ]
+    lines += [
         "",
         "## Request distribution",
         "",
@@ -976,6 +1191,20 @@ async def main_async(args: argparse.Namespace) -> int:
             )
             runs.append(result)
 
+    if args.skip_extras:
+        saturation = None
+        ceiling = []
+        print("\n--- skipping admission and saturation scenarios ---", flush=True)
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        report = format_report(args, runs, ceiling, saturation, None)
+        (RESULTS_DIR / args.output).write_text(report, encoding="utf-8")
+        (RESULTS_DIR / args.output.replace(".md", ".json")).write_text(
+            json.dumps({"runs": runs, "args": vars(args)}, indent=2, default=str),
+            encoding="utf-8",
+        )
+        print(f"\nReport written to {RESULTS_DIR / args.output}")
+        return 0
+
     print("--- saturation: gateway or harness? ---", flush=True)
     saturation = await run_saturation(args)
     for row in saturation["rows"]:
@@ -1037,8 +1266,22 @@ def main() -> int:
                    help="gateway batch.max_batch_size; must exceed N x capacity")
     p.add_argument("--ceiling-workers", type=int, default=4,
                    help="worker count for the admission-ceiling comparison")
+    p.add_argument("--max-tokens", type=int, default=0,
+                   help="0 keeps the dry-run cost exactly equal to --latency-ms; "
+                        "a real engine requires >= 1 and this becomes the workload")
+    p.add_argument("--model", default=None,
+                   help="switch workers to a real vLLM engine, one GPU each; "
+                        "omitted keeps the synthetic dry-run worker")
+    p.add_argument("--quantization", default=None)
+    p.add_argument("--max-model-len", type=int, default=2048)
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    p.add_argument("--skip-extras", action="store_true",
+                   help="run only the worker-count sweep; the admission and "
+                        "saturation scenarios each reload every model and cost "
+                        "more GPU time than they are worth on rented hardware")
     p.add_argument("--saturation-workers", type=int, default=8,
                    help="worker count for the gateway-vs-harness comparison")
+    p.add_argument("--output", default="scaling.md")
     p.add_argument("--ceiling-source-latencies", type=int, nargs="+",
                    default=[100, 50, 25],
                    help="generation costs used to separate a thread-bound "
