@@ -1,0 +1,114 @@
+{
+  "runs": [
+    {
+      "workers": 1,
+      "repeat": 1,
+      "throughput_rps": 5.42,
+      "p50_s": 23.5736,
+      "p95_s": 27.313,
+      "p99_s": 28.8897,
+      "failures": 0,
+      "cache_hits": 0,
+      "deduplicated": 0,
+      "distribution": {
+        "8111": 384
+      }
+    },
+    {
+      "workers": 1,
+      "repeat": 2,
+      "throughput_rps": 5.43,
+      "p50_s": 23.56,
+      "p95_s": 28.2587,
+      "p99_s": 29.1828,
+      "failures": 0,
+      "cache_hits": 0,
+      "deduplicated": 0,
+      "distribution": {
+        "8111": 384
+      }
+    },
+    {
+      "workers": 1,
+      "repeat": 3,
+      "throughput_rps": 5.4,
+      "p50_s": 23.5749,
+      "p95_s": 29.104,
+      "p99_s": 29.4652,
+      "failures": 0,
+      "cache_hits": 0,
+      "deduplicated": 0,
+      "distribution": {
+        "8111": 384
+      }
+    },
+    {
+      "workers": 2,
+      "repeat": 1,
+      "throughput_rps": 10.78,
+      "p50_s": 11.7753,
+      "p95_s": 16.3863,
+      "p99_s": 17.6541,
+      "failures": 0,
+      "cache_hits": 0,
+      "deduplicated": 0,
+      "distribution": {
+        "8112": 192,
+        "8111": 192
+      }
+    },
+    {
+      "workers": 2,
+      "repeat": 2,
+      "throughput_rps": 10.79,
+      "p50_s": 11.7692,
+      "p95_s": 14.4595,
+      "p99_s": 17.1188,
+      "failures": 0,
+      "cache_hits": 0,
+      "deduplicated": 0,
+      "distribution": {
+        "8112": 192,
+        "8111": 192
+      }
+    },
+    {
+      "workers": 2,
+      "repeat": 3,
+      "throughput_rps": 10.8,
+      "p50_s": 11.7822,
+      "p95_s": 13.3252,
+      "p99_s": 17.5679,
+      "failures": 0,
+      "cache_hits": 0,
+      "deduplicated": 0,
+      "distribution": {
+        "8111": 192,
+        "8112": 192
+      }
+    }
+  ],
+  "args": {
+    "workers": "1,2",
+    "repeats": 3,
+    "requests": 384,
+    "concurrency": 128,
+    "latency_ms": 100,
+    "capacity": 4,
+    "admission": 256,
+    "ceiling_workers": 4,
+    "max_tokens": 128,
+    "model": "Qwen/Qwen2.5-32B-Instruct",
+    "quantization": null,
+    "max_model_len": 2048,
+    "gpu_memory_utilization": 0.95,
+    "skip_extras": true,
+    "saturation_workers": 8,
+    "output": "scaling_a100_2gpu.md",
+    "ceiling_source_latencies": [
+      100,
+      50,
+      25
+    ]
+  }
+}
