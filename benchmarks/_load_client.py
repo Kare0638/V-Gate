@@ -78,6 +78,9 @@ async def main_async(args: argparse.Namespace) -> None:
             # requests over that process's own window, and summing windows that
             # do not coincide does not give throughput over any real interval.
             "requests_per_second": result["throughput"]["requests_per_second"],
+            "tokens_per_second": result["throughput"]["tokens_per_second"],
+            "p50_s": result["latency"]["p50_s"],
+            "p99_s": result["latency"]["p99_s"],
             "requests": args.requests,
             "started_at": started_at,
             "ended_at": ended_at,

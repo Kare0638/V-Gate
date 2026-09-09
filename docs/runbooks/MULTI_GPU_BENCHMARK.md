@@ -13,6 +13,21 @@ It drives the whole harness against the dry-run backend on CPU — spawn, load,
 sweep, assertions, report. It measures nothing, and that is the point: harness
 bugs found on an A100 are billed by the hour.
 
+The harness has also been run against a real GPU and a real vLLM engine at
+TP=1 ([report](../../benchmarks/results/tensor_parallel_rtx3060_tp1.md)) on a
+6GB laptop card. That pass found three bugs the CPU self-test could not:
+
+- `VGATE_MODEL__QUANTIZATION=null` produced the four-character **string**, not
+  a null — every FP16 checkpoint, which is what the A100 run uses, would have
+  failed at load.
+- `VLLM_WSL2_ENABLE_PIN_MEMORY` was missing, which crashes vLLM under WSL2.
+- Measuring from the harness process, which imports torch and vLLM, reported
+  **19 req/s where a clean subprocess reported 33** against the same server.
+  Every figure would have been ~40% low, and not necessarily by the same
+  amount at TP=1 and TP=2 — corrupting the comparison, not just the scale.
+
+Run against whatever GPU you have before renting one.
+
 ---
 
 ## Choosing the pod

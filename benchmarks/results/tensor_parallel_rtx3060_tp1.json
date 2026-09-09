@@ -1,0 +1,125 @@
+{
+  "args": {
+    "self_test": false,
+    "model": "Qwen/Qwen2.5-1.5B-Instruct-AWQ",
+    "quantization": "awq",
+    "tensor_parallel": [
+      1
+    ],
+    "concurrency": [
+      1,
+      4,
+      16
+    ],
+    "requests": 192,
+    "repeats": 2,
+    "warmup_requests": 16,
+    "max_tokens": 64,
+    "max_model_len": 2048,
+    "gpu_memory_utilization": 0.6,
+    "load_timeout": 600.0,
+    "settle_seconds": 20.0,
+    "request_timeout": 600.0,
+    "allow_slow_interconnect": false
+  },
+  "environment": {
+    "captured_at": "2026-09-08T23:53:50.193490+00:00",
+    "topology": "\u001b[4mGPU0\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \t\t\t\tN/A\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks",
+    "gpus": "0, NVIDIA GeForce RTX 3060 Laptop GPU, 6144 MiB, 610.74",
+    "cpu_count": 16,
+    "vllm_version": "0.26.0",
+    "torch_version": "2.11.0+cu130",
+    "cuda_version": "13.0"
+  },
+  "configs": [
+    {
+      "tensor_parallel_size": 1,
+      "kv_cache_blocks": 87344,
+      "rows": [
+        {
+          "concurrency": 1,
+          "requests": 192,
+          "rps": 2.69,
+          "tokens_per_second": 171.83,
+          "p50_s": 0.3759,
+          "p95_s": 0.3816,
+          "p99_s": 0.3838,
+          "failures": 0,
+          "cache_hits": 0,
+          "deduplicated": 0,
+          "repeat": 1
+        },
+        {
+          "concurrency": 1,
+          "requests": 192,
+          "rps": 2.63,
+          "tokens_per_second": 168.36,
+          "p50_s": 0.38,
+          "p95_s": 0.3879,
+          "p99_s": 0.3978,
+          "failures": 0,
+          "cache_hits": 0,
+          "deduplicated": 0,
+          "repeat": 2
+        },
+        {
+          "concurrency": 4,
+          "requests": 192,
+          "rps": 9.67,
+          "tokens_per_second": 618.61,
+          "p50_s": 0.4134,
+          "p95_s": 0.4179,
+          "p99_s": 0.4242,
+          "failures": 0,
+          "cache_hits": 0,
+          "deduplicated": 0,
+          "repeat": 1
+        },
+        {
+          "concurrency": 4,
+          "requests": 192,
+          "rps": 9.84,
+          "tokens_per_second": 629.54,
+          "p50_s": 0.4046,
+          "p95_s": 0.4194,
+          "p99_s": 0.4249,
+          "failures": 0,
+          "cache_hits": 0,
+          "deduplicated": 0,
+          "repeat": 2
+        },
+        {
+          "concurrency": 16,
+          "requests": 192,
+          "rps": 29.19,
+          "tokens_per_second": 1868.05,
+          "p50_s": 0.5437,
+          "p95_s": 0.5609,
+          "p99_s": 0.5642,
+          "failures": 0,
+          "cache_hits": 0,
+          "deduplicated": 0,
+          "repeat": 1
+        },
+        {
+          "concurrency": 16,
+          "requests": 192,
+          "rps": 28.85,
+          "tokens_per_second": 1843.53,
+          "p50_s": 0.5479,
+          "p95_s": 0.5993,
+          "p99_s": 0.6117,
+          "failures": 0,
+          "cache_hits": 0,
+          "deduplicated": 0,
+          "repeat": 2
+        }
+      ]
+    }
+  ],
+  "client_headroom": {
+    "single_process_rps": 34.75,
+    "two_process_rps": 32.35,
+    "gain_pct": -6.9
+  }
+}

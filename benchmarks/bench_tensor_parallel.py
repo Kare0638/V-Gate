@@ -123,17 +123,27 @@ def capture_environment() -> Dict[str, Any]:
         ]),
         "cpu_count": os.cpu_count(),
     }
+    # Version probes run in a subprocess rather than importing here. Importing
+    # torch and vLLM into the harness loads enough state to slow its own event
+    # loop, which used to matter when this process also generated load; it no
+    # longer does, and keeping the import out removes the possibility of that
+    # coupling returning unnoticed.
+    probe = _run([
+        sys.executable, "-c",
+        "import json;"
+        "d={};"
+        "\ntry:\n import vllm; d['vllm']=vllm.__version__\nexcept Exception: d['vllm']=None"
+        "\ntry:\n import torch; d['torch']=torch.__version__; d['cuda']=torch.version.cuda"
+        "\nexcept Exception: d['torch']=d['cuda']=None"
+        "\nprint(json.dumps(d))",
+    ])
     try:
-        import vllm
-        env["vllm_version"] = vllm.__version__
-    except Exception:
-        env["vllm_version"] = None
-    try:
-        import torch
-        env["torch_version"] = torch.__version__
-        env["cuda_version"] = torch.version.cuda
-    except Exception:
-        env["torch_version"] = env["cuda_version"] = None
+        versions = json.loads(probe) if probe else {}
+    except json.JSONDecodeError:
+        versions = {}
+    env["vllm_version"] = versions.get("vllm")
+    env["torch_version"] = versions.get("torch")
+    env["cuda_version"] = versions.get("cuda")
     return env
 
 
@@ -159,6 +169,22 @@ def interconnect_of(topology: Optional[str]) -> Optional[str]:
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
+def _fp16_config_path() -> Path:
+    """
+    A config file whose `quantization` is a real null.
+
+    Needed because the environment cannot express one: VGATE_MODEL__QUANTIZATION
+    is an Optional[str], and setting it to "null" yields the four-character
+    string, which vLLM then tries to look up as a quantization method. Written
+    once and reused; the YAML source is lower priority than the environment, so
+    every other override in _spawn still wins.
+    """
+    path = RESULTS_DIR / "logs" / "fp16-config.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("model:\n  quantization: null\n", encoding="utf-8")
+    return path
+
+
 def _spawn(env_overrides: Dict[str, str], log_path: Path) -> subprocess.Popen:
     env = os.environ.copy()
     env.update({
@@ -170,6 +196,9 @@ def _spawn(env_overrides: Dict[str, str], log_path: Path) -> subprocess.Popen:
         # prompts here are unique, so this is belt and braces -- but a silent
         # cache hit is throughput credited to hardware that did nothing.
         "VGATE_CACHE__ENABLED": "false",
+        # vLLM crashes at startup under WSL2 without this. Carried over from
+        # run_report.py, where it was found the hard way; harmless elsewhere.
+        "VLLM_WSL2_ENABLE_PIN_MEMORY": "1",
     })
     env.update(env_overrides)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -252,41 +281,53 @@ class Failure(Exception):
     """A condition that makes the numbers not worth reporting."""
 
 
-def unique_prompts(count: int, tag: str, words: int) -> List[str]:
-    """
-    Distinct prompts of a fixed length.
-
-    Distinct because a cache hit or a coalesced duplicate is throughput
-    credited to a GPU that did nothing. Fixed length because prompt length
-    drives prefill cost, and letting it vary between configurations would put
-    an uncontrolled variable next to the one being measured.
-    """
-    stamp = int(time.time() * 1000)
-    filler = " ".join(f"w{i}" for i in range(words))
-    return [f"{tag} {stamp} {i} {filler}" for i in range(count)]
+# Prompt generation lives in _load_client now that measurement does. Prompts
+# are distinct there for the same reason it mattered here: a cache hit or a
+# coalesced duplicate is throughput credited to a GPU that did nothing.
 
 
 async def measure(
-    concurrency: int, requests: int, prompt_words: int, max_tokens: int, tag: str
+    concurrency: int, requests: int, max_tokens: int, tag: str
 ) -> Dict[str, Any]:
-    result = await run_load_test(
-        base_url=BASE_URL,
-        concurrency=concurrency,
-        total_requests=requests,
-        prompts=unique_prompts(requests, tag, prompt_words),
-        max_tokens=max_tokens,
+    """
+    Drive load from a clean subprocess, never from this one.
+
+    Measuring in-process looked simpler and was wrong by about 40%. This
+    harness imports torch and vLLM to report their versions, and an event loop
+    sharing an interpreter with that much loaded state cannot drive requests as
+    fast as a fresh one: on an RTX 3060, in-process reported 19 req/s where a
+    subprocess at identical concurrency reported 33 against the same server.
+    Every figure in the sweep would have been depressed, and not necessarily by
+    the same amount at TP=1 and TP=2 -- which would have corrupted the
+    comparison rather than merely the absolute numbers.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "benchmarks._load_client",
+        "--url", BASE_URL,
+        "--concurrency", str(concurrency),
+        "--requests", str(requests),
+        "--max-tokens", str(max_tokens),
+        "--tag", f"{tag}-{int(time.time() * 1000)}",
+        cwd=str(REPO_ROOT),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise Failure(f"load client exited {proc.returncode}: {err.decode()[-400:]}")
+    result = json.loads(out.decode())
+
     row = {
         "concurrency": concurrency,
         "requests": requests,
-        "rps": result["throughput"]["requests_per_second"],
-        "tokens_per_second": result["throughput"]["tokens_per_second"],
-        "p50_s": result["latency"]["p50_s"],
-        "p95_s": result["latency"]["p95_s"],
-        "p99_s": result["latency"]["p99_s"],
+        "rps": result["requests_per_second"],
+        "tokens_per_second": result["tokens_per_second"],
+        "p50_s": result["p50_s"],
+        "p95_s": result["p95_s"],
+        "p99_s": result["p99_s"],
         "failures": result["failures"],
-        "cache_hits": result["cache"]["hits"],
-        "deduplicated": result["batching"]["deduplicated"],
+        "cache_hits": result["cache_hits"],
+        "deduplicated": result["deduplicated"],
     }
     # Asserted here, not tallied at the end. A run with any of these did not
     # measure what the report will claim it measured, and continuing would put
@@ -332,9 +373,13 @@ async def run_configuration(
         if args.quantization:
             overrides["VGATE_MODEL__QUANTIZATION"] = args.quantization
         else:
-            # Pydantic reads this as JSON null, which is what an unquantized
-            # FP16 checkpoint needs: forcing a method fails at load.
-            overrides["VGATE_MODEL__QUANTIZATION"] = "null"
+            # Clearing an Optional[str] through the environment does not work:
+            # pydantic-settings hands the string "null" straight through, and
+            # vLLM then looks for a quantization method by that name and fails
+            # at load. Every FP16 checkpoint would have hit this. The YAML
+            # source is what can express a real null, so this points the
+            # process at a generated config instead.
+            overrides["VGATE_CONFIG_PATH"] = str(_fp16_config_path())
 
     proc = _spawn(overrides, log_path)
     try:
@@ -348,7 +393,6 @@ async def run_configuration(
         await measure(
             concurrency=min(4, max(args.concurrency)),
             requests=args.warmup_requests,
-            prompt_words=args.prompt_words,
             max_tokens=args.max_tokens,
             tag=f"warmup-tp{tp}",
         )
@@ -359,8 +403,7 @@ async def run_configuration(
                 row = await measure(
                     concurrency=concurrency,
                     requests=args.requests,
-                    prompt_words=args.prompt_words,
-                    max_tokens=args.max_tokens,
+                            max_tokens=args.max_tokens,
                     tag=f"tp{tp}-c{concurrency}-r{repeat}",
                 )
                 row["repeat"] = repeat
@@ -392,12 +435,23 @@ async def check_client_headroom(args: argparse.Namespace) -> Dict[str, Any]:
     limit and every throughput figure above is a floor rather than a result.
     """
     top = max(args.concurrency)
+    # Deliberately more requests than a sweep point uses. A short window is
+    # dominated by ramp-up, and the comparison then reports the shape of the
+    # first second rather than a steady rate.
+    args = argparse.Namespace(**{**vars(args), "requests": max(args.requests, 256)})
     single = await measure(
         concurrency=top, requests=args.requests,
-        prompt_words=args.prompt_words, max_tokens=args.max_tokens,
+        max_tokens=args.max_tokens,
         tag="headroom-1proc",
     )
     stamp = int(time.time() * 1000)
+    # A shared wall-clock start. Without it the processes stagger by however
+    # long an interpreter takes to boot, one of them briefly has the server to
+    # itself, and the aggregate over a common window is inflated -- which would
+    # manufacture exactly the "the client was the limit" verdict this is
+    # supposed to test for. The same omission was already fixed once in
+    # bench_scaling.py and repeated here.
+    start_at = time.time() + 2.0
     procs = [
         await asyncio.create_subprocess_exec(
             sys.executable, "-m", "benchmarks._load_client",
@@ -406,6 +460,7 @@ async def check_client_headroom(args: argparse.Namespace) -> Dict[str, Any]:
             "--requests", str(args.requests // 2),
             "--tag", f"headroom-2proc-{stamp}-{i}",
             "--max-tokens", str(args.max_tokens),
+            "--start-at", f"{start_at:.3f}",
             cwd=str(REPO_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -470,6 +525,15 @@ def format_report(
             "",
         ]
 
+    if len(tps) == 1:
+        lines += [
+            f"> **Single-configuration run (TP={tps[0]} only).** This is not a",
+            "> tensor-parallelism comparison — there is nothing to compare against.",
+            "> It exercises the harness against a real GPU and a real engine, which",
+            "> is what the `--self-test` path on CPU cannot do.",
+            "",
+        ]
+
     lines += [
         "## What was measured, and on what",
         "",
@@ -485,7 +549,7 @@ def format_report(
         if not args.self_test else "| Quantization | *n/a* |",
         f"| Max model length | {args.max_model_len} |",
         f"| GPU memory utilization | {args.gpu_memory_utilization} |",
-        f"| Prompt length | ~{args.prompt_words} words, all distinct |",
+        "| Prompts | all distinct, so no cache hit or coalesced duplicate |",
         f"| Generated tokens per request | {args.max_tokens} |",
         f"| Requests per point | {args.requests} |",
         f"| Repeats per point | {args.repeats} |",
@@ -698,7 +762,9 @@ async def main_async(args: argparse.Namespace) -> int:
             **({"VGATE_DRY_RUN": "true", "VGATE_DRYRUN_SIMULATED_LATENCY_MS": "50"}
                if args.self_test else
                {"VGATE_MODEL__ENGINE_TYPE": "vllm",
-                "VGATE_MODEL__QUANTIZATION": args.quantization or "null"}),
+                **({"VGATE_MODEL__QUANTIZATION": args.quantization}
+                   if args.quantization
+                   else {"VGATE_CONFIG_PATH": str(_fp16_config_path())})}),
         },
         RESULTS_DIR / "logs" / "tp-headroom-server.log",
     )
@@ -751,7 +817,6 @@ def main() -> int:
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--warmup-requests", type=int, default=16)
     p.add_argument("--max-tokens", type=int, default=128)
-    p.add_argument("--prompt-words", type=int, default=64)
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     p.add_argument("--load-timeout", type=float, default=1800.0,
