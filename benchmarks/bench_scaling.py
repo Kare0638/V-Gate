@@ -403,7 +403,11 @@ async def run_one(
             concurrency=args.concurrency,
             total_requests=args.requests,
             prompts=prompts,
-            max_tokens=0,  # keep the synthetic cost equal to latency_ms exactly
+            # 0 with the dry-run backend keeps the synthetic cost exactly
+            # equal to latency_ms. A real engine rejects it -- vLLM requires
+            # max_tokens >= 1 -- so the real-engine path must generate
+            # something, and how much it generates is itself the workload.
+            max_tokens=args.max_tokens,
         )
         distribution = await _worker_distribution(topo.base_url)
 
@@ -448,7 +452,7 @@ async def run_admission_ceiling(args: argparse.Namespace) -> List[Dict[str, Any]
                 concurrency=args.concurrency,
                 total_requests=args.requests,
                 prompts=prompts,
-                max_tokens=0,
+                max_tokens=args.max_tokens,
             )
         pool_capacity = args.ceiling_workers * args.capacity
         out.append({
@@ -505,7 +509,8 @@ async def run_saturation(args: argparse.Namespace) -> Dict[str, Any]:
             gw_before = _proc_cpu_seconds(topo.gateway.pid)
             sys_before = _system_cpu_seconds()
             measured = await _run_client_processes(
-                topo.base_url, procs, per_proc, requests, f"sat-{procs}"
+                topo.base_url, procs, per_proc, requests, f"sat-{procs}",
+                max_tokens=args.max_tokens,
             )
             gw_after = _proc_cpu_seconds(topo.gateway.pid)
             sys_after = _system_cpu_seconds()
@@ -540,7 +545,8 @@ async def run_saturation(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 async def _run_client_processes(
-    url: str, count: int, concurrency: int, requests: int, tag: str
+    url: str, count: int, concurrency: int, requests: int, tag: str,
+    max_tokens: int = 0,
 ) -> Dict[str, Any]:
     """
     Run `count` independent load-generator processes over a shared window.
@@ -568,6 +574,7 @@ async def _run_client_processes(
             "--concurrency", str(concurrency),
             "--requests", str(requests),
             "--tag", f"{tag}-{stamp}-{i}",
+            "--max-tokens", str(max_tokens),
             "--start-at", f"{start_at:.3f}",
             cwd=str(REPO_ROOT),
             stdout=asyncio.subprocess.PIPE,
@@ -1189,6 +1196,9 @@ def main() -> int:
                    help="gateway batch.max_batch_size; must exceed N x capacity")
     p.add_argument("--ceiling-workers", type=int, default=4,
                    help="worker count for the admission-ceiling comparison")
+    p.add_argument("--max-tokens", type=int, default=0,
+                   help="0 keeps the dry-run cost exactly equal to --latency-ms; "
+                        "a real engine requires >= 1 and this becomes the workload")
     p.add_argument("--model", default=None,
                    help="switch workers to a real vLLM engine, one GPU each; "
                         "omitted keeps the synthetic dry-run worker")
