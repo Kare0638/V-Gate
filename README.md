@@ -22,6 +22,7 @@ The evidence below is a measured snapshot of the current serving path. The vLLM 
 | **vLLM live GPU** | [`Qwen/Qwen2.5-1.5B-Instruct-AWQ`](benchmarks/results/vllm_baseline.md) via vLLM 0.26 on an RTX 3060 Laptop GPU: **294.09 generated tokens/s**, **6.47 requests/s**, **1.5264s p95 latency** | 40 requests at concurrency 8, from one small benchmark run; a directional baseline, not a capacity claim |
 | **SGLang adapter** | Non-streaming adapter behavior is covered by [`tests/test_backends.py`](tests/test_backends.py) | Unit tests use stubs; no live-engine or live-GPU SGLang benchmark is claimed |
 | **1-vs-N worker scaling** | [2.00x at 2 workers, 3.89x at 4](benchmarks/results/scaling.md), 96–99% of ideal, 3 repeats per point, 0 failures across all 18 runs | Dry-run workers with declared capacity: measures how well one gateway feeds N backends, **not** GPU throughput |
+| **Single-GPU engine path (RTX 3060)** | [`bench_tensor_parallel.py` at TP=1](benchmarks/results/tensor_parallel_rtx3060_tp1.md): 2.7 / 9.5 / 27.8 req/s at concurrency 1 / 4 / 16, 2 repeats each, client verified not to be the bottleneck | Validates the multi-GPU harness against a real engine on a 6GB laptop GPU. **Not** a tensor-parallelism result — one device, nothing to compare |
 | **Split topology on Kubernetes** | [3-node kind cluster](docs/reports/K8S_SPLIT_VERIFICATION.md): 19 assertions covering per-pod routing, `kubectl scale` 1↔3↔0, and failover under live traffic | Dry-run workers; the GPU overlay is validated but unexercised |
 
 ---
@@ -993,7 +994,7 @@ either a multi-part rewrite or a hardware purchase:
 | Unified streaming admission | `_stream_chat_completion` calls the backend directly, so folding it in touches the cache, dedup, and admission paths at once. |
 | Prompt-prefix affinity routing | Needs a load generator that can produce *heterogeneous* traffic; under the uniform load this repo can generate, it is indistinguishable from round-robin and therefore unfalsifiable. |
 | Async `RemoteBackend` | Measured as the cause of the 180 req/s gateway ceiling, so its value is known — but it changes the transport for every worker call and belongs with the backpressure work, not ahead of it. |
-| Multi-GPU validation | Not a code problem. Needs rented hardware; nothing in the repo claims multi-GPU behaviour until it exists. |
+| Multi-GPU validation | Not a code problem. Needs rented hardware; nothing in the repo claims multi-GPU behaviour until it exists. The harness and procedure are ready — [`bench_tensor_parallel.py`](benchmarks/bench_tensor_parallel.py) and [the runbook](docs/runbooks/MULTI_GPU_BENCHMARK.md) — and self-test on CPU, so only the measurement is outstanding. |
 | In-flight draining on worker shutdown | Requires a worker to fail its own `/health` while still serving what it accepted — application state the current health endpoint does not carry. |
 
 What *is* finished is a distributed inference gateway that has been deployed,

@@ -225,3 +225,7 @@ ROADMAP.zh-local.md
 # Ignore Virtual Environment
 .venv/
 venv/
+
+# Benchmark server logs are run artefacts, not results. The reports in
+# benchmarks/results/*.md are what gets checked in.
+benchmarks/results/logs/

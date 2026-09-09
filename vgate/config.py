@@ -105,12 +105,33 @@ class WorkerConfig(BaseModel):
 class ModelConfig(BaseModel):
     """Model configuration for inference engine."""
     model_id: str = "Qwen/Qwen2.5-1.5B-Instruct-AWQ"
-    quantization: str = "awq"
+    # None loads the model in its native precision. A string here forces a
+    # quantization method, and forcing "awq" on an unquantized checkpoint fails
+    # at load rather than falling back -- which is why this must be nullable
+    # for any FP16 model.
+    quantization: Optional[str] = "awq"
     gpu_memory_utilization: float = 0.7
     max_model_len: int = 2048
     trust_remote_code: bool = True
     enforce_eager: bool = True
     engine_type: str = "vllm"
+
+    # Shards the model across this many GPUs. 1 keeps it on one device.
+    #
+    # Splitting weights leaves more room per device for the KV cache, which is
+    # usually what bounds concurrency once a model is loaded -- so the effect
+    # is not only "the model fits". The cost is an all-reduce after every
+    # layer, on the critical path of every token, which is why the interconnect
+    # matters more here than raw GPU speed and why single-request latency can
+    # get *worse* while throughput gets better.
+    tensor_parallel_size: int = 1
+
+    @field_validator("tensor_parallel_size")
+    @classmethod
+    def validate_tensor_parallel_size(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"tensor_parallel_size must be >= 1, got {v}")
+        return v
 
     @field_validator("engine_type")
     @classmethod
