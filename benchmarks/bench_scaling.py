@@ -90,6 +90,33 @@ WORKER_PORT_BASE = 8111
 # Process management
 # ---------------------------------------------------------------------------
 
+def _nvidia_smi(args: List[str]) -> Optional[str]:
+    try:
+        out = subprocess.run(["nvidia-smi", *args], capture_output=True,
+                             text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None
+
+
+def _gpu_inventory() -> Optional[str]:
+    return _nvidia_smi(["--query-gpu=index,name,memory.total,driver_version",
+                        "--format=csv"])
+
+
+def _gpu_topology() -> Optional[str]:
+    """
+    Device-to-device links.
+
+    Not decoration even for data parallelism, where nothing crosses between
+    GPUs: the row says which devices were involved and how they sit relative to
+    the host, and it is what lets someone tell this run from one on a different
+    machine. For a sharded run it is load-bearing -- NVLink against PCIe is
+    roughly tenfold.
+    """
+    return _nvidia_smi(["topo", "-m"])
+
+
 def _fp16_config_path() -> Path:
     """A config whose `quantization` is a real null; see bench_tensor_parallel."""
     path = RESULTS_DIR / "logs" / "fp16-config.yaml"
@@ -761,6 +788,17 @@ def format_report(
             f"| Gateway admission limit | {args.admission} |",
             f"| **Measured single-worker rate** | **{per_worker_ideal:.2f} req/s** |",
             "",
+            "The hardware, captured rather than described. A throughput figure",
+            "without it cannot be reproduced or compared to a run anywhere else:",
+            "",
+            "```",
+            (_gpu_inventory() or "nvidia-smi unavailable").strip(),
+            "```",
+            "",
+            "```",
+            (_gpu_topology() or "nvidia-smi topo -m unavailable").strip(),
+            "```",
+            "",
         ]
     else:
         lines += [
@@ -836,10 +874,23 @@ def format_report(
 
     lines += [
         "",
-        f"At client concurrency {args.concurrency}, a pool of N workers has",
-        f"{args.capacity}xN concurrent slots. Below that the queue is short and",
-        "latency is close to one generation; above it, requests wait, and the wait",
-        "is what the tail reports.",
+    ]
+    if real_engine:
+        lines += [
+            f"At client concurrency {args.concurrency}, how much of that a pool",
+            "can hold is set by KV cache, not by a configured number: a worker",
+            "admits sequences until its cache is full and queues the rest. So the",
+            "latency below is mostly queueing, and halving the queue per GPU is",
+            "what halves it.",
+        ]
+    else:
+        lines += [
+            f"At client concurrency {args.concurrency}, a pool of N workers has",
+            f"{args.capacity}xN concurrent slots. Below that the queue is short and",
+            "latency is close to one generation; above it, requests wait, and the wait",
+            "is what the tail reports.",
+        ]
+    lines += [
         "",
         "## Request distribution",
         "",
